@@ -545,9 +545,9 @@ class PSARIndicator:
     def compute(self, df: pd.DataFrame, step: float = 0.02, max_step: float = 0.2) -> pd.DataFrame:
         psar = ta.trend.PSARIndicator(df["high"], df["low"], df["close"], step=step, max_step=max_step)
         return pd.DataFrame({
-            "PSAR": psar.psar(),
-            "PSAR_up": psar.psar_up(),
-            "PSAR_down": psar.psar_down()
+            f"PSAR_{step}_{max_step}": psar.psar(),
+            f"PSAR_up_{step}_{max_step}": psar.psar_up(),
+            f"PSAR_down_{step}_{max_step}": psar.psar_down()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -592,7 +592,7 @@ import ta
 
 class AroonIndicator:
     def compute(self, df: pd.DataFrame, length: int = 25) -> pd.DataFrame:
-        aroon = ta.trend.AroonIndicator(df["close"], window=length)
+        aroon = ta.trend.AroonIndicator(df["high"], df["low"], window=length)
         return pd.DataFrame({
             f"AROON_up_{length}": aroon.aroon_up(),
             f"AROON_down_{length}": aroon.aroon_down(),
@@ -654,8 +654,8 @@ class KSTIndicator:
     def compute(self, df: pd.DataFrame, r1: int = 10, r2: int = 15, r3: int = 20, r4: int = 30) -> pd.DataFrame:
         kst = ta.trend.KSTIndicator(df["close"], roc1=r1, roc2=r2, roc3=r3, roc4=r4)
         return pd.DataFrame({
-            "KST": kst.kst(),
-            "KST_sig": kst.kst_sig()
+            f"KST_{r1}_{r2}_{r3}_{r4}": kst.kst(),
+            f"KST_sig_{r1}_{r2}_{r3}_{r4}": kst.kst_sig()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -951,7 +951,7 @@ class KalmanFilterIndicator:
             x_est[i] = x_pred + K * (prices[i] - x_pred)
             p_est[i] = (1 - K) * p_pred
             
-        return pd.DataFrame({"Kalman": pd.Series(x_est, index=df.index)}, index=df.index)
+        return pd.DataFrame({f"Kalman_{r_ratio}": pd.Series(x_est, index=df.index)}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLATILITY_KALMAN_V1", name="Kalman Filter", category="VOLATILITY",
@@ -1112,7 +1112,7 @@ class AdaptiveKalmanIndicator:
             x_est[i] = x_pred + K * (prices[i] - x_pred)
             p_est[i] = (1 - K) * p_pred
             
-        return pd.DataFrame({"Adapt_Kalman": x_est}, index=df.index)
+        return pd.DataFrame({f"Adapt_Kalman_{q}_{r}": x_est}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="ADAPTIVE_KALMAN_V1", name="Adaptive Kalman Filter", category="ADAPTIVE",
@@ -1173,7 +1173,7 @@ class PivotPointsIndicator:
         
         pp_high = high.shift(1)
         pp_low = low.shift(1)
-        pp_close = df['close'].shift(window).fillna(method='bfill') # Approximate previous 'session' close via lag
+        pp_close = df['close'].shift(window).bfill() # Approximate previous 'session' close via lag
         
         # PP = (H + L + C) / 3
         pp = (pp_high + pp_low + pp_close) / 3
@@ -1314,7 +1314,7 @@ class ZigZagIndicator:
         # Ideally returns Pivot points. For feature series, we might return linear interp or trend dir.
         # Returning simple Trend Direction for now.
         
-        return pd.DataFrame({"ZigZag_Trend": pd.Series(0, index=df.index)}, index=df.index)
+        return pd.DataFrame({f"ZigZag_Trend_{deviation}": pd.Series(0, index=df.index)}, index=df.index)
 """
     # Note: ZigZag is hard to vectorize for simple feature set without lookahead bias in some implementations. 
     # Skipping detailed ZigZag to avoid lookahead issues in standard formation.
@@ -1322,41 +1322,42 @@ class ZigZagIndicator:
     # Heikin Ashi
     ha_code = """
 import pandas as pd
+import numpy as np
 
 class HeikinAshiIndicator:
     def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+        # HA Close: (O + H + L + C) / 4
         ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4
         
-        # HA Open needs recursive calculation
-        ha_open = [df['open'].iloc[0]]
+        # HA Open: requires recursive calculation
+        # HA_Open[0] = (Open[0] + Close[0]) / 2
+        # HA_Open[i] = (HA_Open[i-1] + HA_Close[i-1]) / 2
+        
+        ha_open = np.zeros(len(df))
+        ha_open[0] = (df['open'].iloc[0] + df['close'].iloc[0]) / 2
+        
+        ha_close_arr = ha_close.values
         for i in range(1, len(df)):
-            ha_open.append((ha_open[-1] + df['open'].iloc[i]) / 2) # Approximation for vector speed? No, standard is (prevent_ha_open + prev_ha_close)
+            ha_open[i] = (ha_open[i-1] + ha_close_arr[i-1]) / 2
         
-        # Proper HA Open: (Prev HA Open + Prev HA Close) / 2
-        # Let's do loop
-        ha_o = []
-        prev_o = df['open'].iloc[0]
-        prev_c = df['close'].iloc[0]
+        ha_open_series = pd.Series(ha_open, index=df.index)
         
-        for i in range(len(df)):
-            if i == 0:
-                curr_o = (prev_o + prev_c) / 2
-            else:
-                curr_o = (ha_o[-1] + ha_c[i-1]) / 2 # Need ha_c generated first?
-            
-            # Actually standard:
-            # HA_Close = (O+H+L+C)/4
-            # HA_Open = (Prev_HA_Open + Prev_HA_Close) / 2
-            # HA_High = Max(H, HA_O, HA_C)
-            # HA_Low = Min(L, HA_O, HA_C)
-            pass
-            
-        # Simplified Return: HA Close
-        return pd.DataFrame({"HA_Close": ha_close}, index=df.index)
+        # HA High: Max(High, HA_Open, HA_Close)
+        ha_high = pd.concat([df['high'], ha_open_series, ha_close], axis=1).max(axis=1)
+        
+        # HA Low: Min(Low, HA_Open, HA_Close)
+        ha_low = pd.concat([df['low'], ha_open_series, ha_close], axis=1).min(axis=1)
+        
+        return pd.DataFrame({
+            "HA_Close": ha_close,
+            "HA_Open": ha_open_series,
+            "HA_High": ha_high,
+            "HA_Low": ha_low
+        }, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="PATTERN_HEIKIN_V1", name="Heikin Ashi", category="PATTERN",
-        description="Heikin Ashi Smoothed Close.", code_snippet=ha_code, handler_func="HeikinAshiIndicator",
+        description="Heikin Ashi Smoothed OHLC.", code_snippet=ha_code, handler_func="HeikinAshiIndicator",
         params=[], source="builtin"
     ))
 

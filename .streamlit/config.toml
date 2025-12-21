@@ -1,9 +1,11 @@
 
-# .streamlit/config.toml
+[client]
+toolbarMode = "hidden"
+
 [theme]
 base = "dark"
-primaryColor = "#0A84FF"
-backgroundColor = "#000000"
-secondaryBackgroundColor = "#1C1C1E"
-textColor = "#FFFFFF"
+primaryColor = "#3182F6"
+backgroundColor = "#0F1113"
+secondaryBackgroundColor = "#191F28"
+textColor = "#E5E8EB"
 font = "sans serif"

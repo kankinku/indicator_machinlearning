@@ -12,7 +12,7 @@ from src.shared.logger import get_logger
 logger = get_logger("meta.q_learning")
 
 # --- RL Configuration ---
-ACTIONS = [
+DEFAULT_ACTIONS = [
     "TREND_FOLLOWING",  # MA, MACD, Parabolic SAR
     "MEAN_REVERSION",   # RSI, Bollinger, Stochastic
     "VOLATILITY_BREAK", # ATR, Keltner, Bands
@@ -26,20 +26,24 @@ class QTable:
     # Key: State String, Value: List of Q-values for each action
     table: Dict[str, List[float]] = field(default_factory=dict)
     
-    def get_q(self, state_key: str) -> List[float]:
+    def get_q(self, state_key: str, action_count: int) -> List[float]:
         if state_key not in self.table:
             # Initialize with small variable noise to break ties, centered on 0.0
-            self.table[state_key] = [random.uniform(-0.01, 0.01) for _ in ACTIONS]
+            self.table[state_key] = [random.uniform(-0.01, 0.01) for _ in range(action_count)]
+        elif len(self.table[state_key]) != action_count:
+            # Reset if action space changes
+            self.table[state_key] = [random.uniform(-0.01, 0.01) for _ in range(action_count)]
         return self.table[state_key]
 
-    def update(self, state_key: str, action_idx: int, value: float):
+    def update(self, state_key: str, action_idx: int, action_count: int, value: float):
         if state_key not in self.table:
-            self.get_q(state_key)
+            self.get_q(state_key, action_count)
         self.table[state_key][action_idx] = value
 
 class QLearner:
-    def __init__(self, storage_path: Path):
-        self.storage_path = storage_path / "q_table.json"
+    def __init__(self, storage_path: Path, actions: Optional[List[str]] = None, table_name: str = "q_table.json"):
+        self.actions = actions or DEFAULT_ACTIONS
+        self.storage_path = storage_path / table_name
         
         # Hyperparameters (Loaded from Config)
         from src.config import config
@@ -64,36 +68,47 @@ class QLearner:
         
         # Exploration
         if random.random() < self.epsilon:
-            action_idx = random.randint(0, len(ACTIONS) - 1)
-            action_name = ACTIONS[action_idx]
+            action_idx = random.randint(0, len(self.actions) - 1)
+            action_name = self.actions[action_idx]
             logger.info(f"    [RL] Exploration (e={self.epsilon:.2f}) -> {action_name}")
             self.last_action_idx = action_idx
             return action_name, action_idx
             
         # Exploitation
-        q_values = self.q_table.get_q(state_key)
+        q_values = self.q_table.get_q(state_key, len(self.actions))
         action_idx = int(np.argmax(q_values))
-        action_name = ACTIONS[action_idx]
+        action_name = self.actions[action_idx]
         
         logger.info(f"    [RL] Exploitation (State: {state_key}) -> {action_name} | Q-Vals: {[round(x,3) for x in q_values]}")
         
         self.last_action_idx = action_idx
         return action_name, action_idx
 
-    def update(self, reward: float, next_regime: RegimeState):
+    def update(
+        self,
+        reward: float,
+        next_regime: RegimeState,
+        state_key: Optional[str] = None,
+        action_idx: Optional[int] = None,
+    ):
         """
         Q(s,a) = Q(s,a) + alpha * [Reward + gamma * max(Q(s',a')) - Q(s,a)]
         """
-        if self.last_state_key is None or self.last_action_idx is None:
+        if state_key is None:
+            state_key = self.last_state_key
+        if action_idx is None:
+            action_idx = self.last_action_idx
+
+        if state_key is None or action_idx is None:
             return
 
         # 1. Get Current Q(s,a)
-        current_qs = self.q_table.get_q(self.last_state_key)
-        current_q = current_qs[self.last_action_idx]
+        current_qs = self.q_table.get_q(state_key, len(self.actions))
+        current_q = current_qs[action_idx]
         
         # 2. Get Max Q(s', a')
         next_state_key = self._encode_state(next_regime)
-        next_qs = self.q_table.get_q(next_state_key)
+        next_qs = self.q_table.get_q(next_state_key, len(self.actions))
         max_next_q = max(next_qs)
         
         # 3. Compute Target
@@ -101,9 +116,9 @@ class QLearner:
         
         # 4. Update
         new_q = current_q + self.alpha * (target - current_q)
-        self.q_table.update(self.last_state_key, self.last_action_idx, new_q)
+        self.q_table.update(state_key, action_idx, len(self.actions), new_q)
         
-        logger.info(f"    [RL] Updated Q({self.last_state_key}, {ACTIONS[self.last_action_idx]}): {current_q:.3f} -> {new_q:.3f} | Reward: {reward:.3f}")
+        logger.info(f"    [RL] Updated Q({state_key}, {self.actions[action_idx]}): {current_q:.3f} -> {new_q:.3f} | Reward: {reward:.3f}")
         
         # 5. Decay Epsilon
         if self.epsilon > self.epsilon_min:

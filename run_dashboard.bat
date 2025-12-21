@@ -11,11 +11,9 @@ start /min "Vibe Dashboard Server" python -m streamlit run dashboard.py --server
 echo Waiting for server instantiation...
 timeout /t 3 /nobreak >nul
 
-:: 3. Open in Application Mode (Windowed, No Toolbar)
-:: Using Microsoft Edge as the "App Runner" (Standard on Windows)
-:: If you prefer Chrome, change 'msedge' to 'chrome'
-echo [Vibe Launcher] Launching UI Window...
-start msedge --app=http://localhost:8501
+:: 3. Open in Standard Chrome Tab
+echo [Vibe Launcher] Launching Browser Tab...
+start chrome http://localhost:8501
 
 :: 4. Exit this launcher script automatically
 exit

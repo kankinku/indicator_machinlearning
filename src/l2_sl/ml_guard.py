@@ -44,7 +44,7 @@ class MLGuard:
         if risk_config is None:
             risk_config = {"pt": 2.0, "sl": 1.0, "window": 10}
             
-        logger.info("[ML Guard] Starting training...")
+        logger.debug("[ML Guard] Starting training...")
         
         if targets is None:
             if close_prices is None:
@@ -101,7 +101,7 @@ class MLGuard:
             return {}
             
         # 3. Train LightGBM
-        logger.info(f"[ML Guard] Training on {len(X_train)} samples with {X_train.shape[1]} features. Objective: {self.params.get('objective', 'binary')}")
+        logger.debug(f"[ML Guard] Training on {len(X_train)} samples with {X_train.shape[1]} features. Objective: {self.params.get('objective', 'binary')}")
         
         self.model = lgb.LGBMClassifier(**self.params)
         self.model.fit(X_train, y_train)
@@ -109,7 +109,7 @@ class MLGuard:
         
         # 4. Evaluate (Simple In-Sample for now)
         score = self.model.score(X_train, y_train)
-        logger.info(f"[ML Guard] Training completed. Accuracy: {score:.4f}")
+        logger.debug(f"[ML Guard] Training completed. Accuracy: {score:.4f}")
         
         return {"accuracy": score, "n_samples": len(X_train)}
 

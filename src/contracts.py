@@ -76,6 +76,7 @@ class PolicySpec:
     template_id: str = "GENOME"
     tuned_params: Dict[str, Any] = field(default_factory=dict) # Legacy param slot
     data_window: Dict[str, Any] = field(default_factory=dict)
+    rl_meta: Dict[str, Any] = field(default_factory=dict)
 
     def validate_genome(self) -> None:
         # TODO: Validate against Universe
@@ -135,6 +136,8 @@ class LedgerRecord:
     # [New] Store the Verdict directly or parts of it for easy query
     verdict_dump: Optional[Dict[str, Any]] = None
 
+# Alias for compatibility with scripts
+FeatureParam = TunableParamSpec
 
 @dataclass
 class FeatureMetadata:

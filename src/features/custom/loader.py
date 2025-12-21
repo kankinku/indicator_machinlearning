@@ -27,7 +27,7 @@ class CustomFeatureLoader:
 
     def load_all(self):
         """Scan directory and load all valid custom features."""
-        logger.info(f"Scanning for custom indicators in: {self.custom_dir}")
+        logger.debug(f"Scanning for custom indicators in: {self.custom_dir}")
         
         for file_path in self.custom_dir.glob("*.py"):
             if file_path.name == "base.py" or file_path.name == "__init__.py" or file_path.name == "loader.py":
@@ -56,7 +56,7 @@ class CustomFeatureLoader:
                         instance = attr()
                         self._register_feature(instance)
                         self.loaded_features[instance.id] = attr
-                        logger.info(f"Loaded Custom Feature: {instance.id} ({instance.name})")
+                        logger.debug(f"Loaded Custom Feature: {instance.id} ({instance.name})")
 
         except Exception as e:
             logger.error(f"Failed to load custom feature from {file_path.name}: {e}")

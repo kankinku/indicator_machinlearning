@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import List, Optional
 
 from src.contracts import LedgerRecord
+from src.shared.ranking import check_return_stability, return_rank_key
+from src.shared.returns import compute_compounded_return_pct, get_risk_unit
 from src.l2_sl.artifacts import ArtifactBundle
 
 
@@ -61,4 +63,103 @@ class LedgerRepo:
             risk_report=data.get("risk_report", {}),
             reason_codes=data.get("reason_codes", []),
             fix_suggestion=fix_obj,
+            verdict_dump=data.get("verdict_dump"),
         )
+
+    def prune_experiments(self, keep_n: int = 100) -> int:
+        """
+        Prune experiments, keeping only the top N performers.
+        Sorting Criteria: 
+        1. Status ("Approved" > "Rejected")
+        2. Return-centric ranking with stability checks
+        """
+        records = self.load_records()
+        if len(records) <= keep_n:
+            return 0
+            
+        def get_total_return(r: LedgerRecord) -> float:
+            risk_budget = r.policy_spec.risk_budget or {}
+            total_return = compute_compounded_return_pct(
+                exp_id=r.exp_id,
+                model_artifact_ref=r.model_artifact_ref,
+                ledger_dir=self.base_dir,
+                risk_budget=risk_budget,
+            )
+            if total_return is None:
+                ret_mean = r.cpcv_metrics.get("cpcv_mean", 0.0)
+                n_trades = r.cpcv_metrics.get("n_trades", 0)
+                risk_unit = get_risk_unit(risk_budget)
+                return ret_mean * n_trades * (risk_unit * 100.0)
+            return float(total_return)
+
+        def get_rank_key(r: LedgerRecord):
+            metrics = r.cpcv_metrics or {}
+            eval_score = metrics.get("eval_score")
+            ret_mean = metrics.get("cpcv_mean", 0.0)
+            vol_std = metrics.get("cpcv_std", 0.0)
+            cpcv_worst = metrics.get("cpcv_worst", 0.0)
+            n_trades = metrics.get("n_trades", 0)
+            win_rate = metrics.get("win_rate", 0.0)
+            stability_pass, vol_ratio = check_return_stability(
+                cpcv_mean=ret_mean,
+                cpcv_std=vol_std,
+                cpcv_worst=cpcv_worst,
+                win_rate=win_rate,
+                n_trades=n_trades,
+            )
+            if eval_score is not None:
+                try:
+                    return (
+                        1.0 if stability_pass else 0.0,
+                        float(eval_score),
+                        float(win_rate),
+                        float(n_trades),
+                        -float(vol_ratio),
+                    )
+                except (TypeError, ValueError):
+                    pass
+            total_return = get_total_return(r)
+            return return_rank_key(
+                total_return=total_return,
+                stability_pass=stability_pass,
+                win_rate=win_rate,
+                n_trades=n_trades,
+                vol_ratio=vol_ratio,
+            )
+
+        # Sort: Approved first, then by return-centric stable ranking
+        records.sort(
+            key=lambda r: ((1 if not r.reason_codes else 0),) + get_rank_key(r),
+            reverse=True,
+        )
+        
+        to_keep = records[:keep_n]
+        to_delete = records[keep_n:]
+        
+        # 1. Rewrite JSONL
+        with self.ledger_path.open("w", encoding="utf-8") as f:
+            for rec in to_keep:
+                f.write(json.dumps(asdict(rec)) + "\n")
+                
+        # 2. Delete Artifacts
+        deleted_count = 0
+        for rec in to_delete:
+            deleted_count += 1
+            # Model Artifact
+            if rec.model_artifact_ref:
+                p = Path(rec.model_artifact_ref)
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+            
+            # Results CSV (implied path)
+            res_csv = self.artifact_dir / f"{rec.exp_id}_results.csv"
+            if res_csv.exists():
+                try:
+                    res_csv.unlink()
+                except Exception:
+                    pass
+                    
+        return deleted_count

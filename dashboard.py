@@ -9,7 +9,7 @@ import sys
 # Add current dir to path
 sys.path.append(str(Path(__file__).parent))
 
-from dashboard_shared import load_data, load_chart_data, load_css
+from dashboard_shared import load_data, load_chart_data, load_css, render_sidebar
 
 st.set_page_config(
     page_title="Vibe Trading Lab",
@@ -18,6 +18,7 @@ st.set_page_config(
 )
 
 load_css()
+render_sidebar()
 df_exp = load_data()
 
 # Header
@@ -36,7 +37,15 @@ if df_exp.empty:
     st.rerun()
 
 # --- Top KPI Overlay ---
-best_row = df_exp[df_exp["status"]=="Approved"].sort_values("sharpe", ascending=False).iloc[0] if not df_exp[df_exp["status"]=="Approved"].empty else None
+approved = df_exp[df_exp["status"] == "Approved"]
+best_row = (
+    approved.sort_values(
+        ["holistic_score", "stability_pass", "total_return"],
+        ascending=[False, False, False],
+    ).iloc[0]
+    if not approved.empty
+    else None
+)
 
 kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
 with kpi1:
@@ -47,27 +56,20 @@ with kpi2:
     st.metric("Approval Rate (승인율)", f"{rate:.1f}%", f"{app_count} Approved (승인)")
 with kpi3:
     if best_row is not None:
-        st.metric("Top Sharpe (최고 샤프)", f"{best_row['sharpe']:.2f}")
+        st.metric("Best Model Sharpe (선정 샤프)", f"{best_row['sharpe']:.2f}")
     else:
-        st.metric("Top Sharpe (최고 샤프)", "-")
+        st.metric("Best Model Sharpe (선정 샤프)", "-")
 with kpi4:
     if best_row is not None:
-        st.metric("Top Win Rate (최고 승률)", f"{best_row['win_rate']*100:.1f}%")
+        st.metric("Best Model Win Rate (선정 승률)", f"{best_row['win_rate']*100:.1f}%")
     else:
-        st.metric("Top Win Rate (최고 승률)", "-")
+        st.metric("Best Model Win Rate (선정 승률)", "-")
 with kpi5:
     if best_row is not None:
-        # Check if total_return column exists (backward compatibility)
-        if "total_return" in best_row:
-             tot = best_row["total_return"]
-        else:
-             tot = best_row.get("return_mean", 0) * best_row.get("trades", 0)
-             
-        # Estimate % based on 5% Risk per Trade (Aggressive)
-        est_pct = tot * 5.0 
-        st.metric("Top Return (최고 수익)", f"{tot:.1f}R", f"Est. +{est_pct:.0f}%")
+        tot = best_row.get("total_return", 0)
+        st.metric("Best Model Return (선정 수익)", f"{tot:.1f}%")
     else:
-         st.metric("Top Return (최고 수익)", "-")
+        st.metric("Best Model Return (선정 수익)", "-")
 
 st.divider()
 
@@ -77,41 +79,50 @@ if best_row is not None:
     st.markdown(f"""
 <div class="toss-card">
 <div style="display:flex; justify-content:space-between; margin-bottom:10px;">
-    <span class="badge-blue">BEST PERFORMER (최고 성과)</span>
-    <span style="color:#8B95A1; font-size:12px;">{best_row['timestamp'].strftime('%Y-%m-%d %H:%M')}</span>
+<span class="badge-blue">BEST PERFORMER (최고 성과)</span>
+<span style="color:#8B95A1; font-size:12px;">{best_row['timestamp'].strftime('%Y-%m-%d %H:%M')}</span>
 </div>
 <h3 style="margin:0; color:#FFFFFF;">{best_row['origin']} Strategy (전략)</h3>
 <p style="color:#B0B8C1; margin-top:4px; font-size:14px;">Composition (구성): {best_row['indicators']}</p>
 
 <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:15px; margin-top:20px;">
-    <div>
-        <div style="font-size:12px; color:#8B95A1;">Sharpe (샤프)</div>
-        <div class="mono" style="font-size:24px; font-weight:700; color:#3182F6;">{best_row['sharpe']:.2f}</div>
-    </div>
-    <div>
-        <div style="font-size:12px; color:#8B95A1;">Win Rate (승률)</div>
-        <div class="mono" style="font-size:24px; font-weight:700; color:#FFFFFF;">{best_row['win_rate']*100:.1f}%</div>
-    </div>
-    <div>
-        <div style="font-size:12px; color:#8B95A1;">Trades (거래수)</div>
-        <div class="mono" style="font-size:24px; font-weight:700; color:#FFFFFF;">{int(best_row['trades'])}</div>
-    </div>
-    <div>
-        <div style="font-size:12px; color:#8B95A1;">Avg. Return (평균)</div>
-        <div class="mono" style="font-size:24px; font-weight:700; color:#FFFFFF;">{best_row.get('return_mean', best_row.get('return', 0)):.2f}</div>
-    </div>
-    <div>
-        <div style="font-size:12px; color:#8B95A1;">Tot. Return (누적)</div>
-        <div class="mono" style="font-size:24px; font-weight:700; color:#3182F6;">{best_row.get('total_return', 0):.2f}R</div>
-    </div>
+<div>
+<div style="font-size:12px; color:#8B95A1;">Sharpe (샤프)</div>
+<div class="mono" style="font-size:24px; font-weight:700; color:#3182F6;">{best_row['sharpe']:.2f}</div>
 </div>
+<div>
+<div style="font-size:12px; color:#8B95A1;">Win Rate (승률)</div>
+<div class="mono" style="font-size:24px; font-weight:700; color:#FFFFFF;">{best_row['win_rate']*100:.1f}%</div>
+</div>
+<div>
+<div style="font-size:12px; color:#8B95A1;">Trades (거래수)</div>
+<div class="mono" style="font-size:24px; font-weight:700; color:#FFFFFF;">{int(best_row['trades'])}</div>
+</div>
+<div>
+<div style="font-size:12px; color:#8B95A1;">Avg. Return (평균)</div>
+<div class="mono" style="font-size:24px; font-weight:700; color:#FFFFFF;">{best_row.get('return_mean', 0):.2f}%</div>
+</div>
+<div>
+<div style="font-size:12px; color:#8B95A1;">Tot. Return (누적)</div>
+<div class="mono" style="font-size:24px; font-weight:700; color:#3182F6;">{best_row.get('total_return', 0):.2f}%</div>
+</div>
+</div>
+<p style="color:#8B95A1; font-size:12px; margin-top:10px;">Risk: Target {best_row.get('target_return_pct', 0):.2f}% | Stop {best_row.get('stop_loss_pct', 0):.2f}% | Horizon {int(best_row.get('horizon', 0)) if pd.notna(best_row.get('horizon', 0)) else 0} | Profile {best_row.get('risk_profile', '-')} </p>
 </div>
 """, unsafe_allow_html=True)
     
     # Equity Curve for Best
     df_chart = load_chart_data(best_row["id"])
     if not df_chart.empty and "net_pnl" in df_chart.columns:
-        df_chart["equity"] = df_chart["net_pnl"].cumsum()
+        stop_loss_pct = best_row.get('stop_loss_pct', 1.0)
+        if pd.notna(stop_loss_pct):
+            risk_unit = stop_loss_pct / 100.0
+        else:
+            risk_unit = 0.01
+        returns = df_chart["net_pnl"].fillna(0.0) * risk_unit
+        returns = returns.clip(lower=-0.95)
+        df_chart["equity"] = (1.0 + returns).cumprod() - 1.0
+        df_chart["equity"] = df_chart["equity"] * 100.0
         
         fig = px.area(df_chart, x=df_chart.index, y="equity", height=300)
         fig.update_layout(
@@ -126,45 +137,56 @@ if best_row is not None:
 
 st.divider()
 
-# 2. Leaderboard Table with Selection
+# 2. Experiment History (실험 기록)
 st.subheader("Experiment History (실험 기록)")
-st.info("💡 Click on a row to view details (행을 클릭하면 상세 페이지로 이동합니다)")
+st.info("💡 Click on any row to view Deep Analysis (행을 클릭하면 상세 분석 페이지로 이동합니다)")
 
-# Simple Table structure
-disp_df = df_exp[["short_id", "timestamp", "origin", "sharpe", "win_rate", "trades", "total_return", "status", "fail_reason"]].copy()
-disp_df["win_rate_fmt"] = disp_df["win_rate"].apply(lambda x: f"{x*100:.1f}%")
-disp_df["sharpe_fmt"] = disp_df["sharpe"].apply(lambda x: f"{x:.2f}")
+# Filtering & Search
+col_search, col_sort = st.columns([2, 1])
+with col_search:
+    search_q = st.text_input("🔍 Search Strategy (전략 검색)", placeholder="e.g. RSI, TREND")
+with col_sort:
+    sort_by = st.selectbox(
+        "Sort By", 
+        ["holistic_score", "timestamp", "sharpe", "win_rate", "total_return"],
+        format_func=lambda x: x.replace("_", " ").title()
+    )
 
-event = st.dataframe(
-    disp_df,
+# Filter Logic
+df_display = df_exp.copy()
+if search_q:
+    df_display = df_display[df_display["indicators"].str.contains(search_q, case=False) | df_display["origin"].str.contains(search_q, case=False)]
+
+df_display = df_display.sort_values(sort_by, ascending=False).reset_index(drop=True)
+
+# Display standard dataframe with premium styling & SELECTION
+selection = st.dataframe(
+    df_display[[
+        "timestamp", "generation", "origin", "sharpe", "win_rate", "trades", "total_return", "status", "short_id"
+    ]],
     column_config={
-        "short_id": None, # Hide ID
-        "timestamp": "Time (시간)",
+        "timestamp": st.column_config.DatetimeColumn("Time (시간)", format="MM/DD HH:mm"),
+        "generation": st.column_config.NumberColumn("Gen (세대)", format="#%d"),
         "origin": "Strategy (전략)",
         "sharpe": st.column_config.NumberColumn("Sharpe", format="%.2f"),
-        "sharpe_fmt": None, # Hide formatted helper
-        "win_rate": None, # Hide raw
-        "win_rate_fmt": "Win Rate (승률)",
-        "trades": "Trades (거래)",
-        "total_return": st.column_config.NumberColumn(
-            "Cum. Return (누적수익)",
-            format="%.2f R"
-        ),
-        "status": "Verdict (결과)",
-        "fail_reason": "Note (비고)"
+        "win_rate": st.column_config.ProgressColumn("Win Rate", format="%.1f%%", min_value=0, max_value=1),
+        "trades": "Trades",
+        "total_return": st.column_config.NumberColumn("Return (%)", format="%.2f%%"),
+        "status": "Status",
+        "short_id": "ID"
     },
-    column_order=["timestamp", "origin", "sharpe", "win_rate_fmt", "trades", "total_return", "status", "fail_reason"],
     use_container_width=True,
     hide_index=True,
-    on_select="rerun",
-    selection_mode="single-row"
+    on_select="rerun",  # Triggers rerun on click
+    selection_mode="single-row" 
 )
 
 # Handle Selection
-if event.selection.rows:
-    selected_idx = event.selection.rows[0]
-    # Use the value from the displayed dataframe's specific row
-    selected_id = disp_df.iloc[selected_idx]["short_id"]
-    st.session_state["selected_id"] = selected_id
+if selection and selection["selection"]["rows"]:
+    selected_idx = selection["selection"]["rows"][0]
+    # Get ID from the DISPLAYED dataframe using the selected index
+    selected_short_id = df_display.iloc[selected_idx]["short_id"]
+    
+    st.session_state["selected_id"] = selected_short_id
     st.switch_page("pages/01_Strategy_Analysis.py")
 

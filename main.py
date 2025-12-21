@@ -1,3 +1,9 @@
+# === WARNING FILTERS (MUST BE FIRST) ===
+# Suppress FutureWarnings from external libraries before any imports
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"ta\..*")
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*Series.__setitem__.*")
+warnings.filterwarnings("ignore", message="Series.fillna with 'method' is deprecated")
 
 import sys
 import os

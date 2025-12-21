@@ -2,7 +2,13 @@
 from __future__ import annotations
 
 import time
+import logging
+import multiprocessing
+import os
 from typing import Optional
+
+# Prevent joblib WinError 2 by setting explicit CPU count
+os.environ["LOKY_MAX_CPU_COUNT"] = str(multiprocessing.cpu_count())
 
 from src.config import config
 from src.shared.logger import get_logger
@@ -10,7 +16,7 @@ from src.features.registry import FeatureRegistry
 from src.ledger.repo import LedgerRepo
 from src.l3_meta.agent import MetaAgent
 from src.l3_meta.detectors.regime import RegimeDetector
-from src.orchestration.run_experiment import run_experiment
+from src.orchestration.evaluation import evaluate_stage, persist_best_samples
 from src.data.loader import DataLoader
 
 logger = get_logger("orchestration.loop")
@@ -41,6 +47,15 @@ def infinite_loop(
     agent = MetaAgent(registry, repo)
     detector = RegimeDetector()
     
+    # [Config] Suppress Spam Logs
+    logging.getLogger("meta.agent").setLevel(logging.INFO)
+    logging.getLogger("meta.q_learning").setLevel(logging.INFO)
+    logging.getLogger("feature.registry").setLevel(logging.WARNING)
+    logging.getLogger("feature.custom_loader").setLevel(logging.WARNING)
+    logging.getLogger("data.loader").setLevel(logging.WARNING)
+    logging.getLogger("l2.ml_guard").setLevel(logging.WARNING)
+    
+    
     # 2. Data Load (Live Fetch)
     try:
         logger.info(f">>> [Data] Initializing DataLoader for {ticker}...")
@@ -63,70 +78,78 @@ def infinite_loop(
     except Exception as e:
         counter = 0
         logger.warning(f">>> [System] Starting fresh (History load failed: {e}).")
-    
+
+    batch_idx = 0
     # 3. The Loop
     while True:
-        if max_exps > 0 and counter >= max_exps:
-            logger.info(">>> [System] Max experiments reached. Stopping.")
-            break
-            
-        counter += 1
-        logger.info(f"\n=== Experiment {counter} ===")
-        
+        # Performance Based Pruning (Maintenance)
+        if max_exps > 0 and counter > max_exps:
+            pruned = repo.prune_experiments(keep_n=max_exps)
+            if pruned > 0:
+                logger.info(f">>> [System] Pruned {pruned} poor performers to maintain pool size {max_exps}.")
+
+        batch_idx += 1
+
         # A. Detect Regime (Situation Awareness)
         regime = detector.detect(df)
-        logger.info(f">>> [Regime] Trend={regime.trend_score:.2f}, VolLevel={regime.vol_level:.2f}, Shock={regime.shock_flag}")
-        
-        # B. Load History (Memory)
-        history = repo.load_records() 
-        
-        # C. Agent Proposes Policy (Intelligence)
-        policy = agent.propose_policy(regime, history)
-        logger.info(f">>> [Agent] Proposed: {policy.template_id} | Params: {policy.tuned_params}")
-        
-        # D. Execution (Action)
-        try:
-            record = run_experiment(registry, policy, df, repo)
-            
-            # E. Report (Feedback)
-            # E. Report (Feedback)
-            status = "APPROVED" if not record.reason_codes else "REJECTED"
-            
-            # Extract Metrics
-            perf = record.cpcv_metrics.get('cpcv_mean', 0.0)      # Return
-            vol = record.cpcv_metrics.get('cpcv_std', 1.0)
-            n_trades = record.cpcv_metrics.get('n_trades', 0)
-            win_rate = record.cpcv_metrics.get('win_rate', 0.0)
-            
-            # Key Metric 1: Sharpe
-            sharpe = perf / (vol + 1e-9) if vol > 0 else 0.0
-            
-            # Key Metric 2: Trade Score (Normalized to 50 trades = 1.0)
-            # Cap at 1.0 to prevent high frequency spam from dominating
-            trade_score = min(n_trades / 50.0, 1.0)
-            
-            # Key Metric 3: Win Rate (0.0 - 1.0)
-            
-            # Key Metric 4: Return Score (Scale 0.05 -> 0.5)
-            return_score = perf * 10.0
-            
-            # RL Reward Shaping: Weighted Composite Score
-            # Weights: Sharpe(4), Trades(1), WinRate(2), Return(2)
-            if not record.reason_codes:
-                reward = (4.0 * sharpe) + (1.0 * trade_score) + (2.0 * win_rate) + (2.0 * return_score)
-            else:
-                reward = -1.0 # Hard Penalty for Failure
-            
-            logger.info(f">>> [Result] {status} | Reward: {reward:.3f} (S:{sharpe:.2f} T:{n_trades} W:{win_rate:.2f} R:{perf:.3f})")
-            
-            # Update Agent (RL Feedback)
-            agent.learn(reward, regime)
 
-            if record.fix_suggestion:
-                logger.info(f"    [Fix] Suggestion: {record.fix_suggestion}")
+        # B. Load History (Memory)
+        history = repo.load_records()
+
+        # C. Agent Proposes Policy BATCH (Intelligence)
+        # ---------------------------------------------
+        n_jobs = multiprocessing.cpu_count()
+
+        logger.info("-" * 90)
+        # C. Sequential Execution (Feedback Loop)
+        # ---------------------------------------------
+        # Execute experiments sequentially to provide immediate feedback to the RL agent.
+        # This avoids process spawning overhead and allows faster evolution.
+        
+        n_steps = multiprocessing.cpu_count()
+        logger.info("-" * 90)
+        logger.info(f"  >>> [Sequential] Starting {n_steps} Experiments (Regime: {regime.label})...")
+
+        for i in range(n_steps):
+            # 1. Propose (Intelligence)
+            pol = agent.propose_policy(regime, history)
+            
+            # 2. Evaluate (Execution)
+            # Pass n_jobs=1 to force sequential processing in the evaluator
+            try:
+                results = evaluate_stage([pol], df, "full", regime.label, n_jobs=1)
                 
-        except Exception as e:
-            logger.error(f"!!! [Experiment Error] {e}", exc_info=True)
+                # 3. Persist
+                saved = persist_best_samples(repo, results, df)
+                if saved > 0:
+                    counter += saved
+                
+                # 4. Learn (Evolution)
+                # We expect exactly one result since we sent one policy
+                if results:
+                    res = results[0]
+                    reward = res.score
+                    
+                    status_icon = "OK" if reward > config.EVAL_SCORE_MIN else "NO"
+                    current_exp_id = counter 
+                    
+                    logger.info(
+                        f"  [{current_exp_id}] {status_icon} {pol.template_id:<20} | Score: {reward:>6.3f}"
+                    )
+                    
+                    # Immediate Feedback
+                    agent.learn(reward, regime, pol)
+                    
+                    # Optional: Update in-memory history if strictly needed, 
+                    # but typically reloading from disk next batch is sufficient for deduplication.
+                    # The Q-Table is already updated in memory.
+
+            except Exception as e:
+                logger.error(f"!!! [Sequential Error] {e}", exc_info=True)
+
+        logger.info("  >>> [Sequential] Batch Complete.")
+
+
 
         # F. Iterate
         time.sleep(sleep_sec)

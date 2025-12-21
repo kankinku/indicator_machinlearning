@@ -8,12 +8,15 @@ import ta
 from .custom.loader import loader
 from src.config import config
 from src.features.registry import FeatureRegistry
+from src.shared.logger import get_logger
+
+logger = get_logger("feature.factory")
 
 # Initialize loader once
 try:
     loader.load_all()
 except Exception as e:
-    print(f"Warning: Failed to load custom indicators: {e}")
+    logger.warning(f"Failed to load custom indicators: {e}")
 
 class FeatureFactory:
     """
@@ -59,6 +62,12 @@ class FeatureFactory:
             
         features = pd.concat(feature_chunks, axis=1)
         
+        # De-duplicate columns (keep first occurrence to maintain 'One Source of Truth')
+        if features.columns.duplicated().any():
+            dupes = features.columns[features.columns.duplicated()].unique().tolist()
+            logger.warning(f"[FeatureFactory] Duplicate features detected and removed: {dupes}")
+            features = features.loc[:, ~features.columns.duplicated()]
+        
         # Handle Inf/Nan
         features = features.replace([np.inf, -np.inf], np.nan)
         features = features.ffill().fillna(0.0)
@@ -99,6 +108,11 @@ class FeatureFactory:
         try:
             instance = handler_cls()
             result = instance.compute(df, **params)
+            
+            if result is not None and not result.empty:
+                # [Crucial] Prefix columns with feature_id to prevent naming collisions (e.g., LightGBM duplicates)
+                result.columns = [f"{feature_id}__{c}" for c in result.columns]
+                
             return result
         except Exception as e:
             print(f"Execution Error for {feature_id}: {e}")
