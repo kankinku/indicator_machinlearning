@@ -1,0 +1,29 @@
+{
+  "label_config": {
+    "k": 1.0,
+    "H": 20
+  },
+  "direction_model": "serialized_external",
+  "risk_model": null,
+  "calibration_metrics": {},
+  "metadata": {
+    "genome": {
+      "MOMENTUM_PMO_V1": {
+        "len1": 43,
+        "len2": 20
+      },
+      "MOMENTUM_PAM_V1": {
+        "length": 26
+      },
+      "MOMENTUM_EFI_V1": {
+        "length": 23
+      },
+      "MOMENTUM_VORTEX_V1": {
+        "length": 36
+      }
+    }
+  },
+  "backtest_results": "saved_as_csv",
+  "direction_model_ref": "6172cd5b-dc31-4fa3-a3cf-e42c34602faf.joblib",
+  "backtest_results_ref": "6172cd5b-dc31-4fa3-a3cf-e42c34602faf_results.csv"
+}

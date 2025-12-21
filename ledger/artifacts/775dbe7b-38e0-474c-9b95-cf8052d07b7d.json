@@ -1,0 +1,22 @@
+{
+  "label_config": {
+    "k": 1.0,
+    "H": 20
+  },
+  "direction_model": "serialized_external",
+  "risk_model": null,
+  "calibration_metrics": {},
+  "metadata": {
+    "genome": {
+      "VOLATILITY_UI_V1": {
+        "length": 27
+      },
+      "VOLATILITY_RVI_V1": {
+        "length": 30
+      }
+    }
+  },
+  "backtest_results": "saved_as_csv",
+  "direction_model_ref": "775dbe7b-38e0-474c-9b95-cf8052d07b7d.joblib",
+  "backtest_results_ref": "775dbe7b-38e0-474c-9b95-cf8052d07b7d_results.csv"
+}

@@ -1,0 +1,27 @@
+{
+  "label_config": {
+    "k": 1.0,
+    "H": 20
+  },
+  "direction_model": "serialized_external",
+  "risk_model": null,
+  "calibration_metrics": {},
+  "metadata": {
+    "genome": {
+      "VOLUME_CMF_V1": {
+        "length": 21
+      },
+      "VOLUME_CHO_V1": {
+        "fast": 3,
+        "slow": 26
+      },
+      "VOLUME_OBV_V1": {},
+      "VOLUME_VROC_V1": {
+        "length": 43
+      }
+    }
+  },
+  "backtest_results": "saved_as_csv",
+  "direction_model_ref": "564a287d-35dc-4621-ab16-b4cb82661bfe.joblib",
+  "backtest_results_ref": "564a287d-35dc-4621-ab16-b4cb82661bfe_results.csv"
+}

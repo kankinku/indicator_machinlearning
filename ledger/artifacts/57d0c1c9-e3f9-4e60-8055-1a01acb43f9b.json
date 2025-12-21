@@ -1,0 +1,26 @@
+{
+  "label_config": {
+    "k": 1.0,
+    "H": 20
+  },
+  "direction_model": "serialized_external",
+  "risk_model": null,
+  "calibration_metrics": {},
+  "metadata": {
+    "genome": {
+      "TREND_ADX_V1": {
+        "length": 31
+      },
+      "TREND_MACROSS_V1": {
+        "fast": 33,
+        "slow": 102
+      },
+      "TREND_TRIX_V1": {
+        "length": 33
+      }
+    }
+  },
+  "backtest_results": "saved_as_csv",
+  "direction_model_ref": "57d0c1c9-e3f9-4e60-8055-1a01acb43f9b.joblib",
+  "backtest_results_ref": "57d0c1c9-e3f9-4e60-8055-1a01acb43f9b_results.csv"
+}

@@ -1,0 +1,32 @@
+{
+  "label_config": {
+    "k": 1.0,
+    "H": 20
+  },
+  "direction_model": "serialized_external",
+  "risk_model": null,
+  "calibration_metrics": {},
+  "metadata": {
+    "genome": {
+      "TREND_TRIX_V1": {
+        "length": 50
+      },
+      "TREND_ICHIMOKU_V1": {
+        "tenkan": 6,
+        "kijun": 38,
+        "senkou": 49
+      },
+      "TREND_SUPER_V1": {
+        "length": 7,
+        "multiplier": 3.0
+      },
+      "TREND_MACROSS_V1": {
+        "fast": 12,
+        "slow": 143
+      }
+    }
+  },
+  "backtest_results": "saved_as_csv",
+  "direction_model_ref": "1a159e98-8a1f-4ce9-b4ff-48998116d3eb.joblib",
+  "backtest_results_ref": "1a159e98-8a1f-4ce9-b4ff-48998116d3eb_results.csv"
+}

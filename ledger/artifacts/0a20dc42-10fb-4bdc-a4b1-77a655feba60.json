@@ -1,0 +1,22 @@
+{
+  "label_config": {
+    "k": 1.0,
+    "H": 20
+  },
+  "direction_model": "serialized_external",
+  "risk_model": null,
+  "calibration_metrics": {},
+  "metadata": {
+    "genome": {
+      "TREND_ADX_V1": {
+        "length": 29
+      },
+      "TREND_TRIX_V1": {
+        "length": 14
+      }
+    }
+  },
+  "backtest_results": "saved_as_csv",
+  "direction_model_ref": "0a20dc42-10fb-4bdc-a4b1-77a655feba60.joblib",
+  "backtest_results_ref": "0a20dc42-10fb-4bdc-a4b1-77a655feba60_results.csv"
+}

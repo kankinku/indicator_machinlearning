@@ -1,0 +1,34 @@
+{
+  "label_config": {
+    "k": 1.0,
+    "H": 10
+  },
+  "direction_model": "serialized_external",
+  "risk_model": {
+    "avg_vol": 0.010628073312232738,
+    "std_vol": 0.010886703269979151,
+    "p95": 0.030370517808833566,
+    "p99": 0.049131818992198144,
+    "max_vol": 0.1200308181135814
+  },
+  "calibration_metrics": {
+    "ece": 0.1414992871292103,
+    "brier": 0.27067898029785387
+  },
+  "metadata": {
+    "template_id": "T01",
+    "feature_names": [
+      "price_action_rsi_14",
+      "price_action_rsi_7",
+      "price_action_roc_10",
+      "price_action_dist_ma_20",
+      "price_action_dist_ma_60",
+      "volatility_atr_norm",
+      "volatility_bb_width",
+      "volatility_vol_cone_ratio"
+    ]
+  },
+  "backtest_results": "saved_as_csv",
+  "direction_model_ref": "8f43baae-9dc0-498f-9f0b-bc7417ddffd2.joblib",
+  "backtest_results_ref": "8f43baae-9dc0-498f-9f0b-bc7417ddffd2_results.csv"
+}

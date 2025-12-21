@@ -1,0 +1,25 @@
+{
+  "label_config": {
+    "k": 1.0,
+    "H": 20
+  },
+  "direction_model": "serialized_external",
+  "risk_model": null,
+  "calibration_metrics": {},
+  "metadata": {
+    "genome": {
+      "MOMENTUM_CMO_V1": {
+        "length": 7
+      },
+      "MOMENTUM_WILLR_V1": {
+        "length": 16
+      },
+      "MOMENTUM_MOM_V1": {
+        "length": 2
+      }
+    }
+  },
+  "backtest_results": "saved_as_csv",
+  "direction_model_ref": "e5fae93e-0c5b-4b85-9648-6f4616f59a72.joblib",
+  "backtest_results_ref": "e5fae93e-0c5b-4b85-9648-6f4616f59a72_results.csv"
+}

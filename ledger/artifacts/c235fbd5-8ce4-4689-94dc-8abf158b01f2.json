@@ -1,0 +1,23 @@
+{
+  "label_config": {
+    "k": 1.0,
+    "H": 20
+  },
+  "direction_model": "serialized_external",
+  "risk_model": null,
+  "calibration_metrics": {},
+  "metadata": {
+    "genome": {
+      "TREND_MACROSS_V1": {
+        "fast": 48,
+        "slow": 51
+      },
+      "TREND_AROON_V1": {
+        "length": 48
+      }
+    }
+  },
+  "backtest_results": "saved_as_csv",
+  "direction_model_ref": "c235fbd5-8ce4-4689-94dc-8abf158b01f2.joblib",
+  "backtest_results_ref": "c235fbd5-8ce4-4689-94dc-8abf158b01f2_results.csv"
+}

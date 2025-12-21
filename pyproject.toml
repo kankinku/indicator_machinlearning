@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "indicator-machinlearning"
+version = "0.1.0"
+description = "Template 기반 메타 최적화 트레이딩 실험 시스템 스켈레톤"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "hanji", email = "" }]
+dependencies = []
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
