@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 import json
 from dataclasses import asdict
+import time
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -16,7 +17,7 @@ sys.path.append(str(PROJECT_ROOT))
 # Import Config and Registry
 from src.config import config
 from src.ledger.repo import LedgerRepo
-from src.features.registry import FeatureRegistry
+from src.features.registry import get_registry
 from src.shared.returns import (
     compute_compounded_return_pct,
     get_risk_reward_ratio,
@@ -40,9 +41,8 @@ app.add_middleware(
 LEDGER_PATH = PROJECT_ROOT / "ledger"
 repo = LedgerRepo(LEDGER_PATH)
 
-feature_registry = FeatureRegistry(str(config.FEATURE_REGISTRY_PATH))
-# Ensure registry is initialized (loaded)
-feature_registry.initialize()
+feature_registry = get_registry()
+# Registry is already initialized by get_registry() if needed
 
 # Feature Factory & Data Loading
 from src.features.factory import FeatureFactory
@@ -51,6 +51,13 @@ from src.data.loader import DataLoader
 feature_factory = FeatureFactory()
 MARKET_DATA_CACHE = None
 FULL_MARKET_DATA_CACHE = None
+
+# Cache for experiment listing to prevent OOM/CPU spikes
+EXPERIMENT_CACHE = {
+    "time": 0,
+    "data": [],
+    "ttl": 5.0  # seconds
+}
 
 def get_cached_market_data():
     global MARKET_DATA_CACHE
@@ -71,13 +78,65 @@ def get_full_market_data():
     return FULL_MARKET_DATA_CACHE
 
 CODE_MAP = {
+    # [V11] 설계도 기반 Hard Gate 실패 사유
+    "MIN_TRADES": "거래 부족 (최소 기준 미달)",
+    "MAX_MDD": "MDD 초과 (생존 리스크)",
+    "WINRATE_HIGH": "승률 과다 (과적합 의심)",
+    "WINRATE_LOW": "승률 부족 (전략 결함)",
+    "RR_LOW": "손익비 부족 (R:R < 0.5)",
+    "LOW_EXPOSURE": "시장 참여율 부족",
+    
+    # 기존 호환용
     "DD_LIMIT_BREACH": "Max Drawdown Exceeded",
     "CPCV_WORST_TOO_LOW": "Validation Return Low",
     "LABEL_IMBALANCE": "Data Imbalance",
     "TURNOVER_TOO_HIGH": "Excessive Turnover",
     "SHARPE_TOO_LOW": "Low Sharpe Ratio",
-    "PBO_TOO_HIGH": "Overfitting Risk"
+    "PBO_TOO_HIGH": "Overfitting Risk",
+    "MIN_TRADES_VIOLATION": "Insufficient Trades"
 }
+
+
+def determine_rejection_status(metrics: dict, risk_budget: dict) -> tuple:
+    """
+    [V11] 설계도 기반 REJECTED 판정 로직.
+    
+    Hard Gates:
+    1. 거래 수 < VAL_MIN_TRADES
+    2. MDD > VAL_MAX_MDD_PCT
+    3. 승률 > VAL_WINRATE_MAX (과적합)
+    4. 승률 < VAL_WINRATE_MIN (전략 결함)
+    5. R:R < 0.5 (구조적 결함)
+    
+    Returns:
+        (status, fail_reason): ("Approved", "") or ("Rejected", "사유")
+    """
+    n_trades = metrics.get("sample_trades") or metrics.get("n_trades", 0)
+    mdd_pct = metrics.get("sample_mdd_pct") or metrics.get("mdd_pct", 0.0)
+    win_rate = metrics.get("sample_win_rate") or metrics.get("win_rate", 0.0)
+    reward_risk = metrics.get("sample_rr", 1.0)
+    
+    # Gate 1: 거래 수
+    if n_trades < config.VAL_MIN_TRADES:
+        return "Rejected", CODE_MAP["MIN_TRADES"]
+    
+    # Gate 2: MDD
+    if mdd_pct > config.VAL_MAX_MDD_PCT:
+        return "Rejected", CODE_MAP["MAX_MDD"]
+    
+    # Gate 3: 승률 과다 (과적합)
+    if win_rate > config.VAL_WINRATE_MAX:
+        return "Rejected", CODE_MAP["WINRATE_HIGH"]
+    
+    # Gate 4: 승률 부족 (충분한 거래 시에만)
+    if n_trades >= 30 and win_rate < config.VAL_WINRATE_MIN:
+        return "Rejected", CODE_MAP["WINRATE_LOW"]
+    
+    # Gate 5: R:R 부족 (충분한 거래 시에만)
+    if n_trades >= 20 and reward_risk < 0.5:
+        return "Rejected", CODE_MAP["RR_LOW"]
+    
+    return "Approved", ""
 
 def format_strategy_name(template_id, genome):
     if "EVO" in template_id:
@@ -112,6 +171,11 @@ def get_genome_desc(genome):
 
 @app.get("/api/experiments")
 def get_experiments():
+    # Check Cache
+    if time.time() - EXPERIMENT_CACHE["time"] < EXPERIMENT_CACHE["ttl"]:
+        if EXPERIMENT_CACHE["data"]:
+            return EXPERIMENT_CACHE["data"]
+            
     try:
         records_obj = repo.load_records()
     except Exception as e:
@@ -163,6 +227,23 @@ def get_experiments():
         bt_win_rate = metrics.get("sample_win_rate")
         bt_trades = metrics.get("sample_trades")
         bt_mdd = metrics.get("sample_mdd_pct")
+        bt_rr = metrics.get("sample_rr", 1.0)
+        
+        # [V11] 설계도 기반 통합 REJECTED 판정
+        # 기존 reason_codes가 있으면 먼저 확인, 없으면 새 로직으로 판정
+        if r.reason_codes:
+            status = "Rejected"
+            fail_reason_clean = CODE_MAP.get(r.reason_codes[0], r.reason_codes[0])
+        else:
+            # 새로운 Hard Gate 적용
+            validation_metrics = {
+                "sample_trades": bt_trades if bt_trades is not None else n_trades,
+                "sample_mdd_pct": bt_mdd if bt_mdd is not None else 0.0,
+                "sample_win_rate": bt_win_rate if bt_win_rate is not None else win_rate,
+                "sample_rr": bt_rr,
+                "n_trades": n_trades,
+            }
+            status, fail_reason_clean = determine_rejection_status(validation_metrics, risk_budget)
 
         if bt_total_return is None:
             results_path = LEDGER_PATH / "artifacts" / f"{r.exp_id}_results.csv"
@@ -170,17 +251,20 @@ def get_experiments():
                 if market_df is None:
                     market_df = get_full_market_data()
                 if not market_df.empty:
-                    results_df = pd.read_csv(results_path)
-                    bt = run_signal_backtest(
-                        price_df=market_df,
-                        results_df=results_df,
-                        risk_budget=risk_budget,
-                        cost_bps=r.policy_spec.execution_assumption.get("cost_bps", 5),
-                    )
-                    bt_total_return = bt.total_return_pct
-                    bt_win_rate = bt.win_rate
-                    bt_trades = bt.trade_count
-                    bt_mdd = bt.mdd_pct
+                    try:
+                        results_df = pd.read_csv(results_path)
+                        bt = run_signal_backtest(
+                            price_df=market_df,
+                            results_df=results_df,
+                            risk_budget=risk_budget,
+                            cost_bps=r.policy_spec.execution_assumption.get("cost_bps", 5),
+                        )
+                        bt_total_return = bt.total_return_pct
+                        bt_win_rate = bt.win_rate
+                        bt_trades = bt.trade_count
+                        bt_mdd = bt.mdd_pct
+                    except Exception:
+                        pass
 
         if bt_total_return is None:
             bt_total_return = compute_compounded_return_pct(
@@ -202,7 +286,7 @@ def get_experiments():
         # Avg Return (%)
         return_mean = (bt_total_return / bt_trades) if bt_trades else 0.0
 
-        ts_iso = pd.to_datetime(r.timestamp, unit='s').isoformat()
+        ts_iso = pd.to_datetime(r.timestamp, unit='s', utc=True).isoformat()
 
         flat_data.append({
             "id": r.exp_id,
@@ -241,7 +325,7 @@ def get_experiments():
             "sample_vol_pct": metrics.get("sample_vol_pct"),
             "sample_trades": metrics.get("sample_trades"),
             "sample_win_rate": metrics.get("sample_win_rate"),
-            "sample_mdd_pct": metrics.get("sample_mdd_pct"),
+            "sample_win_rate": metrics.get("sample_win_rate"),
             "backtest_mdd_pct": float(bt_mdd),
             "k_up": risk_budget.get("k_up"),
             "k_down": risk_budget.get("k_down"),
@@ -262,6 +346,10 @@ def get_experiments():
         item["generation"] = i + 1
         
     flat_data.sort(key=lambda x: x["timestamp"], reverse=True) 
+
+    # Update Cache
+    EXPERIMENT_CACHE["data"] = flat_data
+    EXPERIMENT_CACHE["time"] = time.time()
 
     return flat_data
 
@@ -591,6 +679,69 @@ def test_model(exp_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/stats/regime")
+def get_regime_stats():
+    """
+    [V11.4] Returns Regime-based Leaderboard, Rejection Breakdown, and Indicator Priors.
+    """
+    try:
+        records = repo.load_records()
+        if not records:
+            return {"leaderboard": {}, "rejections": {}, "priors": {}}
+
+        # 1. Rejection Breakdown
+        rejections = {}
+        for r in records:
+            if r.is_rejected and r.reason_codes:
+                reason = r.reason_codes[0]
+                reason_clean = CODE_MAP.get(reason, reason)
+                rejections[reason_clean] = rejections.get(reason_clean, 0) + 1
+
+        # 2. Regime Leaderboard
+        regime_data = {}
+        for r in records:
+            # Group by regime state_key (e.g., BULL, BEAR, STAGNANT)
+            regime = r.policy_spec.rl_meta.get("state_key", "UNKNOWN")
+            if regime not in regime_data:
+                regime_data[regime] = []
+            regime_data[regime].append(r)
+
+        leaderboard = {}
+        for regime, group in regime_data.items():
+            # Filter approved only
+            approved = [r for r in group if not r.is_rejected]
+            if not approved:
+                continue
+            
+            # Sort by total_return
+            approved.sort(key=lambda x: x.cpcv_metrics.get("total_return_pct", 0.0), reverse=True)
+            
+            top_3 = []
+            for r in approved[:3]:
+                top_3.append({
+                    "id": r.exp_id[:8],
+                    "total_return": r.cpcv_metrics.get("total_return_pct", 0.0),
+                    "win_rate": r.cpcv_metrics.get("win_rate", 0.0),
+                    "trades": r.cpcv_metrics.get("n_trades", 0),
+                    "mdd": r.cpcv_metrics.get("mdd_pct", 0.0),
+                    "indicators": get_genome_desc(r.policy_spec.feature_genome)
+                })
+            leaderboard[regime] = top_3
+
+        # 3. Indicator Priors
+        from src.l3_meta.analyst import get_indicator_analyst
+        analyst = get_indicator_analyst(repo.base_dir)
+        priors = analyst.priors
+
+        return {
+            "rejections": rejections,
+            "leaderboard": leaderboard,
+            "priors": priors
+        }
+    except Exception as e:
+        print(f"Stats Error: {e}")
+        return {"error": str(e)}
+
 # Serve static files (Frontend)
 WEB_ROOT = PROJECT_ROOT / "web"
 if not WEB_ROOT.exists():
@@ -600,4 +751,5 @@ app.mount("/", StaticFiles(directory=str(WEB_ROOT), html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn
+    # Host 0.0.0.0 for external access as requested
     uvicorn.run(app, host="0.0.0.0", port=8001)

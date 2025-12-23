@@ -1,0 +1,15 @@
+{
+    "name": "Donchian Range Channel",
+    "template_id": "RANGE_TRADING",
+    "feature_genome": {
+        "VOLATILITY_DONCHIAN_V1": {
+            "lower_length": 20,
+            "upper_length": 20
+        }
+    },
+    "risk_budget": {
+        "k_up": 2.2,
+        "k_down": 1.8,
+        "horizon": 25
+    }
+}

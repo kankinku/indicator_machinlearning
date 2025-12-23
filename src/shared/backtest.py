@@ -17,6 +17,7 @@ class BacktestResult:
     total_return_pct: float
     win_rate: float
     trade_count: int
+    valid_trade_count: int  # [V11.2] Regime-aligned trades
     mdd_pct: float
 
 
@@ -103,9 +104,10 @@ def simulate_backtest(
     sl_pct: float,
     horizon: int,
     cost_bps: float,
+    target_regime: Optional[str] = None,  # [V11.2]
 ) -> BacktestResult:
     if price_df.empty:
-        return BacktestResult([], [], [], 0.0, 0.0, 0, 0.0)
+        return BacktestResult([], [], [], 0.0, 0.0, 0, 0, 0.0)
 
     df = price_df.copy()
     for col in ("open", "high", "low", "close"):
@@ -136,8 +138,14 @@ def simulate_backtest(
             entry_price = float(df["open"].iloc[i])
             entry_idx = i
             hold_bars = 0
-            pending_dir = 0
-            pending_idx = None
+            pending_idx = i + 1
+            
+        # [V11.2] Regime Check for Entry (if provided)
+        # Entry price is usually open of next bar, so we check regime at entry_idx or pending_idx
+        is_regime_match = True
+        if target_regime and "regime_label" in df.columns:
+            # Check the regime at the bar where signal was generated
+            is_regime_match = df["regime_label"].iloc[i] == target_regime
 
         if position == 0:
             if signal != 0 and i + 1 < len(df):
@@ -204,6 +212,7 @@ def simulate_backtest(
                 "return_pct": round(pnl_pct * 100.0, 4),
                 "reason": exit_reason,
                 "bars": hold_bars,
+                "is_valid": is_regime_match, # [V11.2]
             })
             position = 0
             entry_price = None
@@ -226,6 +235,7 @@ def simulate_backtest(
             "return_pct": round(pnl_pct * 100.0, 4),
             "reason": "eod",
             "bars": hold_bars,
+            "is_valid": is_regime_match,
         })
         if equity_curve:
             equity_curve[-1] = (equity - 1.0) * 100.0
@@ -235,6 +245,7 @@ def simulate_backtest(
     trade_returns = [t["return_pct"] for t in trades]
     wins = sum(1 for v in trade_returns if v > 0)
     trade_count = len(trade_returns)
+    valid_trade_count = sum(1 for t in trades if t.get("is_valid", True))
     win_rate = wins / trade_count if trade_count > 0 else 0.0
 
     equity_arr = np.array([1.0 + v / 100.0 for v in equity_curve]) if equity_curve else np.array([1.0])
@@ -252,6 +263,7 @@ def simulate_backtest(
         total_return_pct=total_return_pct,
         win_rate=win_rate,
         trade_count=trade_count,
+        valid_trade_count=valid_trade_count,
         mdd_pct=mdd_pct,
     )
 
@@ -261,6 +273,7 @@ def run_signal_backtest(
     results_df: Optional[pd.DataFrame],
     risk_budget: Dict[str, object],
     cost_bps: float,
+    target_regime: Optional[str] = None,
 ) -> BacktestResult:
     signal_idx = _extract_signal_index(results_df)
     if signal_idx is not None and not signal_idx.empty:
@@ -270,4 +283,4 @@ def run_signal_backtest(
 
     tp_pct, sl_pct, horizon = derive_trade_params(risk_budget)
     signals = build_signal_series(results_df, price_df)
-    return simulate_backtest(price_df, signals, tp_pct, sl_pct, horizon, cost_bps)
+    return simulate_backtest(price_df, signals, tp_pct, sl_pct, horizon, cost_bps, target_regime=target_regime)

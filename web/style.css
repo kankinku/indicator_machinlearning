@@ -167,7 +167,7 @@ details.detail-collapse {
     padding: 14px 18px;
 }
 
-details.detail-collapse > summary {
+details.detail-collapse>summary {
     cursor: pointer;
     list-style: none;
     font-size: 13px;
@@ -177,18 +177,18 @@ details.detail-collapse > summary {
     align-items: center;
 }
 
-details.detail-collapse > summary::-webkit-details-marker {
+details.detail-collapse>summary::-webkit-details-marker {
     display: none;
 }
 
-details.detail-collapse > summary::after {
+details.detail-collapse>summary::after {
     content: '+';
     margin-left: auto;
     color: var(--text-secondary);
     font-size: 16px;
 }
 
-details.detail-collapse[open] > summary::after {
+details.detail-collapse[open]>summary::after {
     content: '-';
 }
 
@@ -965,4 +965,93 @@ select.sort-select {
 .prediction-details strong {
     color: white;
     margin-left: 8px;
+}
+
+/* === Analysis Page Styles === */
+.card-row {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 30px;
+}
+
+.card {
+    background-color: var(--card-bg);
+    border-radius: 16px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 24px;
+}
+
+.card-header {
+    font-size: 16px;
+    font-weight: 600;
+    color: white;
+    margin-bottom: 20px;
+}
+
+.regime-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+    gap: 20px;
+    margin-bottom: 40px;
+}
+
+.regime-card {
+    background-color: var(--card-bg);
+    border-radius: 16px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 24px;
+    transition: transform 0.2s;
+}
+
+.regime-card:hover {
+    transform: translateY(-4px);
+}
+
+.regime-name {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent-blue);
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.leader-item {
+    margin-bottom: 15px;
+}
+
+.leader-rank {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+}
+
+.leader-info {
+    font-size: 13px;
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.leader-stats {
+    display: flex;
+    gap: 12px;
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.leader-stats span {
+    color: var(--accent-green);
+}
+
+.priors-regime-row {
+    margin-bottom: 20px;
+}
+
+.priors-regime-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent-blue);
+    margin-bottom: 10px;
 }

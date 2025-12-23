@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import math
 from typing import Optional, Tuple
+from src.config import config
 
-MIN_TRADES = 20
+MIN_TRADES = config.EVAL_MIN_TRADES
 MIN_WIN_RATE = 0.5
 MIN_CPCV_MEAN = 0.0
 MIN_CPCV_WORST = 0.0

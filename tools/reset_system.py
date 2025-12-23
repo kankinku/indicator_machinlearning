@@ -1,13 +1,31 @@
 import os
 import shutil
 import sys
+import subprocess
 from pathlib import Path
 
 # Add project root to sys.path to import modules if needed
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
+import time
+
+def kill_zombie_processes():
+    print(">>> [System Reset] Killing running python processes (main.py, run_web.py)...")
+    try:
+        # Windows process termination using WMIC
+        # We suppress output to keep it clean
+        subprocess.run('wmic process where "CommandLine like \'%main.py%\'" call terminate', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run('wmic process where "CommandLine like \'%run_web.py%\'" call terminate', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)  # Wait for file handles to be released
+        print("    [Process] Cleanup signals sent.")
+    except Exception as e:
+        print(f"    [Warning] Failed to kill processes: {e}")
+
 def reset_system():
+    # 0. Kill Zombies First!
+    kill_zombie_processes()
+
     print(">>> [System Reset] Starting system initialization...")
     
     # 1. Define Paths to Clean
@@ -30,6 +48,7 @@ def reset_system():
                     print(f"    [Deleted] File: {path}")
             except Exception as e:
                 print(f"    [Error] Failed to delete {path}: {e}")
+                print("    (Hint: Close all python windows and try again)")
         else:
             print(f"    [Skip] Not found: {path}")
 

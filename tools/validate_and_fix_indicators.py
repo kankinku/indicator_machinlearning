@@ -77,8 +77,8 @@ def validate_and_fix():
         print(f"    [Warn] Could not fetch live data: {e}. Using dummy data.")
         df = create_dummy_ohlcv()
     
-    # Ensure lowercase columns
-    df.columns = [c.lower() for c in df.columns]
+    # Ensure columns match expectations (usually uppercase in indicators)
+    # df.columns = [c.lower() for c in df.columns]
     
     # 2. Load Registry
     registry = FeatureRegistry(str(config.FEATURE_REGISTRY_PATH))

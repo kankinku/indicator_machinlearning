@@ -1,0 +1,16 @@
+{
+    "name": "RSI Mean Reversion",
+    "template_id": "MEAN_REVERSION",
+    "feature_genome": {
+        "MOMENTUM_RSI_V1": {
+            "window": 14,
+            "threshold_low": 30,
+            "threshold_high": 70
+        }
+    },
+    "risk_budget": {
+        "k_up": 1.5,
+        "k_down": 1.0,
+        "horizon": 10
+    }
+}

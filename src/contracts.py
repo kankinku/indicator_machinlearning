@@ -131,6 +131,8 @@ class LedgerRecord:
     risk_report: Dict[str, Any]
     
     reason_codes: List[str]
+    is_rejected: bool = False
+    rejection_reason: Optional[str] = None
     fix_suggestion: Optional[FixSuggestion] = None
     
     # [New] Store the Verdict directly or parts of it for easy query

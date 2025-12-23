@@ -21,6 +21,7 @@ from src.l1_judge.evaluator import (
     normalize_scores,
     sample_risk_params,
     stable_hash,
+    validate_sample,
 )
 from src.shared.backtest import run_signal_backtest
 from src.orchestration.run_experiment import _generate_features_cached, _run_experiment_core, build_record_and_artifact
@@ -37,6 +38,7 @@ class WindowResult:
     p10_score: float
     std_score: float
     violation_rate: float
+    avg_alpha: float = 0.0  # [V11.3] Walk-forward Alpha Consistency
     normalized_score: float = 0.0
 
 
@@ -96,13 +98,28 @@ def _sample_reduced_windows(df: pd.DataFrame, slices: int, slice_bars: int) -> L
 
 
 def build_windows(df: pd.DataFrame, stage: str) -> List[Tuple[str, pd.DataFrame]]:
+    current_stage_idx = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
+    
     if stage == "fast":
         lookback = min(config.EVAL_FAST_LOOKBACK_BARS, len(df))
         fast_df = df.iloc[-lookback:]
         return _split_contiguous_windows(fast_df, config.EVAL_WINDOW_COUNT_FAST, "FAST")
+    
     if stage == "reduced":
         return _sample_reduced_windows(df, config.EVAL_REDUCED_SLICES, config.EVAL_REDUCED_SLICE_BARS)
-    return _split_contiguous_windows(df, config.EVAL_WINDOW_COUNT_FULL, "FULL")
+    
+    # [V11.3] Full Evaluation - Dynamic WF Splits
+    if config.WF_GATE_ENABLED:
+        if current_stage_idx == 1:
+            cnt = config.WF_SPLITS_STAGE1
+        elif current_stage_idx == 2:
+            cnt = config.WF_SPLITS_STAGE2
+        else:
+            cnt = config.WF_SPLITS_STAGE3
+    else:
+        cnt = config.EVAL_WINDOW_COUNT_FULL
+        
+    return _split_contiguous_windows(df, cnt, "FULL")
 
 
 def _build_sample_risk_budget(
@@ -196,6 +213,7 @@ def _evaluate_policy_windows(
 
         sample_scores: List[float] = []
         violations: List[bool] = []
+        alphas: List[float] = []
 
         for sample in samples:
             sample_risk = _build_sample_risk_budget(risk_budget, sample.tp_pct, sample.sl_pct, sample.horizon)
@@ -211,6 +229,7 @@ def _evaluate_policy_windows(
                 results_df=core.get("results_df"),
                 risk_budget=sample_risk,
                 cost_bps=cost_bps,
+                target_regime=regime_id, # [V11.2]
             )
             trade_returns = np.array([t["return_pct"] / 100.0 for t in bt.trades], dtype=float)
             metrics = compute_sample_metrics(trade_returns, bt.trade_count)
@@ -218,8 +237,35 @@ def _evaluate_policy_windows(
             metrics.mdd_pct = bt.mdd_pct
             metrics.win_rate = bt.win_rate
             metrics.trade_count = bt.trade_count
-            sample_score = score_sample(metrics)
-            violation = is_violation(metrics)
+            metrics.valid_trade_count = bt.valid_trade_count # [V11.2]
+            
+            # [V11.2] Bench ROI (Buy & Hold) calculation for Alpha
+            bench_start = float(window_df["close"].iloc[0])
+            bench_end = float(window_df["close"].iloc[-1])
+            bench_roi_pct = ((bench_end / bench_start) - 1.0) * 100.0
+            metrics.benchmark_roi_pct = bench_roi_pct
+            
+            # Alpha = Strat ROI - Bench ROI
+            alpha = (bt.total_return_pct - bench_roi_pct) / 100.0
+            alphas.append(alpha)
+
+            # [vNext] Calc Exposure Ratio
+            results_df = core.get("results_df")
+            if results_df is not None and not results_df.empty:
+                exposure_ratio = float((results_df["pred"] != 0).sum()) / len(results_df)
+            else:
+                exposure_ratio = 0.0
+            metrics.exposure_ratio = exposure_ratio
+
+            # [vNext] Validation (Hard Gate)
+            passed, reason = validate_sample(metrics)
+
+            if not passed:
+                sample_score = float(config.EVAL_SCORE_MIN)
+                violation = True
+            else:
+                sample_score = score_sample(metrics)
+                violation = False
 
             sample_scores.append(sample_score)
             violations.append(violation)
@@ -235,6 +281,8 @@ def _evaluate_policy_windows(
                 )
 
         agg = aggregate_sample_scores(sample_scores, violations)
+        avg_alpha = float(np.mean(alphas)) if alphas else 0.0
+        
         window_results.append(
             WindowResult(
                 window_id=window_id,
@@ -243,9 +291,25 @@ def _evaluate_policy_windows(
                 p10_score=agg["p10_score"],
                 std_score=agg["std_score"],
                 violation_rate=agg["violation_rate"],
+                avg_alpha=avg_alpha,
             )
         )
 
+    # [V11.4] After evaluation, compute trade logic for the overall best sample to provide feedback
+    if best_sample and "trade_logic" not in best_sample.core:
+        # We need X_features for that window
+        best_window_df = next(win_df for win_id, win_df in windows if win_id == best_sample.window_id)
+        X_best = X_full.loc[best_window_df.index]
+        
+        best_core_with_logic = _run_experiment_core(
+            policy_spec=policy_spec,
+            df=best_window_df,
+            X_features=X_best,
+            risk_budget=best_sample.risk_budget,
+            include_trade_logic=True,
+        )
+        best_sample.core["trade_logic"] = best_core_with_logic.get("trade_logic", {})
+        
     return ModuleResult(
         policy_spec=policy_spec,
         module_key=module_key,
@@ -270,10 +334,13 @@ def _normalize_window_scores(results: List[ModuleResult]) -> None:
 
 
 def _finalize_module_scores(results: List[ModuleResult]) -> None:
+    current_stage_idx = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
+    
     for r in results:
         if not r.window_results:
             r.score = config.EVAL_SCORE_MIN
             continue
+            
         norm_scores = [w.normalized_score for w in r.window_results]
         arr = np.array(norm_scores, dtype=float)
         median_score = float(np.median(arr))
@@ -281,12 +348,36 @@ def _finalize_module_scores(results: List[ModuleResult]) -> None:
         std_score = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
         violation_rate = float(np.mean([w.violation_rate for w in r.window_results]))
 
-        r.score = (
-            median_score
-            + (config.EVAL_SCORE_W_RETURN_Q * p10_score)
-            - (config.EVAL_SCORE_W_VOL * std_score)
-            - (config.EVAL_SCORE_W_VIOLATION * violation_rate)
-        )
+        # [V11.3] Walk-forward Consistency Gate
+        wf_failed = False
+        if config.WF_GATE_ENABLED and r.stage == "full":
+            if current_stage_idx == 1:
+                alpha_floor = config.WF_ALPHA_FLOOR_STAGE1
+            elif current_stage_idx == 2:
+                alpha_floor = config.WF_ALPHA_FLOOR_STAGE2
+            else:
+                alpha_floor = config.WF_ALPHA_FLOOR_STAGE3
+            
+            # 모든 구간에서 Alpha 가 하한선 이상이어야 함 (또는 대다수)
+            # 여기서는 '모근 구간 무조건 통과' 옵션 (Deterministic)
+            for w in r.window_results:
+                if w.avg_alpha < alpha_floor:
+                    wf_failed = True
+                    break
+
+        if violation_rate > 0.5 or wf_failed:
+             # [V11.3] WF 실패 시 Rejection 수준의 페널티
+             r.score = config.EVAL_SCORE_MIN
+        else:
+            r.score = (
+                median_score
+                + (config.EVAL_SCORE_W_RETURN_Q * p10_score)
+                - (config.EVAL_SCORE_W_VOL * std_score)
+                - (config.EVAL_SCORE_W_VIOLATION * violation_rate)
+            )
+        
+        # 하한선 적용 (RL 안정성)
+        r.score = max(float(config.EVAL_SCORE_MIN), float(r.score))
 
 
 def evaluate_stage(

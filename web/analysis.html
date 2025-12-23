@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analysis - Vibe Lab</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+
+<body id="page-analysis">
+
+    <!-- Sidebar -->
+    <nav class="sidebar">
+        <a href="index.html" class="brand">Vibe Lab</a>
+        <div class="nav-links">
+            <a href="index.html" class="nav-item">
+                <svg class="nav-icon" viewBox="0 0 24 24">
+                    <path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z" />
+                </svg>
+                Dashboard
+            </a>
+            <a href="history.html" class="nav-item">
+                <svg class="nav-icon" viewBox="0 0 24 24">
+                    <path
+                        d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z" />
+                </svg>
+                History
+            </a>
+            <a href="features.html" class="nav-item">
+                <svg class="nav-icon" viewBox="0 0 24 24">
+                    <path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2z" />
+                </svg>
+                Feature Universe
+            </a>
+            <a href="analysis.html" class="nav-item active">
+                <svg class="nav-icon" viewBox="0 0 24 24">
+                    <path
+                        d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM9 17H7v-7h2v7zm4 0h-2V7h2v10zm4 0h-2v-4h2v4z" />
+                </svg>
+                Analysis
+            </a>
+            <a href="backtest.html" class="nav-item">
+                <svg class="nav-icon" viewBox="0 0 24 24">
+                    <path d="M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z" />
+                </svg>
+                Backtest
+            </a>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <div class="container">
+            <header>
+                <h1>Analysis</h1>
+                <p class="subtitle">Insights into Regime Performance & Learning Feedback</p>
+            </header>
+
+            <div class="card-row">
+                <div class="card" style="flex: 1;">
+                    <div class="card-header">Rejection Breakdown (Fail Reason)</div>
+                    <div id="rejection-chart" style="height: 350px;"></div>
+                </div>
+                <div class="card" style="flex: 1;">
+                    <div class="card-header">Category Priors (L2 Importance Feedback)</div>
+                    <div id="priors-chart" style="height: 350px;"></div>
+                </div>
+            </div>
+
+            <div class="section-header">
+                <div class="section-title">Regime Leaderboard (Top 3 Approved)</div>
+            </div>
+            <div id="regime-leaderboard" class="regime-grid">
+                <!-- Dynamic Content -->
+                <div class="status-text">Loading insights...</div>
+            </div>
+        </div>
+    </main>
+
+    <script src="app.js?v=4"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            if (window.app && app.initAnalysis) {
+                app.initAnalysis();
+
+                // Auto-refresh every 30 seconds
+                setInterval(() => {
+                    app.initAnalysis();
+                }, 30000);
+            } else {
+                console.error("App or initAnalysis not found");
+            }
+        });
+    </script>
+</body>
+
+</html>

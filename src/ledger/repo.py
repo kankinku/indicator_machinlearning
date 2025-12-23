@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import time
+import random
+import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import List, Optional
@@ -19,29 +22,49 @@ class LedgerRepo:
         self.artifact_dir = self.base_dir / "artifacts"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
 
+    def _retry_op(self, func, *args, **kwargs):
+        """Retries a file operation on PermissionError (common on Windows)."""
+        max_retries = 10
+        for i in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except (PermissionError, OSError) as e:
+                # WinError 32: The process cannot access the file because it is being used by another process.
+                if i == max_retries - 1:
+                    print(f"[Repo] File access failed after {max_retries} retries: {e}")
+                    raise
+                time.sleep(0.1 + random.random() * 0.3)  # Jitter
+
     def save_record(self, record: LedgerRecord, artifact: Optional[ArtifactBundle] = None) -> None:
         if artifact:
             artifact_path = self.artifact_dir / f"{record.exp_id}.json"
             artifact.save(artifact_path)
             record.model_artifact_ref = str(artifact_path)
 
-        with self.ledger_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(asdict(record)) + "\n")
+        def _append():
+            with self.ledger_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(asdict(record)) + "\n")
+        
+        self._retry_op(_append)
 
     def load_records(self) -> List[LedgerRecord]:
         if not self.ledger_path.exists():
             return []
-        records: List[LedgerRecord] = []
-        with self.ledger_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    raw = json.loads(line)
-                    records.append(self._from_dict(raw))
-                except Exception:
-                    continue
-        return records
+            
+        def _read():
+            records: List[LedgerRecord] = []
+            with self.ledger_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        raw = json.loads(line)
+                        records.append(self._from_dict(raw))
+                    except Exception:
+                        continue
+            return records
+
+        return self._retry_op(_read)
 
     @staticmethod
     def _from_dict(data: dict) -> LedgerRecord:
@@ -69,9 +92,7 @@ class LedgerRepo:
     def prune_experiments(self, keep_n: int = 100) -> int:
         """
         Prune experiments, keeping only the top N performers.
-        Sorting Criteria: 
-        1. Status ("Approved" > "Rejected")
-        2. Return-centric ranking with stability checks
+        Uses atomic write pattern (write tmp -> rename) to avoid race conditions.
         """
         records = self.load_records()
         if len(records) <= keep_n:
@@ -136,10 +157,31 @@ class LedgerRepo:
         to_keep = records[:keep_n]
         to_delete = records[keep_n:]
         
-        # 1. Rewrite JSONL
-        with self.ledger_path.open("w", encoding="utf-8") as f:
-            for rec in to_keep:
-                f.write(json.dumps(asdict(rec)) + "\n")
+        # 1. Rewrite JSONL Atomically
+        tmp_path = self.ledger_path.with_suffix(".tmp")
+        
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                for rec in to_keep:
+                    f.write(json.dumps(asdict(rec)) + "\n")
+            
+            # Atomic replace
+            def _replace():
+                if self.ledger_path.exists():
+                    os.replace(tmp_path, self.ledger_path)
+                else:
+                    os.rename(tmp_path, self.ledger_path)
+            
+            self._retry_op(_replace)
+            
+        except Exception as e:
+            # Clean up tmp if failed
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except:
+                    pass
+            raise e
                 
         # 2. Delete Artifacts
         deleted_count = 0

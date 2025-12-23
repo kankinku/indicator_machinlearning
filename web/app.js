@@ -24,6 +24,10 @@ const app = {
             this.initFeatures();
         } else if (pageId === 'page-detail') {
             this.initDetail();
+        } else if (pageId === 'page-analysis') {
+            this.initAnalysis();
+        } else if (pageId === 'page-backtest') {
+            this.initBacktest();
         }
     },
     formatRisk: function (d) {
@@ -66,6 +70,14 @@ const app = {
         return num.toFixed(decimals);
     },
 
+    saveState: function (key, val) {
+        localStorage.setItem(key, String(val));
+    },
+
+    restoreState: function (key) {
+        return localStorage.getItem(key) === 'true';
+    },
+
     calculateScore: function (d) {
         // Balanced Approach:
         // Return * 3.0 (Significant) + WinRate * 50 (Baseline) + Trade * 0.1 (Participation, max 5.0)
@@ -75,6 +87,9 @@ const app = {
     // === Dashboard ===
     initDashboard: async function () {
         await this.fetchData();
+        const cb = document.getElementById('dash-include-rejected');
+        if (cb) cb.checked = this.restoreState('dash-include-rejected');
+
         this.renderKPIs();
         this.renderHallOfFame();
         this.renderDashTable();
@@ -150,7 +165,17 @@ const app = {
         const tbody = document.getElementById('dash-table-body');
         if (!tbody) return;
         tbody.innerHTML = "";
-        let sorted = [...this.data];
+
+        if (!this.data || this.data.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:20px; color:#86868B;">No data available or loading...</td></tr>';
+            return;
+        }
+
+        const includeRejected = document.getElementById('dash-include-rejected')?.checked;
+        if (includeRejected !== undefined) this.saveState('dash-include-rejected', includeRejected);
+
+        let sorted = this.data.filter(d => includeRejected || d.status === "Approved");
+
         // Default Sort: Holistic Score
         sorted.sort((a, b) => this.calculateScore(b) - this.calculateScore(a));
         const top5 = sorted.slice(0, 5);
@@ -160,6 +185,10 @@ const app = {
     // === History ===
     initHistory: async function () {
         await this.fetchData();
+
+        const cb = document.getElementById('hist-include-rejected');
+        if (cb) cb.checked = this.restoreState('hist-include-rejected');
+
         this.renderHistoryTable();
 
         const searchInput = document.getElementById('search-input');
@@ -170,12 +199,21 @@ const app = {
         }
     },
 
-    renderHistoryTable: function (filterText = "") {
+    renderHistoryTable: function (filterText = null) {
         const tbody = document.getElementById('hist-table-body');
         if (!tbody) return;
 
+        if (filterText === null || filterText === undefined) {
+            const searchInput = document.getElementById('search-input');
+            filterText = searchInput ? searchInput.value : "";
+        }
+
         tbody.innerHTML = "";
-        let displayData = [...this.data];
+
+        const includeRejected = document.getElementById('hist-include-rejected')?.checked;
+        if (includeRejected !== undefined) this.saveState('hist-include-rejected', includeRejected);
+
+        let displayData = this.data.filter(d => includeRejected || d.status === "Approved");
 
         if (filterText) {
             const lower = filterText.toLowerCase();
@@ -208,7 +246,49 @@ const app = {
     // === Features ===
     initFeatures: async function () {
         await this.fetchFeatures();
+        this.renderFeatureStats();
         this.renderFeatureTable();
+    },
+
+    renderFeatureStats: function () {
+        const statsContainer = document.getElementById('feature-stats');
+        if (!statsContainer || this.features.length === 0) return;
+
+        const total = this.features.length;
+        const categories = [...new Set(this.features.map(f => f.category).filter(Boolean))];
+        const categoryCounts = this.features.reduce((acc, f) => {
+            if (f.category) {
+                acc[f.category] = (acc[f.category] || 0) + 1;
+            }
+            return acc;
+        }, {});
+
+        // Sort categories by count
+        const topCats = Object.entries(categoryCounts)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 4);
+
+        let html = `
+            <div class="kpi-card">
+                <div class="kpi-label">Total Features</div>
+                <div class="kpi-value">${total}</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Categories</div>
+                <div class="kpi-value">${categories.length}</div>
+            </div>
+        `;
+
+        topCats.forEach(([cat, count]) => {
+            html += `
+                <div class="kpi-card">
+                    <div class="kpi-label">${cat}</div>
+                    <div class="kpi-value" style="font-size: 18px;">${count} Indicators</div>
+                </div>
+            `;
+        });
+
+        statsContainer.innerHTML = html;
     },
 
     renderFeatureTable: function () {
@@ -522,8 +602,14 @@ const app = {
             const date = new Date(d.timestamp);
             const timeStr = `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 
-            let statusBadge = `<span class="status-badge status-rejected">REJECTED</span>`;
-            if (d.status === "Approved") statusBadge = `<span class="status-badge status-approved">APPROVED</span>`;
+            // [V11] REJECTED 상태에 실패 사유 표시
+            let statusBadge;
+            if (d.status === "Approved") {
+                statusBadge = `<span class="status-badge status-approved">APPROVED</span>`;
+            } else {
+                const failReason = d.fail_reason || 'Unknown';
+                statusBadge = `<span class="status-badge status-rejected" title="${failReason}">REJECTED</span>`;
+            }
 
             tr.innerHTML = `
                 <td style="color:#86868B; font-family:'JetBrains Mono', monospace;">${timeStr}</td>
@@ -547,6 +633,9 @@ const app = {
 
     initBacktest: async function () {
         await this.fetchData();
+        const cb = document.getElementById('bt-include-rejected');
+        if (cb) cb.checked = this.restoreState('bt-include-rejected');
+
         this.renderModelCards();
     },
 
@@ -556,13 +645,16 @@ const app = {
 
         container.innerHTML = "";
 
-        // Get top 5 approved models sorted by Sharpe
-        const approved = this.data.filter(d => d.status === "Approved");
-        approved.sort((a, b) => b.sharpe - a.sharpe);
-        const top5 = approved.slice(0, 5);
+        const includeRejected = document.getElementById('bt-include-rejected')?.checked;
+        if (includeRejected !== undefined) this.saveState('bt-include-rejected', includeRejected);
+
+        // Get top 5 models sorted by Sharpe
+        const candidates = this.data.filter(d => includeRejected || d.status === "Approved");
+        candidates.sort((a, b) => b.sharpe - a.sharpe);
+        const top5 = candidates.slice(0, 5);
 
         if (top5.length === 0) {
-            container.innerHTML = '<div style="color:#86868B; padding:20px;">No approved models available.</div>';
+            container.innerHTML = '<div style="color:#86868B; padding:20px;">No models available.</div>';
             return;
         }
 
@@ -603,42 +695,48 @@ const app = {
 
         // Update card selection
         document.querySelectorAll('.model-card').forEach(c => c.classList.remove('selected'));
-        document.querySelector(`.model-card[data-id="${model.short_id}"]`).classList.add('selected');
+        const selectedCard = document.querySelector(`.model-card[data-id="${model.short_id}"]`);
+        if (selectedCard) selectedCard.classList.add('selected');
 
-        // Update label
-        document.getElementById('selected-model-label').textContent = `Selected: ${model.origin}`;
+        // Update labels
+        const label = document.getElementById('selected-model-label');
+        if (label) label.textContent = `Selected: ${model.origin}`;
 
-        // Show detail section
+        const title = document.getElementById('selected-model-title');
+        if (title) title.textContent = `${model.origin} Strategy`;
+
+        // Clear previous results
+        ['m-total-return', 'm-entry-signals', 'm-trades', 'm-winrate', 'm-mdd'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = '-';
+        });
+
+        // Show section
         const section = document.getElementById('model-detail-section');
-        section.style.display = 'block';
-        section.scrollIntoView({ behavior: 'smooth' });
-
-        // Fill details
-        document.getElementById('selected-model-title').textContent = `${model.origin} Strategy`;
-
-        document.getElementById('m-total-return').textContent = '-';
-        document.getElementById('m-entry-signals').textContent = '-';
-        document.getElementById('m-trades').textContent = '-';
-        document.getElementById('m-winrate').textContent = '-';
-        document.getElementById('m-mdd').textContent = '-';
+        if (section) {
+            section.style.display = 'block';
+            section.scrollIntoView({ behavior: 'smooth' });
+        }
 
         // Composition Grid
         const grid = document.getElementById('model-comp-grid');
-        grid.innerHTML = "";
-        if (model.genome_full && typeof model.genome_full === 'object') {
-            Object.keys(model.genome_full).sort().forEach(key => {
-                const params = model.genome_full[key];
-                let paramsStr = "";
-                if (typeof params === 'object') {
-                    paramsStr = Object.entries(params).map(([k, v]) => `${k}: ${v}`).join(', ');
-                } else {
-                    paramsStr = String(params);
-                }
-                const item = document.createElement('div');
-                item.className = 'comp-item';
-                item.innerHTML = `<div class="comp-name">${key}</div><div class="comp-params">${paramsStr}</div>`;
-                grid.appendChild(item);
-            });
+        if (grid) {
+            grid.innerHTML = "";
+            if (model.genome_full && typeof model.genome_full === 'object') {
+                Object.keys(model.genome_full).sort().forEach(key => {
+                    const params = model.genome_full[key];
+                    let paramsStr = "";
+                    if (typeof params === 'object') {
+                        paramsStr = Object.entries(params).map(([k, v]) => `${k}: ${v}`).join(', ');
+                    } else {
+                        paramsStr = String(params);
+                    }
+                    const item = document.createElement('div');
+                    item.className = 'comp-item';
+                    item.innerHTML = `<div class="comp-name">${key}</div><div class="comp-params">${paramsStr}</div>`;
+                    grid.appendChild(item);
+                });
+            }
         }
 
         // Load Chart
@@ -672,9 +770,9 @@ const app = {
                 yaxis: { gridcolor: '#2C2C2E', color: '#86868B', title: 'Equity (%)', titlefont: { size: 11 } }
             };
             const config = { displayModeBar: false, responsive: true };
-            Plotly.newPlot('model-chart', [trace], layout, config);
+            if (document.getElementById('model-chart')) Plotly.newPlot('model-chart', [trace], layout, config);
         } catch (e) {
-            document.getElementById('model-chart').innerHTML = '<p style="color:#86868B; text-align:center; padding-top:100px;">Chart data unavailable.</p>';
+            if (document.getElementById('model-chart')) document.getElementById('model-chart').innerHTML = '<p style="color:#86868B; text-align:center; padding-top:100px;">Chart data unavailable.</p>';
         }
     },
 
@@ -715,11 +813,11 @@ const app = {
         if (!data || !data.metrics) return;
         const metrics = data.metrics;
 
-        document.getElementById('m-total-return').textContent = `${metrics.total_return_pct.toFixed(2)}%`;
+        document.getElementById('m-total-return').textContent = metrics.total_return_pct.toFixed(2) + '%';
         document.getElementById('m-entry-signals').textContent = metrics.entry_signals;
         document.getElementById('m-trades').textContent = metrics.trade_count;
-        document.getElementById('m-winrate').textContent = `${(metrics.win_rate * 100).toFixed(1)}%`;
-        document.getElementById('m-mdd').textContent = `${metrics.mdd_pct.toFixed(2)}%`;
+        document.getElementById('m-winrate').textContent = (metrics.win_rate * 100).toFixed(1) + '%';
+        document.getElementById('m-mdd').textContent = metrics.mdd_pct.toFixed(2) + '%';
 
         const summary = document.getElementById('backtest-summary');
         const text = document.getElementById('backtest-summary-text');
@@ -732,12 +830,152 @@ const app = {
                     metrics.win_rate * 100
                 ).toFixed(1)}% and max drawdown ${metrics.mdd_pct.toFixed(2)}%.`;
         }
+    },
+
+    // === Analysis ===
+    initAnalysis: async function () {
+        try {
+            const res = await fetch('/api/v1/stats/regime');
+            if (!res.ok) throw new Error("Failed to fetch stats");
+            const data = await res.json();
+
+            this.renderRejectionChart(data.rejections);
+            this.renderPriorsChart(data.priors);
+            this.renderRegimeLeaderboard(data.leaderboard);
+        } catch (e) {
+            console.error("Analysis Init Error:", e);
+        }
+    },
+
+    renderRejectionChart: function (rejections) {
+        if (!rejections || Object.keys(rejections).length === 0) return;
+
+        const labels = Object.keys(rejections).slice(0, 10);
+        const values = labels.map(l => rejections[l]);
+
+        const data = [{
+            values: values,
+            labels: labels,
+            type: 'pie',
+            hole: 0.4,
+            marker: {
+                colors: ['#FF453A', '#FF9F0A', '#FFD60A', '#30D158', '#64D2FF', '#BF5AF2', '#86868B', '#5E5E62', '#414144', '#2C2C2E']
+            },
+            textinfo: 'percent',
+            textposition: 'outside',
+            automargin: true
+        }];
+
+        const layout = {
+            paper_bgcolor: 'rgba(0,0,0,0)',
+            plot_bgcolor: 'rgba(0,0,0,0)',
+            showlegend: true,
+            legend: {
+                font: { color: '#86868B', size: 10 },
+                orientation: 'v',
+                x: 1.1,
+                y: 0.5
+            },
+            margin: { t: 20, b: 20, l: 20, r: 120 },
+            font: { color: '#F5F5F7', family: 'Inter' }
+        };
+
+        const config = { displayModeBar: false, responsive: true };
+        if (document.getElementById('rejection-chart')) Plotly.newPlot('rejection-chart', data, layout, config);
+    },
+
+    renderPriorsChart: function (priors) {
+        if (!priors || Object.keys(priors).length === 0) return;
+
+        const regimes = Object.keys(priors);
+        const categories = Object.keys(priors[regimes[0]] || {});
+
+        const traces = regimes.map(regime => {
+            return {
+                x: categories,
+                y: categories.map(cat => (priors[regime][cat] || 0) * 100),
+                name: regime,
+                type: 'bar'
+            };
+        });
+
+        const layout = {
+            paper_bgcolor: 'rgba(0,0,0,0)',
+            plot_bgcolor: 'rgba(0,0,0,0)',
+            barmode: 'group',
+            xaxis: {
+                tickfont: { color: '#86868B', size: 10 },
+                showgrid: false
+            },
+            yaxis: {
+                title: 'Weight (%)',
+                titlefont: { color: '#86868B', size: 10 },
+                gridcolor: '#38383A',
+                color: '#86868B'
+            },
+            legend: {
+                font: { color: '#F5F5F7', size: 10 },
+                orientation: 'h',
+                y: -0.3
+            },
+            margin: { t: 20, b: 80, l: 40, r: 20 },
+            font: { family: 'Inter' }
+        };
+
+        const config = { displayModeBar: false, responsive: true };
+        if (document.getElementById('priors-chart')) Plotly.newPlot('priors-chart', traces, layout, config);
+    },
+
+    renderRegimeLeaderboard: function (leaderboard) {
+        const container = document.getElementById('regime-leaderboard');
+        if (!container) return;
+
+        container.innerHTML = "";
+
+        const regimes = Object.keys(leaderboard);
+        if (regimes.length === 0) {
+            container.innerHTML = '<div class="status-text">No approved strategies yet to rank.</div>';
+            return;
+        }
+
+        regimes.forEach(regime => {
+            const group = leaderboard[regime];
+            const card = document.createElement('div');
+            card.className = "regime-card";
+
+            let leadersHtml = "";
+            group.forEach((item, idx) => {
+                leadersHtml += `
+                    <div class="leader-item">
+                        <div class="leader-rank">RANK #${idx + 1} (${item.id})</div>
+                        <div class="leader-info">${item.indicators}</div>
+                        <div class="leader-stats">
+                            <span>Ret: ${item.total_return.toFixed(1)}%</span>
+                            Win: ${(item.win_rate * 100).toFixed(1)}%
+                            Trades: ${item.trades}
+                        </div>
+                    </div>
+                `;
+            });
+
+            card.innerHTML = `
+                <div class="regime-name" style="color:${this.getRegimeColor(regime)}">${regime}</div>
+                ${leadersHtml}
+            `;
+            container.appendChild(card);
+        });
+    },
+
+    getRegimeColor: function (regime) {
+        const r = regime.toUpperCase();
+        if (r.includes("BULL") || r.includes("UP")) return "#30D158";
+        if (r.includes("BEAR") || r.includes("DOWN")) return "#FF453A";
+        if (r.includes("STAGNANT") || r.includes("FLAT") || r.includes("SIDE")) return "#FF9F0A";
+        if (r.includes("VOLATILE") || r.includes("SHOCK")) return "#BF5AF2";
+        return "#2997FF";
     }
 };
 
 // Auto Initialize - add backtest page check
-if (document.body.id === 'page-backtest') {
-    app.initBacktest();
-} else {
-    app.init();
-}
+// Initialize
+app.init();

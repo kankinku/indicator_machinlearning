@@ -2,45 +2,134 @@
 import random
 import uuid
 import copy
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+import pandas as pd
+import json
 
 from src.contracts import PolicySpec, LedgerRecord, FeatureMetadata
 from src.ledger.repo import LedgerRepo
 from src.l3_meta.state import RegimeState
 from src.features.definitions import INDICATOR_UNIVERSE # Keep for fallback mapping if needed
-from src.features.registry import FeatureRegistry
+from src.features.registry import get_registry
 from src.config import config
 from src.shared.logger import get_logger
 from src.l3_meta.q_learner import QLearner
 from src.l3_meta.risk_profiles import RiskProfile, get_default_risk_profiles
 
+# D3QN 조건부 임포트
+if config.D3QN_ENABLED:
+    from src.l3_meta.d3qn_agent import D3QNAgent, create_rl_agent
+    from src.l3_meta.reward_shaper import get_reward_shaper
+
+from src.l3_meta.curriculum_controller import get_curriculum_controller, CurriculumController
+from src.l3_meta.analyst import get_indicator_analyst
+
 logger = get_logger("meta.agent")
 
 class MetaAgent:
     def __init__(self, registry: object, repo: LedgerRepo):
-        self.registry = FeatureRegistry(str(config.FEATURE_REGISTRY_PATH)) # Use real registry
-        self.registry.initialize()
+        # DI: 외부에서 주입받거나 싱글톤 사용
+        self.registry = get_registry()
         self.repo = repo
-        # Initialize RL Brains
-        self.strategy_rl = QLearner(repo.base_dir)
+        
+        # [V11.4] Integrated Multi-head D3QN 모드
+        if config.D3QN_ENABLED:
+            logger.info("[MetaAgent] Integrated Multi-head D3QN 모드로 초기화")
+            from src.l3_meta.d3qn_agent import get_integrated_agent, DEFAULT_ACTIONS
+            self.integrated_rl = get_integrated_agent(
+                repo.base_dir,
+                strategy_actions=DEFAULT_ACTIONS,
+                risk_actions=list(self._get_risk_profile_ids())
+            )
+            self.reward_shaper = get_reward_shaper()
+        else:
+            logger.info("[MetaAgent] Q-Table 모드로 초기화")
+            from src.l3_meta.q_learner import QLearner
+            self.strategy_rl = QLearner(repo.base_dir)
+            risk_actions = list(self._get_risk_profile_ids()) or ["DEFAULT"]
+            self.risk_rl = QLearner(repo.base_dir, actions=risk_actions, table_name="q_table_risk.json")
+            self.reward_shaper = None
+        
+        # [V11.4] Indicator Prior Analyst
+        self.analyst = get_indicator_analyst(repo.base_dir)
+        
+        self.curriculum = get_curriculum_controller()
         self.risk_profiles = get_default_risk_profiles()
         self.risk_profile_map = {profile.profile_id: profile for profile in self.risk_profiles}
-        risk_actions = list(self.risk_profile_map.keys()) or ["DEFAULT"]
-        self.risk_rl = QLearner(repo.base_dir, actions=risk_actions, table_name="q_table_risk.json")
+        
+        # [V11.3] Warm-start Baselines
+        self.baselines = self._load_baselines()
+        
+        # 현재 시장 데이터 참조 (D3QN용)
+        self._current_df: Optional[pd.DataFrame] = None
+    
+    def _load_baselines(self) -> List[Dict[str, Any]]:
+        """data/baselines/*.json 파일을 로드합니다."""
+        baselines = []
+        path = config.WARM_START_BASE_DIR
+        if not path.exists():
+            return []
+        
+        for f in path.glob("*.json"):
+            try:
+                with open(f, "r") as r:
+                    baselines.append(json.load(r))
+            except Exception as e:
+                logger.error(f"Failed to load baseline {f}: {e}")
+        
+        logger.info(f"[MetaAgent] {len(baselines)} baselines loaded from {path}")
+        return baselines
 
+    def _get_risk_profile_ids(self) -> List[str]:
+        """리스크 프로파일 ID 목록을 반환합니다."""
+        profiles = get_default_risk_profiles()
+        return [p.profile_id for p in profiles] or ["DEFAULT"]
+    
+    def set_market_data(self, df: pd.DataFrame) -> None:
+        """현재 시장 데이터를 설정합니다 (D3QN 상태 인코딩용)."""
+        self._current_df = df
     def propose_policy(self, regime: RegimeState, history: List[LedgerRecord]) -> PolicySpec:
         """
-        [V3] Regime-Aware Policy Construction.
-        1. Observe Regime (State)
-        2. Select Strategy Archetype (Action) via Q-Learning
-        3. Construct Genome (Implementation) - Regime Aware
-        4. Define Risk Profiling - Regime Aware
+        [V11.3] Warm-start Integrated Policy Construction.
         """
-        logger.info(f"[MetaAgent] Regime Detected: {regime.label} (Trend: {regime.trend_score:.2f}, VIX: {regime.vol_level:.2f})")
+        # 0. Mix with Baselines if in Warm-start period
+        total_exp = len(history)
+        baseline_prob = 0.0
+        
+        if total_exp < config.WARM_START_N1:
+            baseline_prob = 0.5
+        elif total_exp < config.WARM_START_N2:
+            baseline_prob = 0.3
+        else:
+            baseline_prob = 0.1 # Keep small amount of baseline for prior stability
+            
+        if self.baselines and random.random() < baseline_prob:
+            base = random.choice(self.baselines)
+            logger.debug(f"[MetaAgent] Warm-start: Using baseline '{base.get('name')}'")
+            return self._make_spec(
+                genome=base["feature_genome"],
+                template_tag=base["template_id"],
+                regime=regime,
+                # risk_profile is optional in baseline, but we can override or use it
+                rl_meta={
+                    "is_baseline": True,
+                    "baseline_name": base.get("name"),
+                    "state_key": regime.label,
+                }
+            )
 
-        # Get Action from RL
-        action_name, action_idx = self.strategy_rl.get_action(regime)
-        risk_profile_id, risk_action_idx = self.risk_rl.get_action(regime)
+        # 1. Standard RL Flow
+        logger.debug(f"[MetaAgent] Regime Detected: {regime.label} (Trend: {regime.trend_score:.2f}, VIX: {regime.vol_level:.2f})")
+
+        # Get Action from RL (Multi-head Integrated)
+        if config.D3QN_ENABLED:
+            action_name, action_idx, risk_profile_id, risk_action_idx = self.integrated_rl.get_action(
+                regime, df=self._current_df
+            )
+        else:
+            action_name, action_idx = self.strategy_rl.get_action(regime)
+            risk_profile_id, risk_action_idx = self.risk_rl.get_action(regime)
+        
         risk_profile = self._resolve_risk_profile(risk_profile_id)
         
         # Build Genome based on Action AND Regime
@@ -52,26 +141,57 @@ class MetaAgent:
             "strategy_action_idx": action_idx,
             "risk_profile": risk_profile_id,
             "risk_action_idx": risk_action_idx,
+            "d3qn_mode": config.D3QN_ENABLED,
         }
         
         return self._make_spec(feature_genome, action_name, regime, risk_profile=risk_profile, rl_meta=rl_meta)
 
-    def learn(self, reward: float, next_regime: RegimeState, policy_spec: PolicySpec = None):
+
+    def learn(
+        self, 
+        reward: float, 
+        next_regime: RegimeState, 
+        policy_spec: PolicySpec = None,
+        metrics: Optional[Dict] = None,  # CPCV 지표 (D3QN 보상 재계산용)
+    ):
         """
         Feedback loop for the RL agent.
+        
+        D3QN 모드에서는 metrics를 사용하여 더 정교한 보상을 계산합니다.
+        
+        Args:
+            reward: 보상 (Q-Table 모드) 또는 기본 보상 (D3QN에서 재계산 가능)
+            next_regime: 다음 시장 상태
+            policy_spec: 실행된 정책 (RL 메타정보 포함)
+            metrics: CPCV 평가 지표 (D3QN 보상 계산용)
         """
         if not policy_spec or not policy_spec.rl_meta:
-            self.strategy_rl.update(reward, next_regime)
-            self.risk_rl.update(reward, next_regime)
+            # D3QN 모드
+            if config.D3QN_ENABLED:
+                self.integrated_rl.update(reward, next_regime, next_df=self._current_df)
+            else:
+                self.strategy_rl.update(reward, next_regime)
+                self.risk_rl.update(reward, next_regime)
             return
 
         state_key = policy_spec.rl_meta.get("state_key")
         strategy_idx = policy_spec.rl_meta.get("strategy_action_idx")
         risk_idx = policy_spec.rl_meta.get("risk_action_idx")
 
-        self.strategy_rl.update(reward, next_regime, state_key=state_key, action_idx=strategy_idx)
-        if risk_idx is not None:
-            self.risk_rl.update(reward, next_regime, state_key=state_key, action_idx=risk_idx)
+        # [V11.4] Integrated D3QN 모드
+        if config.D3QN_ENABLED:
+            self.integrated_rl.update(reward, next_regime, next_df=self._current_df)
+            
+            # [V11.4] Update Indicator Priors from feedback
+            if metrics:
+                is_rejected = getattr(metrics, 'is_rejected', metrics.get('is_rejected', False))
+                if not is_rejected:
+                    self.analyst.update_with_record(metrics, state_key, self.registry)
+        else:
+            # Q-Table 모드
+            self.strategy_rl.update(reward, next_regime, state_key=state_key, action_idx=strategy_idx)
+            if risk_idx is not None:
+                self.risk_rl.update(reward, next_regime, state_key=state_key, action_idx=risk_idx)
 
     def _construct_genome_from_action(self, action_name: str, regime: RegimeState) -> Dict[str, Any]:
         """
@@ -81,12 +201,12 @@ class MetaAgent:
         """
         # Map Action to Feature Category
         category_map = {
-            "TREND_FOLLOWING": ["TREND"],
-            "MEAN_REVERSION": ["MOMENTUM", "VOLUME"], 
+            "TREND_FOLLOWING": ["TREND", "ADAPTIVE"],
+            "MEAN_REVERSION": ["MOMENTUM", "VOLUME", "MEAN_REVERSION"], 
             "VOLATILITY_BREAK": ["VOLATILITY", "TREND"],
-            "MOMENTUM_ALPHA": ["MOMENTUM"],
-            "DIP_BUYING": ["MOMENTUM", "TREND"], 
-            "DEFENSIVE": ["VOLATILITY", "TREND"]
+            "MOMENTUM_ALPHA": ["MOMENTUM", "PRICE_ACTION"],
+            "DIP_BUYING": ["MOMENTUM", "TREND", "PATTERN"], 
+            "DEFENSIVE": ["VOLATILITY", "TREND", "ADAPTIVE"]
         }
         
         target_categories = category_map.get(action_name, ["TREND", "MOMENTUM"])
@@ -102,10 +222,42 @@ class MetaAgent:
         
         selected_features = []
         if target_candidates:
-            # Select a subset from the TARGET candidates only.
-            # Example: If we have 10 momentum indicators, pick 1 to 5 of them.
-            subset_size = random.randint(1, min(len(target_candidates), 5))
-            selected_features = random.sample(target_candidates, subset_size)
+            # [V11.2] Stage-based Feature Count Expansion
+            # Stage가 올라갈수록 더 복잡한 전략(더 많은 지표)을 시도하도록 유도
+            stage = self.curriculum.current_stage
+            min_count = config.GENOME_FEATURE_COUNT_MIN + (stage - 1)
+            max_count = min(len(target_candidates), config.GENOME_FEATURE_COUNT_MAX + (stage - 1) * 2)
+            
+            subset_size = random.randint(min_count, max_count)
+            
+            # [V11.4] Weighted Sampling by Category Priors
+            priors = self.analyst.get_priors(regime.name)
+            
+            # Filter and normalize priors for target categories
+            valid_target_cats = [cat for cat in target_categories if self.registry.list_by_category(cat)]
+            if not valid_target_cats:
+                selected_features = random.sample(target_candidates, subset_size)
+            else:
+                cat_weights = [priors.get(cat, 0.1) for cat in valid_target_cats]
+                sum_w = sum(cat_weights)
+                cat_weights = [w/sum_w for w in cat_weights]
+                
+                selected_features = []
+                # Distribute slots among categories based on weights
+                # Using random.choices for category selection, then random.choice for indicator within category
+                for _ in range(subset_size):
+                    chosen_cat = random.choices(valid_target_cats, weights=cat_weights, k=1)[0]
+                    cat_items = self.registry.list_by_category(chosen_cat)
+                    if cat_items:
+                        feat = random.choice(cat_items)
+                        if feat not in selected_features:
+                            selected_features.append(feat)
+                
+                # Fill up if duplicates reduced the count
+                if len(selected_features) < subset_size:
+                    remaining = [f for f in target_candidates if f not in selected_features]
+                    if remaining:
+                        selected_features.extend(random.sample(remaining, min(len(remaining), subset_size - len(selected_features))))
         else:
             # Fallback: If registry is empty or category missing, pick 1 random from all.
             all_candidates = self.registry.list_all()
@@ -132,14 +284,14 @@ class MetaAgent:
                 
                 # Contextual Mutations - Strategy Type
                 if action_context == "DEFENSIVE" and "window" in p_schema.name:
-                    min_v = max(min_v, int(max_v * 0.5)) 
+                    min_v = max(min_v, int(max_v * config.PARAM_DEFENSIVE_WINDOW_RATIO)) 
                 elif action_context == "SCALPING" and "window" in p_schema.name:
-                    max_v = min(max_v, 20)
+                    max_v = min(max_v, config.PARAM_SCALPING_MAX_WINDOW)
                 
                 # Contextual Mutations - Regime
                 if regime and regime.label == "PANIC" and "window" in p_schema.name:
                      # In Panic, cap max window to avoid too much lag
-                     max_v = min(max_v, 30)
+                     max_v = min(max_v, config.PARAM_PANIC_MAX_WINDOW)
 
                 # Clamp
                 min_v = max(int(p_schema.min), min_v)
@@ -210,14 +362,14 @@ class MetaAgent:
         # Max Leverage: Inversely related to k_down (tighter stops = more leverage possible)
         # Logic: If k_down is low (tight stop), we can afford more leverage
         # Range: 0.5 to 1.5
-        max_leverage = 0.5 + (1.0 / (k_down + 0.5))  # Inverted relationship
-        max_leverage = max(0.5, min(1.5, max_leverage))
+        max_leverage = config.MAX_LEVERAGE_MIN + (1.0 / (k_down + 0.5))  # Inverted relationship
+        max_leverage = max(config.MAX_LEVERAGE_MIN, min(config.MAX_LEVERAGE_MAX, max_leverage))
         
         # Stop Loss (Actual %): Derived from k_down and typical daily volatility (~1.5%)
         # This is an approximation; actual stop depends on market volatility
-        estimated_daily_vol = 0.015  # ~1.5% typical daily vol
+        estimated_daily_vol = config.RISK_EST_DAILY_VOL
         stop_loss = k_down * estimated_daily_vol
-        stop_loss = max(0.005, min(0.05, stop_loss))  # Clamp to 0.5% - 5%
+        stop_loss = max(config.STOP_LOSS_MIN, min(config.STOP_LOSS_MAX, stop_loss))
         
         # ========================================
         # 3. Logging for Analysis
@@ -230,8 +382,10 @@ class MetaAgent:
         
         # [V6] Autonomy - Entry Threshold Control
         # Instead of fixed global threshold, let the agent decide per strategy.
-        # Range: 0.51 (Aggressive) to 0.70 (Conservative)
-        entry_threshold = round(random.uniform(0.51, 0.70), 2)
+        entry_threshold = round(random.uniform(
+            config.ENTRY_THRESHOLD_MIN, 
+            config.ENTRY_THRESHOLD_MAX
+        ), 2)
         
         return PolicySpec(
             spec_id=str(uuid.uuid4()),

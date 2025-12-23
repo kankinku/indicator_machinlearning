@@ -1,0 +1,16 @@
+{
+    "name": "Moving Average Cross (Trend)",
+    "template_id": "TREND_FOLLOWING",
+    "feature_genome": {
+        "TREND_MACROSS_V1": {
+            "fast": 20,
+            "slow": 60,
+            "ma_type": "sma"
+        }
+    },
+    "risk_budget": {
+        "k_up": 2.5,
+        "k_down": 1.5,
+        "horizon": 20
+    }
+}

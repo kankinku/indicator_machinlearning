@@ -1,0 +1,19 @@
+{
+    "name": "ATR Volatility Breakout",
+    "template_id": "VOLATILITY_BREAK",
+    "feature_genome": {
+        "VOLATILITY_ATR_V1": {
+            "window": 14
+        },
+        "TREND_MACROSS_V1": {
+            "fast": 10,
+            "slow": 30,
+            "ma_type": "ema"
+        }
+    },
+    "risk_budget": {
+        "k_up": 3.0,
+        "k_down": 1.2,
+        "horizon": 15
+    }
+}

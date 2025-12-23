@@ -130,3 +130,62 @@ class RegimeDetector:
             shock_flag=bool(shock_flag),
             label=label
         )
+    def detect_series(self, df: pd.DataFrame) -> pd.Series:
+        """
+        [V11.2] DataFrame 전체에 대해 Regime Label 시리즈를 생성합니다.
+        Backtest 시 바 단위 레짐 정합성 체크에 활용됩니다.
+        """
+        if len(df) < 50:
+            return pd.Series("SIDEWAYS", index=df.index)
+
+        # 재사용을 위해 필수 지표 계산
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
+        
+        # 1. 기술적 지표
+        adx = ta.trend.adx(high, low, close, window=14).fillna(0)
+        sma_50 = close.rolling(50).mean()
+        sma_200 = close.rolling(200).mean()
+        
+        trend_score = pd.Series(0.0, index=df.index)
+        trend_score += (close > sma_50).astype(float) * 0.5
+        trend_score += (sma_50 > sma_200).astype(float) * 0.5
+        trend_score -= (close < sma_50).astype(float) * 0.5
+        trend_score -= (sma_50 < sma_200).astype(float) * 0.5
+        
+        adx_factor = (adx / 50.0).clip(0, 1)
+        final_trend_score = trend_score * adx_factor
+        
+        returns = close.pct_change()
+        vol_short = returns.rolling(20).std()
+        vol_long = returns.rolling(100).std()
+        vol_level = (vol_short / vol_long).fillna(1.0)
+        
+        bb_l = ta.volatility.bollinger_lband(close, window=20, window_dev=2.5)
+        shock_flag = close < bb_l
+        
+        # 2. 매크로 (있을 경우)
+        vix = df["vix_close"] if "vix_close" in df.columns else pd.Series(20.0, index=df.index)
+        yield_10y = df["us10y_close"] if "us10y_close" in df.columns else pd.Series(4.0, index=df.index)
+        hyg_sma50 = df["hyg_close"].rolling(50).mean() if "hyg_close" in df.columns else None
+        hyg_trend = (df["hyg_close"] - hyg_sma50) / hyg_sma50 if hyg_sma50 is not None else pd.Series(0.0, index=df.index)
+
+        # 3. 분류 로직
+        labels = pd.Series("SIDEWAYS", index=df.index)
+        
+        is_panic = (vix > 30) | shock_flag | (final_trend_score < -0.7) | (hyg_trend < -0.05)
+        is_bull_run = (final_trend_score > 0.4) & (vix < 25)
+        is_goldilocks = (final_trend_score > 0) & (vix < 20) & (yield_10y < 4.0)
+        is_stagflation = (final_trend_score < -0.1) & (yield_10y > 4.2)
+        
+        labels.loc[is_goldilocks] = "GOLDILOCKS"
+        labels.loc[is_bull_run] = "BULL_RUN"
+        labels.loc[is_stagflation] = "STAGFLATION"
+        labels.loc[is_panic] = "PANIC"
+        
+        # 추가 세분화
+        labels.loc[(labels == "SIDEWAYS") & (vol_level > 1.5)] = "HIGH_VOL"
+        labels.loc[(labels == "SIDEWAYS") & (final_trend_score < -0.2)] = "BEAR_TREND"
+        
+        return labels

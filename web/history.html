@@ -34,6 +34,13 @@
                 </svg>
                 Feature Universe
             </a>
+            <a href="analysis.html" class="nav-item">
+                <svg class="nav-icon" viewBox="0 0 24 24">
+                    <path
+                        d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM9 17H7v-7h2v7zm4 0h-2V7h2v10zm4 0h-2v-4h2v4z" />
+                </svg>
+                Analysis
+            </a>
             <a href="backtest.html" class="nav-item">
                 <svg class="nav-icon" viewBox="0 0 24 24">
                     <path d="M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z" />
@@ -62,12 +69,17 @@
                 </div>
 
                 <div class="control-group">
+                    <label style="margin-right: 15px; font-size: 13px; color: #86868B; cursor: pointer;">
+                        <input type="checkbox" id="hist-include-rejected" onchange="app.renderHistoryTable()"> Include
+                        Rejected
+                    </label>
                     <select id="sort-select" class="sort-select" onchange="app.handleSortChange(this.value)">
                         <option value="holistic" selected>Holistic Score (Recommended)</option>
                         <option value="timestamp">Newest First</option>
                         <option value="sharpe">Highest Sharpe</option>
                         <option value="win_rate">Highest Win Rate</option>
                         <option value="total_return">Highest Return (%)</option>
+                        <option value="trades">Highest Trades</option>
                     </select>
                 </div>
             </div>
@@ -92,7 +104,7 @@
         </div>
     </main>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=2"></script>
 </body>
 
 </html>
