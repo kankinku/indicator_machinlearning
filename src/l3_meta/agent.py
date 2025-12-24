@@ -177,11 +177,11 @@ class MetaAgent:
         
         risk_profile = self._resolve_risk_profile(risk_profile_id)
         
-        # Build Genome based on Action AND Regime
-        feature_genome = self._construct_genome_from_action(action_name, regime, history)
+        # Build LogicTree based on Action AND Regime (V17)
+        logic_trees = self._construct_trees_from_action(action_name, regime, history)
         
-        # Build Decision Rules from Genome (V13)
-        decision_rules = self._construct_rules_from_genome(feature_genome)
+        # [V17] Genome-Rule Sync: Extract feature_genome from LogicTree
+        feature_genome = self._sync_genome_from_trees(logic_trees, action_name, regime)
         
         rl_meta = {
             "state_key": regime.label,
@@ -190,11 +190,18 @@ class MetaAgent:
             "risk_profile": risk_profile_id,
             "risk_action_idx": risk_action_idx,
             "d3qn_mode": config.D3QN_ENABLED,
-            "tuner_intervened": mix is not None
+            "tuner_intervened": mix is not None,
+            "logic_tree_mode": True
         }
         
         spec = self._make_spec(feature_genome, action_name, regime, risk_profile=risk_profile, rl_meta=rl_meta)
-        spec.decision_rules = decision_rules
+        spec.logic_trees = logic_trees
+        # decision_rules for legacy/logging
+        from src.shared.logic_tree import LogicTree
+        spec.decision_rules = {
+            "entry": str(LogicTree.from_dict(logic_trees["entry"]).root) if logic_trees.get("entry") else "True",
+            "exit": str(LogicTree.from_dict(logic_trees["exit"]).root) if logic_trees.get("exit") else "False"
+        }
         spec.spec_id = generate_policy_id(spec)
         return spec
 
@@ -361,6 +368,94 @@ class MetaAgent:
         # Store bias for rule generation
         genome["__meta__"] = {"q_bias": q_bias, "profile": action_name}
         return genome
+
+    def _construct_trees_from_action(self, action_name: str, regime: RegimeState, history: List[LedgerRecord]) -> Dict[str, Dict[str, Any]]:
+        """
+        [V17] Build LogicTree structure based on Action and Regime.
+        """
+        from src.shared.logic_tree import LogicTree, ConditionNode, LogicalOpNode, mutate_tree, asdict
+        
+        # [EVOLVE] Logic: Mutate existing elite tree
+        if action_name == "EVOLVE":
+            elite_records = [r for r in history if not r.is_rejected and (r.cpcv_metrics.get("sharpe", 0) > 1.0)]
+            if elite_records:
+                parent = random.choice(elite_records).policy_spec
+                if parent.logic_trees:
+                    entry_tree = LogicTree.from_dict(parent.logic_trees["entry"])
+                    mutated_entry = mutate_tree(entry_tree, self.registry, action_type=random.choice(["ADD_CONDITION", "MUTATE_THRESHOLD", "SWAP_FEATURE", "CHANGE_OP"]))
+                    return {
+                        "entry": asdict(mutated_entry.root),
+                        "exit": parent.logic_trees.get("exit", asdict(ConditionNode(feature_key="FALSE", op="==", value=1.0)))
+                    }
+
+        # Fallback to Template-based dynamic tree generation
+        # (This replaces _construct_genome_from_action + _construct_rules_from_genome)
+        profile_map = {
+            "TREND_ALPHA":      (["TREND", "ADAPTIVE"], 2, "tail"),
+            "TREND_STABLE":     (["TREND"], 3, "center"),
+            "MOMENTUM_TAIL":    (["MOMENTUM", "PRICE_ACTION"], 2, "tail"),
+            "MOMENTUM_CENTER":  (["MOMENTUM"], 2, "center"),
+            "VOLATILITY_SNIPER":(["VOLATILITY"], 2, "tail"),
+            "PATTERN_COMPLEX":  (["TREND", "MOMENTUM", "VOLATILITY"], 3, "spread"),
+            "DEFENSIVE_CORE":   (["TREND", "ADAPTIVE"], 2, "center"),
+            "SCALPING_FAST":    (["MOMENTUM", "VOLATILITY"], 1, "spread")
+        }
+        
+        cats, subset_size, q_bias = profile_map.get(action_name, (["TREND"], 1, "center"))
+        target_candidates = []
+        for cat in cats: target_candidates.extend(self.registry.list_by_category(cat))
+        
+        if not target_candidates: target_candidates = self.registry.list_all()
+        selected_features = random.sample(target_candidates, min(len(target_candidates), subset_size)) if target_candidates else []
+        
+        # Build Entry Tree (Flat AND for now)
+        quantiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        if q_bias == "center": w = [0.05, 0.05, 0.2, 0.2, 0.2, 0.2, 0.05, 0.05, 0.05]
+        elif q_bias == "tail": w = [0.3, 0.15, 0.05, 0.0, 0.0, 0.0, 0.05, 0.15, 0.3]
+        else: w = [0.1, 0.1, 0.1, 0.1, 0.2, 0.1, 0.1, 0.1, 0.1]
+        
+        entry_nodes = []
+        for feat in selected_features:
+            q = random.choices(quantiles, weights=w, k=1)[0]
+            op = ">" if random.random() > 0.5 else "<"
+            entry_nodes.append(ConditionNode(feature_key=feat.feature_id, op=op, value=f"[q{q}]"))
+            
+        if len(entry_nodes) > 1:
+            entry_root = LogicalOpNode(op="and", children=entry_nodes)
+        elif entry_nodes:
+            entry_root = entry_nodes[0]
+        else:
+            entry_root = ConditionNode(feature_key="TRUE", op="==", value=1.0)
+            
+        # Build Simple Exit Tree
+        exit_root = ConditionNode(feature_key="FALSE", op="==", value=1.0)
+        
+        return {"entry": asdict(entry_root), "exit": asdict(exit_root)}
+
+    def _sync_genome_from_trees(self, logic_trees: Dict[str, Dict[str, Any]], action_name: str, regime: RegimeState) -> Dict[str, Any]:
+        """
+        [V17] Genome-Rule Sync: Derive feature_genome from tree.
+        """
+        from src.shared.logic_tree import LogicTree
+        feat_ids = set()
+        for name, root_dict in logic_trees.items():
+            tree = LogicTree.from_dict(root_dict)
+            feat_ids.update(tree.get_referenced_features())
+            
+        genome = {}
+        for fid in feat_ids:
+            # Fetch metadata to evolve params
+            meta = self.registry.get(fid)
+            if meta:
+                params = self._evolve_params(meta, action_name, regime)
+                genome[fid] = params
+            else:
+                genome[fid] = {}
+        
+        # Store metadata for rules (q_bias might be useful if we mutate)
+        genome["__meta__"] = {"profile": action_name}
+        return genome
+            
 
     def _construct_rules_from_genome(self, genome: Dict[str, Any]) -> Dict[str, str]:
         """

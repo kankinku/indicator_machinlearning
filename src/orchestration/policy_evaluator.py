@@ -28,19 +28,85 @@ class RuleEvaluator:
     def evaluate_signals(self, df: pd.DataFrame, policy_spec: PolicySpec) -> Tuple[pd.Series, pd.Series, float]:
         """
         Returns (entry_signals, exit_signals, complexity_score).
+        [V17] Prefers LogicTree (AST) over text rules.
+        [V18] Catches LogicTreeMatchError and returns explicit failure signals.
+        
+        If match fails, returns (all_false, all_false, -1.0) where -1.0 complexity 
+        indicates a matching failure. The caller should check for this.
         """
-        if not policy_spec.decision_rules:
-            return pd.Series(False, index=df.index), pd.Series(False, index=df.index), 1.0
+        from src.shared.logic_tree import LogicTree, evaluate_logic_tree, parse_text_to_logic, asdict
+        from src.shared.logic_tree_diagnostics import LogicTreeMatchError
+        
+        # 1. Sync LogicTree (Phase 1 Migration)
+        if not policy_spec.logic_trees:
+            # Lazy migration from text
+            policy_spec.logic_trees = {
+                "entry": asdict(parse_text_to_logic(policy_spec.decision_rules.get("entry", "True")).root),
+                "exit": asdict(parse_text_to_logic(policy_spec.decision_rules.get("exit", "False")).root)
+            }
             
-        entry_expr = policy_spec.decision_rules.get("entry", "False")
-        exit_expr = policy_spec.decision_rules.get("exit", "False")
+        try:
+            # 2. Evaluate using LogicTree
+            entry_tree = LogicTree.from_dict(policy_spec.logic_trees.get("entry"))
+            exit_tree = LogicTree.from_dict(policy_spec.logic_trees.get("exit"))
+            
+            # [V17] Use LogicTree for Signal Generation
+            entry_sig = evaluate_logic_tree(entry_tree, df)
+            exit_sig = evaluate_logic_tree(exit_tree, df)
+            
+            # 3. Complexity Calculation (Structural)
+            complexity = self._calculate_tree_complexity(entry_tree) + self._calculate_tree_complexity(exit_tree)
+            
+            return entry_sig, exit_sig, complexity
+            
+        except LogicTreeMatchError as e:
+            # [V18] 매칭 실패: 명시적 실패 반환
+            logger.error(f"[RuleEvaluator] LogicTree match failed: {e.message}")
+            
+            # 실패 마커: complexity = -1.0 (caller가 이를 확인해야 함)
+            # 모든 신호를 False로 설정하고, 실패 원인을 policy_spec에 기록
+            all_false = pd.Series(False, index=df.index)
+            
+            # 실패 원인을 policy에 기록 (REJECT 처리용)
+            if not hasattr(policy_spec, '_logictree_error'):
+                policy_spec._logictree_error = None
+            policy_spec._logictree_error = {
+                "type": e.match_type,
+                "feature_key": e.feature_key,
+                "message": e.message
+            }
+            
+            # complexity = -1.0은 "FEATURE_MISSING" 실패 마커
+            return all_false, all_false, -1.0
+
+    def _calculate_tree_complexity(self, tree: LogicTree) -> float:
+        """
+        Calculates complexity based on tree structure.
+        structural_complexity = 1.0 * n_features + 0.5 * n_compares + 0.3 * n_logic + 0.2 * depth
+        """
+        from src.shared.logic_tree import ConditionNode, LogicalOpNode, NotNode
+        if not tree or not tree.root: return 0.5
         
-        # Use simple caching to avoid repeated parsing and fuzzy matching
-        entry_sig, entry_comp = self._safe_eval(df, entry_expr)
-        exit_sig, exit_comp = self._safe_eval(df, exit_expr)
+        n_features = set()
+        n_compares = 0
+        n_logic = 0
+        max_depth = 0
         
-        total_complexity = entry_comp + exit_comp
-        return entry_sig, exit_sig, total_complexity
+        def walk(node, depth):
+            nonlocal n_compares, n_logic, max_depth
+            max_depth = max(max_depth, depth)
+            if isinstance(node, ConditionNode):
+                n_compares += 1
+                n_features.add(node.feature_key)
+            elif isinstance(node, LogicalOpNode):
+                n_logic += len(node.children)
+                for child in node.children: walk(child, depth + 1)
+            elif isinstance(node, NotNode):
+                n_logic += 1
+                walk(node.child, depth + 1)
+                
+        walk(tree.root, 1)
+        return (1.0 * len(n_features)) + (0.5 * n_compares) + (0.3 * n_logic) + (0.2 * max_depth)
 
     def _safe_eval(self, df: pd.DataFrame, expr: str) -> Tuple[pd.Series, float]:
         """

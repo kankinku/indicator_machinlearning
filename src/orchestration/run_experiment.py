@@ -113,10 +113,62 @@ def _run_experiment_core(
     - Separate Entry/Exit logic from RuleEvaluator.
     - Deterministic State Machine in BacktestEngine.
     - Complexity-aware scoring.
+    
+    [V18]
+    - FEATURE_MISSING 조기 감지 및 명시적 REJECT
     """
     # 1. Evaluate Signals from Rules
     evaluator = RuleEvaluator()
     entry_sig, exit_sig, complexity = evaluator.evaluate_signals(X_features, policy_spec)
+    
+    # [V18] FEATURE_MISSING 감지: complexity=-1.0은 LogicTree 매칭 실패 마커
+    if complexity < 0:
+        # 매칭 실패: 즉시 실패 결과 반환
+        error_info = getattr(policy_spec, '_logictree_error', {})
+        error_type = error_info.get("type", "unknown")
+        error_key = error_info.get("feature_key", "unknown")
+        
+        logger.warning(f"[Experiment] FEATURE_MISSING detected: {error_type} for '{error_key}'")
+        
+        # 실패 결과 구조 (REJECT 처리용)
+        return {
+            "results_df": pd.DataFrame(),
+            "cpcv": {
+                "n_trades": 0,
+                "win_rate": 0.0,
+                "total_return_pct": 0.0,
+                "mdd_pct": 0.0,
+                "profit_factor": 1.0,
+                "exposure_ratio": 0.0,
+                "avg_trade_return": 0.0,
+                "complexity_score": 0.0,
+                "trades_per_year": 0.0,
+                "excess_return": 0.0,
+                "oos_bars": len(df),
+                # [V18] FEATURE_MISSING 명시적 마커
+                "_feature_missing": True,
+                "_feature_missing_type": error_type,
+                "_feature_missing_key": error_key,
+            },
+            "pbo": 0.0,
+            "turnover": 0.0,
+            "n_trades": 0,
+            "win_rate": 0.0,
+            "total_return_pct": 0.0,
+            "mdd_pct": 0.0,
+            "trade_logic": {
+                "error": f"FEATURE_MISSING: {error_type} for '{error_key}'",
+                "complexity": 0.0,
+            },
+            "final_guard": None,
+            "label_config": {},
+            "label_hash": "v18_feature_missing",
+            "t_train": 0.0,
+            "bt_result": None,
+            # [V18] 명시적 실패 마커
+            "_rejected": True,
+            "_rejection_reason": f"FEATURE_MISSING_{error_type.upper()}",
+        }
     
     # 2. Run Deterministic Backtest
     bt_engine = DeterministicBacktestEngine()
@@ -133,7 +185,7 @@ def _run_experiment_core(
     # Phase 1 Filter: Cheap Checks
     # [V13.5] Early rejection for extreme outliers
     if bt_result.trades_per_year < 2.0 or bt_result.trades_per_year > 300.0:
-        bt_result.total_return = -99.9 # Force rejection
+        pass # Rejection handled by validate_sample later
         
     # metrics for scoring
     cpcv = {
@@ -244,22 +296,74 @@ def build_record_and_artifact(
             "stage": eval_stage,
         }
 
+    # =========================================================
+    # [V18] FEATURE_MISSING 조기 감지 및 즉시 REJECT
+    # =========================================================
+    if core.get("_rejected") or cpcv.get("_feature_missing"):
+        rejection_reason = core.get("_rejection_reason") or "FEATURE_MISSING"
+        exp_id = str(uuid4())
+        
+        artifact = ArtifactBundle(
+            label_config=label_config,
+            direction_model=None,
+            risk_model=None,
+            calibration_metrics={},
+            metadata={"genome": policy_spec.feature_genome, "error": rejection_reason},
+            backtest_results=[]
+        )
+        
+        ledger_record = LedgerRecord(
+            exp_id=exp_id,
+            timestamp=time.time(),
+            policy_spec=policy_spec,
+            data_hash=_hash_payload(df.values.tobytes()) if not df.empty else "empty",
+            feature_hash="",
+            label_hash=label_hash,
+            model_artifact_ref="",
+            cpcv_metrics=cpcv,
+            pbo=pbo,
+            risk_report={"ok": False},
+            reason_codes=[rejection_reason],
+            is_rejected=True,
+            rejection_reason=rejection_reason,
+            verdict_dump=verdict_dump
+        )
+        
+        return ledger_record, artifact
+
     # [V9] Validation based on Backtest results
     # [vNext] Validation Layer Integration (Hard Gates)
     hard_fail = []
     
-    # Convert dict to SampleMetrics for validation
+    # [V16] Convert dict to SampleMetrics for validation
+    from src.shared.metrics import TradeStats, EquityStats
+    
+    # [V18] Defensive extraction: handle both 'sample_' prefix and standard keys
+    n_trades = cpcv.get("sample_trades") if "sample_trades" in cpcv else cpcv.get("n_trades", 0)
+    win_rate = cpcv.get("sample_win_rate") if "sample_win_rate" in cpcv else cpcv.get("win_rate", 0.0)
+    total_ret = cpcv.get("sample_total_return_pct") if "sample_total_return_pct" in cpcv else cpcv.get("total_return_pct", 0.0)
+    mdd = cpcv.get("sample_mdd_pct") if "sample_mdd_pct" in cpcv else cpcv.get("mdd_pct", 0.0)
+    sharpe = cpcv.get("sample_sharpe") if "sample_sharpe" in cpcv else cpcv.get("sharpe", 0.0)
+    rr = cpcv.get("sample_rr") if "sample_rr" in cpcv else cpcv.get("reward_risk", 1.0)
+    benchmark_roi = cpcv.get("sample_benchmark_roi_pct") if "sample_benchmark_roi_pct" in cpcv else cpcv.get("benchmark_roi_pct", 0.0)
+
     metrics_obj = SampleMetrics(
-        total_return_pct=cpcv.get("total_return_pct", 0.0),
-        mdd_pct=cpcv.get("mdd_pct", 0.0),
-        reward_risk=cpcv.get("reward_risk", 0.0),
-        vol_pct=0.0,
-        trade_count=cpcv.get("n_trades", 0),
-        valid_trade_count=cpcv.get("valid_trade_count", cpcv.get("n_trades", 0)),
-        win_rate=cpcv.get("win_rate", 0.0),
-        sharpe=cpcv.get("sharpe", 0.0),
-        benchmark_roi_pct=cpcv.get("benchmark_roi_pct", 0.0),
-        exposure_ratio=cpcv.get("exposure_ratio", 0.0)
+        window_id="BACKTEST",
+        trades=TradeStats(
+            trade_count=n_trades,
+            valid_trade_count=cpcv.get("valid_trade_count", n_trades),
+            win_rate=win_rate,
+            reward_risk=rr
+        ),
+        equity=EquityStats(
+            total_return_pct=total_ret,
+            max_drawdown_pct=mdd,
+            sharpe=sharpe,
+            benchmark_roi_pct=benchmark_roi,
+            exposure_ratio=cpcv.get("exposure_ratio", 0.0)
+        ),
+        raw_score=cpcv.get("eval_score", 0.0),
+        bars_total=cpcv.get("oos_bars", len(df))
     )
     
     passed, reason = validate_sample(metrics_obj)

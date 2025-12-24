@@ -66,6 +66,10 @@ class PolicySpec:
     # [New] Rule-based logic (e.g., {"entry": "rsi_14 < 30", "exit": "rsi_14 > 70"})
     decision_rules: Dict[str, str] = field(default_factory=dict)
     
+    # [V17] LogicTree structure (AST-based)
+    # Format: {"entry": {...Node...}, "exit": {...Node...}}
+    logic_trees: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    
     # [Changed] Instead of just template_id, we now have a full Genome.
     # If the Agent uses a predefined template, we can fill this genome from the template.
     # Format: { "RSI": {"window": 14}, "MACD": {"fast": 12...} }

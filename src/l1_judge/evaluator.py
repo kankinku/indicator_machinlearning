@@ -189,7 +189,8 @@ def compute_sample_metrics(
     benchmark_roi_pct: float = 0.0,
     valid_trade_count: Optional[int] = None,
     full_returns: Optional[np.ndarray] = None,
-    exposure_mask: Optional[np.ndarray] = None
+    exposure_mask: Optional[np.ndarray] = None,
+    complexity_score: float = 0.0
 ) -> SampleMetrics:
     """
     [V16] Unified Metric Extraction
@@ -199,14 +200,16 @@ def compute_sample_metrics(
         # If full_returns not provided, use trade_returns as a fallback (should avoid)
         full_returns = trade_returns if trade_returns.any() else np.zeros(bars_total)
         
-    return compute_window_metrics(
-        window_id="sample",
+    metrics = compute_window_metrics(
+        window_id="SAMPLE",
         trade_returns=trade_returns,
         full_returns=full_returns,
         bars_total=bars_total,
         benchmark_roi_pct=benchmark_roi_pct,
-        exposure_mask=exposure_mask
+        exposure_mask=exposure_mask,
+        complexity_score=complexity_score
     )
+    return metrics
 
 def validate_sample(metrics: SampleMetrics) -> Tuple[bool, str]:
     """
@@ -366,9 +369,9 @@ def normalize_scores(scores: List[float]) -> List[float]:
 
 
 def is_violation(metrics: SampleMetrics) -> bool:
-    if metrics.trade_count < config.VAL_MIN_TRADES:
+    if metrics.trades.trade_count < config.VAL_MIN_TRADES:
         return True
-    if metrics.mdd_pct > config.VAL_MAX_MDD_PCT:
+    if metrics.equity.max_drawdown_pct > config.VAL_MAX_MDD_PCT:
         return True
     return False
 

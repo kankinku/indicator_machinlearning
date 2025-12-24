@@ -405,6 +405,20 @@ class BaseConfig:
     STAGNATION_MIN_PROGRESS: float = 0.01 # Reward improvement floor
     
     # =========================================================
+    # [V18] LogicTree Strict Mode - Feature Matching Control
+    # =========================================================
+    # 학습 모드에서는 침묵 실패(silent failure)를 금지하고,
+    # 미매칭/모호성 발생 시 명시적으로 REJECT 처리
+    LOGICTREE_STRICT: bool = True  # True = 학습 모드 (엄격), False = 운영 모드 (관대)
+    LOGICTREE_FUZZY_MATCH: bool = True  # prefix 기반 fuzzy matching 허용 여부
+    
+    # 모호성 처리 정책: "error" | "warn_pick_first" | "warn_pick_value"
+    # - error: 학습 모드에서 즉시 reject
+    # - warn_pick_first: 경고 후 첫 번째 컬럼 선택 (운영 모드용)
+    # - warn_pick_value: 경고 후 __value 또는 알파벳 순 선택
+    LOGICTREE_AMBIGUOUS_POLICY: str = "error"
+    
+    # =========================================================
     # [V11.3] New Features: Stability & Diversity
     # =========================================================
     

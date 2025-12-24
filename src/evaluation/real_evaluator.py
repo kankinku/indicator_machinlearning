@@ -20,7 +20,8 @@ class RealEvaluator:
         df: pd.DataFrame,
         signals: pd.Series,
         risk_budget: Dict[str, Any],
-        target_regime: Optional[str] = None
+        target_regime: Optional[str] = None,
+        complexity_score: float = 0.0
     ) -> Tuple[SampleMetrics, Any]:
         """
         Runs the backtest and computes unified metrics.
@@ -31,8 +32,6 @@ class RealEvaluator:
         trade_returns = np.array(bt_result.trade_returns)
         
         # Build full strategy returns series for EquityStats
-        # Since cumulative equity = (1+r1)(1+r2)... we can work back to daily returns r
-        # Or better: use the equity_curve from engine (already contains strategy returns)
         equity = np.array(bt_result.equity_curve) / 100.0 + 1.0
         full_returns = np.diff(equity) / equity[:-1]
         
@@ -45,7 +44,8 @@ class RealEvaluator:
             bars_total=len(df),
             benchmark_roi_pct=bench_ret,
             full_returns=full_returns,
-            exposure_mask=None # bt_result.exposure is already a mean, we pass it indirectly if needed
+            exposure_mask=None,
+            complexity_score=complexity_score
         )
         
         # Override exposure_ratio from engine (accurate mean)

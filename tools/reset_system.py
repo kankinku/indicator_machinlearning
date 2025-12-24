@@ -2,87 +2,105 @@ import os
 import shutil
 import sys
 import subprocess
+import time
 from pathlib import Path
 
-# Add project root to sys.path to import modules if needed
+# Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-import time
-
-def kill_zombie_processes():
-    print(">>> [System Reset] Killing running python processes (main.py, run_web.py)...")
+def kill_running_processes():
+    """Kills any running main.py or run_web.py processes to release file handles."""
+    print(">>> [Reset] Cleaning up active processes...")
     try:
-        # Windows process termination using WMIC
-        # We suppress output to keep it clean
-        subprocess.run('wmic process where "CommandLine like \'%main.py%\'" call terminate', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run('wmic process where "CommandLine like \'%run_web.py%\'" call terminate', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2)  # Wait for file handles to be released
-        print("    [Process] Cleanup signals sent.")
+        # Use PowerShell to find and kill processes by command line content
+        # This is much more reliable than window title matching on Windows
+        scripts = ["main.py", "run_web.py"]
+        for script in scripts:
+            # We use a broad match for the script name in the command line
+            ps_cmd = f"Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{script}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"
+            subprocess.run(['powershell', '-Command', ps_cmd], capture_output=True)
+        
+        time.sleep(2)
+        print("    [Process] Cleanup complete.")
     except Exception as e:
-        print(f"    [Warning] Failed to kill processes: {e}")
+        print(f"    [Warning] Process cleanup had issues: {e}")
+
+def delete_path(path: Path):
+    """Deletes a file or directory tree."""
+    if not path.exists():
+        return
+    
+    try:
+        if path.is_dir():
+            # Handle Windows permission issues with a retry or simple rmtree
+            shutil.rmtree(path)
+            print(f"    [Deleted] Directory: {path.relative_to(PROJECT_ROOT)}")
+        else:
+            os.remove(path)
+            print(f"    [Deleted] File: {path.relative_to(PROJECT_ROOT)}")
+    except Exception as e:
+        print(f"    [Error] Could not delete {path}: {e}")
 
 def reset_system():
-    # 0. Kill Zombies First!
-    kill_zombie_processes()
-
-    print(">>> [System Reset] Starting system initialization...")
+    print("================================================================================")
+    print("                     RL TRADING SYSTEM - FULL RESET                             ")
+    print("================================================================================")
     
-    # 1. Define Paths to Clean
-    paths_to_clean = [
-        PROJECT_ROOT / "ledger",
-        PROJECT_ROOT / "logs",
-        PROJECT_ROOT / "src" / "l3_meta" / "q_table.json",
-        PROJECT_ROOT / "data" / "features.json"
+    # 0. Cleanup
+    kill_running_processes()
+    
+    # 1. Define targets
+    targets = [
+        PROJECT_ROOT / "ledger",           # DB, Artifacts, Models
+        PROJECT_ROOT / "logs",             # All logs
+        PROJECT_ROOT / ".cache",           # Joblib disk cache
+        PROJECT_ROOT / "data" / "features.json", # Feature Registry
+        PROJECT_ROOT / "src" / "l3_meta" / "q_table.json", # Legacy state
+        PROJECT_ROOT / "src" / "l3_meta" / "q_table_risk.json", # Legacy state
     ]
     
-    # 2. Delete Files/Directories
-    for path in paths_to_clean:
-        if path.exists():
-            try:
-                if path.is_dir():
-                    shutil.rmtree(path)
-                    print(f"    [Deleted] Directory: {path}")
-                else:
-                    os.remove(path)
-                    print(f"    [Deleted] File: {path}")
-            except Exception as e:
-                print(f"    [Error] Failed to delete {path}: {e}")
-                print("    (Hint: Close all python windows and try again)")
-        else:
-            print(f"    [Skip] Not found: {path}")
-
-    # 3. Create Necessary Directories (Empty)
-    # config.py usually handles this, but good to be explicit for logs and ledger
-    (PROJECT_ROOT / "ledger").mkdir(exist_ok=True)
-    (PROJECT_ROOT / "logs").mkdir(exist_ok=True)
-    print("    [Created] Empty 'ledger' and 'logs' directories.")
-
-    # 4. Populate Feature Registry
-    print(">>> [System Reset] Populating Feature Registry...")
-    try:
-        # Import and run the population script
-        # We run it as a subprocess to ensure clean state if it relies on globals
-        import subprocess
+    # 2. Delete
+    print(">>> [Reset] Deleting persistent state...")
+    for target in targets:
+        delete_path(target)
         
-        script_path = PROJECT_ROOT / "src" / "features" / "extended_population.py"
-        result = subprocess.run([sys.executable, str(script_path)], capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            print(result.stdout)
-            print("    [Success] Feature Registry populated.")
+    # 3. Reconstruct directory structure
+    print(">>> [Reset] Reconstructing directory structure...")
+    (PROJECT_ROOT / "ledger" / "artifacts").mkdir(parents=True, exist_ok=True)
+    (PROJECT_ROOT / "ledger" / "diagnostics").mkdir(parents=True, exist_ok=True)
+    (PROJECT_ROOT / "logs" / "instrumentation").mkdir(parents=True, exist_ok=True)
+    print("    [Created] ledger/artifacts/ , ledger/diagnostics/ , logs/instrumentation/")
+    
+    # 4. Repopulate Features
+    print(">>> [Reset] Repopulating Feature Registry...")
+    population_scripts = [
+        PROJECT_ROOT / "tools" / "populate_features_v2.py",
+        PROJECT_ROOT / "tools" / "populate_features_extended.py",
+        PROJECT_ROOT / "tools" / "register_context_features.py"
+    ]
+    
+    for script in population_scripts:
+        if script.exists():
+            print(f"    [Running] {script.name}...")
+            res = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
+            if res.returncode != 0:
+                print(f"    [Error] {script.name} failed:")
+                print(res.stderr)
+            else:
+                print(f"    [Success] {script.name} completed.")
         else:
-            print("    [Error] Failed to populate registry:")
-            print(result.stderr)
-            
-    except Exception as e:
-        print(f"    [Error] Failed to run population script: {e}")
+            print(f"    [Warning] {script.name} not found.")
 
-    print(">>> [System Reset] Initialization Complete. Ready to run main.py.")
+    print("================================================================================")
+    print(">>> [Reset] SYSTEM INITIALIZED SUCCESSFULLY.")
+    print("    All previous experiments, logs, and models have been wiped.")
+    print("    Feature Registry is restored with ~50 indicators + context features.")
+    print("================================================================================")
 
 if __name__ == "__main__":
-    confirm = input("Are you sure you want to RESET the entire system (delete all data)? [y/N]: ")
+    confirm = input("!!! WARNING !!! This will DELETE ALL DATA. Proceed? [y/N]: ")
     if confirm.lower() == 'y':
         reset_system()
     else:
-        print("Cancelled.")
+        print("Reset cancelled.")

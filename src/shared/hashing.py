@@ -32,6 +32,7 @@ def generate_policy_id(policy_spec: Any) -> str:
     content = {
         "genome": policy_spec.feature_genome,
         "rules": policy_spec.decision_rules,
+        "logic_trees": getattr(policy_spec, 'logic_trees', {}),
         "risk_budget": policy_spec.risk_budget,
         "execution": policy_spec.execution_assumption,
         "data_window": policy_spec.data_window,

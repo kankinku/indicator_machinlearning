@@ -15,6 +15,7 @@ class WindowResult:
     violation_rate: float
     avg_alpha: float = 0.0
     normalized_score: float = 0.0
+    complexity_score: float = 0.0
 
 @dataclass
 class BestSample:

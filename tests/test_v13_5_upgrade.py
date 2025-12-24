@@ -79,18 +79,26 @@ class TestV13_5_Invariants(unittest.TestCase):
         """[V14] Annualized excess return gate logic."""
         # Setup metrics for 0.5 years
         # 126 bars = 0.5 years
+        from src.shared.metrics import TradeStats, EquityStats
         m = SampleMetrics(
-            total_return_pct=10.0,
-            mdd_pct=5.0,
-            reward_risk=1.5,
-            vol_pct=2.0,
-            trade_count=50,
-            win_rate=0.6,
-            sharpe=1.2,
-            trades_per_year=100.0, # -> years = 0.5
-            excess_return=1.0, 
-            exposure_ratio=0.2,
-            profit_factor=1.5
+            window_id="TEST",
+            trades=TradeStats(
+                trade_count=50,
+                win_rate=0.6,
+                reward_risk=1.5,
+                trades_per_year=100.0,
+                profit_factor=1.5
+            ),
+            equity=EquityStats(
+                total_return_pct=10.0,
+                max_drawdown_pct=5.0,
+                vol_pct=2.0,
+                sharpe=1.2,
+                excess_return=1.0,
+                exposure_ratio=0.2
+            ),
+            raw_score=0.0,
+            bars_total=126
         )
         
         from src.l1_judge.evaluator import validate_sample

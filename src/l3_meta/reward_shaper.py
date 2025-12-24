@@ -253,10 +253,16 @@ class RewardShaper:
             r_winrate_penalty = -self._clip(excess) * 1.0
             
         # [V14] F. Complexity Penalty
-        # Encourage parsimony: more features = higher penalty
-        genome = metrics.get("genome", {})
-        n_features = len([k for k in genome.keys() if not k.startswith("__")])
-        r_complexity = -self._clip(n_features * 0.05, 0, 0.3)
+        # Encourage parsimony: more features/depth = higher penalty
+        # [V17] Use structural complexity from LogicTree if available
+        comp_score = metrics.get("complexity_score", 0.0)
+        if comp_score > 0:
+            # Scale: 10 logical terms/nodes ~ 0.3 penalty
+            r_complexity = -self._clip(comp_score * 0.03, 0, 0.4)
+        else:
+            genome = metrics.get("genome", {})
+            n_features = len([k for k in genome.keys() if not k.startswith("__")])
+            r_complexity = -self._clip(n_features * 0.05, 0, 0.3)
         
         # [V16] AutoTuner Dynamic Weights
         from src.l3_meta.auto_tuner import get_auto_tuner

@@ -200,7 +200,18 @@ def get_experiments():
         cpcv_worst = metrics.get("cpcv_worst", 0.0)
         n_trades = metrics.get("n_trades", 0)
         win_rate = metrics.get("win_rate", 0.0)
-        sharpe = ret_mean / (vol_std + 1e-9) if vol_std > 0 else 0.0
+        
+        # Backtest-derived metrics (preferred)
+        bt_total_return = metrics.get("sample_total_return_pct")
+        bt_win_rate = metrics.get("sample_win_rate")
+        bt_trades = metrics.get("sample_trades")
+        bt_mdd = metrics.get("sample_mdd_pct")
+        bt_rr = metrics.get("sample_rr", 1.0)
+        bt_sharpe = metrics.get("sample_sharpe")
+        bt_excess_return = metrics.get("sample_excess_return")
+
+        # Stability calculated from legacy fields if available
+        sharpe = bt_sharpe if bt_sharpe is not None else (ret_mean / (vol_std + 1e-9) if vol_std > 0 else 0.0)
         stability_pass, vol_ratio = check_return_stability(
             cpcv_mean=ret_mean,
             cpcv_std=vol_std,
@@ -209,10 +220,20 @@ def get_experiments():
             n_trades=n_trades,
         )
         
-        # Reasons
-        status = "Approved" if not r.reason_codes else "Rejected"
-        fail_reason = r.reason_codes[0] if r.reason_codes else ""
-        fail_reason_clean = CODE_MAP.get(fail_reason, fail_reason)
+        # Status & Reasons (SOT: Ledger reason_codes)
+        status = "Approved"
+        fail_reason_clean = ""
+        if r.reason_codes:
+            status = "Rejected"
+            # Extract main fail code from "FAIL_XXX (details)"
+            raw_reason = r.reason_codes[0]
+            fail_code = raw_reason.split("(")[0].strip() if "(" in raw_reason else raw_reason
+            fail_reason_clean = CODE_MAP.get(fail_code, raw_reason)
+        elif r.is_rejected:
+            status = "Rejected"
+            raw_reason = r.rejection_reason or "UNKNOWN_REJECTION"
+            fail_code = raw_reason.split("(")[0].strip() if "(" in raw_reason else raw_reason
+            fail_reason_clean = CODE_MAP.get(fail_code, raw_reason)
         
         # Risk Params
         risk_unit = get_risk_unit(risk_budget)
@@ -222,28 +243,8 @@ def get_experiments():
         if risk_unit is not None and risk_reward_ratio is not None:
             target_return_pct = risk_unit * risk_reward_ratio * 100.0
 
-        # Backtest-derived metrics (preferred)
-        bt_total_return = metrics.get("sample_total_return_pct")
-        bt_win_rate = metrics.get("sample_win_rate")
-        bt_trades = metrics.get("sample_trades")
-        bt_mdd = metrics.get("sample_mdd_pct")
-        bt_rr = metrics.get("sample_rr", 1.0)
-        
-        # [V11] 설계도 기반 통합 REJECTED 판정
-        # 기존 reason_codes가 있으면 먼저 확인, 없으면 새 로직으로 판정
-        if r.reason_codes:
-            status = "Rejected"
-            fail_reason_clean = CODE_MAP.get(r.reason_codes[0], r.reason_codes[0])
-        else:
-            # 새로운 Hard Gate 적용
-            validation_metrics = {
-                "sample_trades": bt_trades if bt_trades is not None else n_trades,
-                "sample_mdd_pct": bt_mdd if bt_mdd is not None else 0.0,
-                "sample_win_rate": bt_win_rate if bt_win_rate is not None else win_rate,
-                "sample_rr": bt_rr,
-                "n_trades": n_trades,
-            }
-            status, fail_reason_clean = determine_rejection_status(validation_metrics, risk_budget)
+        # [V16] Rejection logic integrated into build_record_and_artifact/Evaluation orchestration.
+        # We rely on the ledger's status to avoid discrepancy.
 
         if bt_total_return is None:
             results_path = LEDGER_PATH / "artifacts" / f"{r.exp_id}_results.csv"

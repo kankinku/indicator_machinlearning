@@ -45,9 +45,10 @@ class TestV13ProCore(unittest.TestCase):
         self.assertTrue(exit_sig.iloc[7])
         self.assertFalse(exit_sig.iloc[6])
         
-        # Token count: 3 tokens each ('feature_a', '>', '25') -> 6 total
-        # Implementation uses: complexity = len(tokens) * 0.1 -> 0.6
-        self.assertAlmostEqual(complexity, 0.6)
+        # [V17] structural_complexity = 1.0 * n_features + 0.5 * n_compares + 0.3 * n_logic + 0.2 * depth
+        # For 'feature_a > 25': 1.0(feat) + 0.5(comp) + 0.0(logic) + 0.2(depth 1) = 1.7
+        # Entry(1.7) + Exit(1.7) = 3.4
+        self.assertAlmostEqual(complexity, 3.4)
 
     def test_rule_evaluator_nan_safety(self):
         """Test that NaN values result in False for rules."""

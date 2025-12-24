@@ -34,6 +34,7 @@ from src.shared.logger import get_logger
 from src.shared.instrumentation import get_instrumentation
 from src.shared.hashing import generate_policy_id
 from src.l3_meta.reward_shaper import get_reward_shaper
+from src.shared.event_bus import record_event
 
 logger = get_logger("orchestration.evaluation")
 
@@ -65,9 +66,9 @@ class OperationalQACollector:
         self.performance_stats["scores"].append(score)
         if passed and metrics:
             self.passed_samples += 1
-            self.performance_stats["returns"].append(metrics.total_return_pct)
-            self.performance_stats["mdds"].append(metrics.mdd_pct)
-            self.performance_stats["annual_trades"].append(metrics.trades_per_year)
+            self.performance_stats["returns"].append(metrics.equity.total_return_pct)
+            self.performance_stats["mdds"].append(metrics.equity.max_drawdown_pct)
+            self.performance_stats["annual_trades"].append(metrics.trades.trades_per_year)
             if metrics.trades.trade_count == 0:
                 self.performance_stats["zero_trades"] += 1
         else:
@@ -410,6 +411,7 @@ def _evaluate_policy_windows(
                     signals=base_signals,
                     risk_budget=sample_risk,
                     target_regime=regime_id,
+                    complexity_score=core_base.get("cpcv", {}).get("complexity_score", 0.0)
                 )
 
                 # Alpha = Strat ROI - Bench ROI
@@ -432,6 +434,9 @@ def _evaluate_policy_windows(
 
                 sample_scores.append(sample_score)
                 violations.append(violation)
+                
+                # [V18] Event Recording
+                record_event("SAMPLE_EVALUATED", policy_id=policy_spec.spec_id, stage=stage, payload={"passed": not violation, "score": sample_score})
                 
                 if best_sample is None or sample_score > best_sample.sample_score:
                     # Capture core artifacts only for the best sample to save memory
@@ -461,11 +466,13 @@ def _evaluate_policy_windows(
                     std_score=agg["std_score"],
                     violation_rate=agg["violation_rate"],
                     avg_alpha=avg_alpha,
+                    complexity_score=metrics.complexity_score
                 )
             )
 
             # [V14-O] Early Exit: If this window failed hard gates significantly, skip remaining windows
             if agg["violation_rate"] > 0.8:
+                record_event("WINDOW_EARLY_EXIT", policy_id=policy_spec.spec_id, stage=stage, payload={"window_id": window_id})
                 logger.debug(f" [EarlyExit] Policy {policy_spec.template_id} rejected at {window_id}")
                 break
 
@@ -832,33 +839,42 @@ def persist_best_samples(
             continue
 
         best = r.best_sample
+        
+        # [V18] Handle results without best_sample (e.g., Stage 1 filtered out)
         if best is None:
+            # Create minimal scorecard for rejected record
+            scorecard = {
+                "eval_score": r.score,
+                "eval_stage": r.stage,
+                "module_key": r.module_key,
+                "fingerprint": r.fingerprint,
+                "is_filtered": True
+            }
+            record, artifact = build_record_and_artifact(
+                policy_spec=r.policy_spec,
+                df=df.iloc[:5], # Dummy small DF
+                X_features=pd.DataFrame(),
+                core={}, # Empty core
+                scorecard=scorecard,
+                module_key=r.module_key,
+                eval_stage=r.stage,
+            )
+            repo.save_record(record, artifact)
+            saved += 1
             continue
             
-        # [V16] Use pre-captured artifacts
+        # [V16] Use pre-captured artifacts for candidates that have evaluation data
         spec = copy.deepcopy(r.policy_spec)
         spec.risk_budget = best.risk_budget
         
         # [V14-O] Reconstruct artifacts locally
         df_local = window_map.get(best.window_id)
         if df_local is None:
-            # Fallback: maybe it's Stage 1 result being persisted (rare but possible)
-            if best.window_id.startswith("FAST"):
-                lookback = min(config.EVAL_FAST_LOOKBACK_BARS, len(df))
-                fast_df = df.iloc[-lookback:]
-                win_idx = int(best.window_id.split("_")[-1])
-                # Simplified window reconstruction
-                total = len(fast_df)
-                cnt = config.EVAL_WINDOW_COUNT_FAST
-                window_size = max(config.EVAL_MIN_WINDOW_BARS, total // cnt)
-                start = win_idx * window_size
-                end = total if win_idx == cnt - 1 else min(total, start + window_size)
-                df_local = fast_df.iloc[start:end]
-            else:
-                logger.warning(f"No window_df for {spec.spec_id}, id={best.window_id}, skipping persistence.")
-                continue
+            # Fallback for FAST or other windows
+            lookback = min(config.EVAL_FAST_LOOKBACK_BARS, len(df))
+            df_local = df.iloc[-lookback:]
             
-        # Re-generate features for the window (Should be cached on disk or quick)
+        # Re-generate features for the window
         X_full = _generate_features_cached(df_local.values, df_local.columns.tolist(), df_local.index, spec.feature_genome)
         
         scorecard = {
@@ -867,12 +883,25 @@ def persist_best_samples(
             "module_key": r.module_key,
             "sample_id": best.sample_id,
             "sample_window_id": best.window_id,
+            
+            # Standard keys (for validation & SSOT)
+            "total_return_pct": best.metrics.equity.total_return_pct,
+            "mdd_pct": best.metrics.equity.max_drawdown_pct,
+            "sharpe": best.metrics.equity.sharpe,
+            "win_rate": best.metrics.trades.win_rate,
+            "n_trades": best.metrics.trades.trade_count,
+            "reward_risk": best.metrics.trades.reward_risk,
+            
+            # Prefixed keys (for Dashboard API compatibility)
             "sample_total_return_pct": best.metrics.equity.total_return_pct,
             "sample_mdd_pct": best.metrics.equity.max_drawdown_pct,
+            "sample_sharpe": best.metrics.equity.sharpe,
+            "sample_excess_return": best.metrics.equity.excess_return,
             "sample_rr": best.metrics.trades.reward_risk,
             "sample_vol_pct": best.metrics.equity.vol_pct,
             "sample_trades": best.metrics.trades.trade_count,
             "sample_win_rate": best.metrics.trades.win_rate,
+            
             "fingerprint": r.fingerprint,
             "reward_breakdown": r.reward_breakdown
         }
@@ -887,8 +916,6 @@ def persist_best_samples(
             eval_stage=r.stage,
         )
         
-        # Check for duplication (via fingerprint/policy_id check if repo supports it)
-        # For now, we trust the caller to have checked or we just save.
         repo.save_record(record, artifact)
         saved += 1
     if saved > 0 or skipped > 0:

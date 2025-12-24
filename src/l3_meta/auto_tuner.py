@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, asdict
 import numpy as np
 from src.config import config
 from src.shared.logger import get_logger
+from src.shared.event_bus import record_event
 
 logger = get_logger("l3.auto_tuner")
 
@@ -114,11 +115,14 @@ class AutoTuner:
                 success = self._evaluate_intervention(plan)
                 if success:
                     plan.status = "SUCCESS"
+                    record_event("AUTOTUNER_INTERVENTION_SUCCESS", payload={"plan_id": plan.intervention_id, "cause": plan.cause})
                     logger.info(f"[AutoTuner] ✅ Intervention {plan.intervention_id} SUCCESS. Maintaining levers.")
                 else:
                     plan.status = "FAILED"
+                    record_event("AUTOTUNER_INTERVENTION_FAILED", payload={"plan_id": plan.intervention_id, "cause": plan.cause})
                     logger.warning(f"[AutoTuner] ❌ Intervention {plan.intervention_id} FAILED. Rolling back.")
                     self._rollback(plan)
+                    record_event("AUTOTUNER_INTERVENTION_ROLLBACK", payload={"plan_id": plan.intervention_id})
 
     def _analyze_and_act(self, current: BatchState):
         """Root cause analysis and intervention strategy selection."""
@@ -129,15 +133,23 @@ class AutoTuner:
         cause = self._classify_cause(current)
         if cause == "HEALTHY":
             return
+        
+        record_event("AUTOTUNER_RIGID_DETECTED", payload={"cause": cause})
 
         # Start new intervention if not already tracking an active one
         if any(p.status == "ACTIVE" for p in self.interventions):
             return
 
         self._apply_intervention(cause, current.batch_id)
+        record_event("AUTOTUNER_INTERVENTION_APPLIED", payload={"cause": cause})
 
     def _classify_cause(self, current: BatchState) -> str:
         """Heuristic-based Cause Classification (A-F)."""
+        from src.testing.context import is_test_mode, get_test_context
+        if is_test_mode():
+            ctx = get_test_context()
+            if ctx and ctx.env and ctx.env.force_rigid:
+                return "SPACE_TOO_NARROW" # Default forced rigid cause
         
         # 0. Infrastructure check (F)
         if current.exception_count > 5:

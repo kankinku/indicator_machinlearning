@@ -23,7 +23,7 @@ os.environ["LOKY_MAX_CPU_COUNT"] = str(multiprocessing.cpu_count())
 from joblib import Parallel, delayed
 
 from src.config import config
-from src.shared.logger import get_logger, setup_main_logging, setup_worker_logging, stop_main_logging
+from src.shared.logger import get_logger
 from src.shared.caching import get_feature_cache, clear_all_caches
 from src.shared.caching import get_feature_cache, clear_all_caches
 from src.features.registry import get_registry, inject_registry
@@ -68,7 +68,7 @@ def _run_single_experiment(
         RL 학습은 여기서 수행하지 않습니다 (메인 프로세스에서 일괄 수행).
     """
     try:
-        # [Optim] 워커 프로세스 초기화: 레지스트리 주입 및 로깅 설정
+        # [Optim] 워커 프로세스 초기화: 레지스트리 주입
         if preloaded_registry is not None:
             inject_registry(preloaded_registry)
 
@@ -84,17 +84,17 @@ def _run_single_experiment(
                 m = res.best_sample.metrics
                 # [V9] Backtest 기반 필드명
                 metrics_dict = {
-                    "total_return_pct": m.total_return_pct,
-                    "mdd_pct": m.mdd_pct,
-                    "win_rate": m.win_rate,
-                    "n_trades": m.trade_count,
-                    "valid_trade_count": m.valid_trade_count if hasattr(m, "valid_trade_count") else m.trade_count,
-                    "benchmark_roi_pct": m.benchmark_roi_pct if hasattr(m, "benchmark_roi_pct") else 0.0,
-                    "sharpe": m.sharpe if hasattr(m, 'sharpe') else 0.0,
-                    "cpcv_mean": m.cpcv_mean if hasattr(m, 'cpcv_mean') else 0.0,
-                    "cpcv_std": m.cpcv_std if hasattr(m, 'cpcv_std') else 1.0,
-                    "trades_per_year": m.trades_per_year if hasattr(m, 'trades_per_year') else 0.0,
-                    "profit_factor": m.profit_factor if hasattr(m, 'profit_factor') else 1.0,
+                    "total_return_pct": m.equity.total_return_pct,
+                    "mdd_pct": m.equity.max_drawdown_pct,
+                    "win_rate": m.trades.win_rate,
+                    "n_trades": m.trades.trade_count,
+                    "valid_trade_count": m.trades.valid_trade_count if hasattr(m.trades, "valid_trade_count") else m.trades.trade_count,
+                    "benchmark_roi_pct": m.equity.benchmark_roi_pct if hasattr(m.equity, "benchmark_roi_pct") else 0.0,
+                    "sharpe": m.equity.sharpe if hasattr(m.equity, 'sharpe') else 0.0,
+                    "cpcv_mean": m.raw_score, # Placeholder or map from raw_score
+                    "cpcv_std": 0.0,
+                    "trades_per_year": m.trades.trades_per_year if hasattr(m.trades, 'trades_per_year') else 0.0,
+                    "profit_factor": m.trades.profit_factor if hasattr(m.trades, 'profit_factor') else 1.0,
                 }
             
             return ExperimentResult(
@@ -113,8 +113,6 @@ def _run_single_experiment(
                 error="No evaluation results",
             )
     except Exception as e:
-        import traceback
-        logger.error(f"!!! [Worker Error] {policy.template_id}: {e}\n{traceback.format_exc()}")
         return ExperimentResult(
             policy=policy,
             score=config.EVAL_SCORE_MIN,
@@ -132,18 +130,21 @@ def _run_batch_parallel(
 ) -> List[ExperimentResult]:
     """
     여러 실험을 병렬로 실행합니다.
+    
+    Args:
+        policies: 실행할 정책들
+        df: 시장 데이터
+        regime_label: 현재 시장 상태 라벨
+        n_jobs: 병렬 작업 수
+    
+    Returns:
+        실험 결과 리스트
     """
     if not policies:
         return []
-
-    from src.shared.logger import _log_queue
+    
+    # [Optim] 메인 프로세스의 레지스트리를 가져옵니다 (이미 로드됨)
     main_registry = get_registry()
-
-    # Define initializer for workers
-    def worker_setup(q, reg):
-        setup_worker_logging(q)
-        if reg:
-            inject_registry(reg)
 
     # joblib Parallel 사용 - prefer="processes"로 GIL 우회
     results = Parallel(
@@ -151,14 +152,12 @@ def _run_batch_parallel(
         backend=config.PARALLEL_BACKEND,
         timeout=config.PARALLEL_TIMEOUT,
         verbose=0,
-        initializer=worker_setup,
-        initargs=(_log_queue, main_registry)
     )(
         delayed(_run_single_experiment)(
             policy=policy,
             df=df,
             regime_label=regime_label,
-            preloaded_registry=None, # Already handled by initializer
+            preloaded_registry=main_registry, # [Optim] 객체 전달 (Pickling)
         )
         for policy in policies
     )
@@ -266,8 +265,7 @@ def infinite_loop(
     max_exps = max_experiments if max_experiments is not None else config.MAX_EXPERIMENTS
     sleep_sec = sleep_interval if sleep_interval is not None else config.SLEEP_INTERVAL
 
-    # 1. Setup Logging (Main Process)
-    log_queue = setup_main_logging()
+    # 1. Setup
     logger.info(">>> [System] Initializing Vibe Engine (Dynamic Evolved)...")
     
     # DI: 싱글톤 레지스트리 사용 (중복 초기화 방지)
@@ -386,27 +384,21 @@ def infinite_loop(
             
             # 2. 병렬 평가 (V14 Optimized)
             logger.info(f"  >>> [V14] Evaluating {len(policies)} experiments in batch (Parallel)...")
+            s2_start = time.time()
             results, diagnostic_status = evaluate_v12_batch(policies, df, regime.label, n_jobs)
+            s2_duration = time.time() - s2_start
+            
+            # Instrument Stage 2 (Detailed)
+            p_rate = len([r for r in results if r.score > config.EVAL_SCORE_MIN]) / len(results) if results else 0
+            instrumentation.record_stage2(s2_duration, p_rate)
             
             # [V14] Self-Healing: 진단 결과에 따라 정책 조정 (Epsilon 재가열 등)
-            agent.adjust_policy(diagnostic_status.get("status", "OK"))
+            agent.adjust_policy(diagnostic_status)
             
-            # [V15] Auto-Tuning (Reward Weights, search_profile_mix, etc.)
+            # [V15] Auto-Tuning (Reward Weights, etc.)
             from src.l3_meta.auto_tuner import get_auto_tuner
             tuner = get_auto_tuner()
-            
-            # Gather extra context for tuner
-            s1_pass_rate = diagnostic_status.get("pass_rate", 0.0) # Placeholder if not separate
-            # In V14 evaluation, instrumentation already has S1 pass rate
-            s1_metrics = instrumentation.current_batch.get("stage1", {})
-            
-            extra_tuner_info = {
-                "batch_id": batch_idx,
-                "pass_rate_s1": s1_metrics.get("pass_rate", 0.0),
-                "exception_count": instrumentation.current_batch.get("exceptions", 0),
-                "search_profile_mix": {} # TBD
-            }
-            tuner.process_diagnostics(diagnostic_status, extra_tuner_info)
+            tuner.process_diagnostics(diagnostic_status, {})
 
             # 3. [V11.3] Diversity Selection & Persistence
             from src.l1_judge.diversity import select_diverse_top_k
@@ -433,31 +425,40 @@ def infinite_loop(
                     diversity_info.get("collision_rate", 0.0)
                 )
             
-            # 4. [V16] One-Pass Persistence
+            # 4. [V16] One-Pass Persistence (Save all results for 'Include Rejected')
             try:
-                saved = persist_best_samples(repo, diverse_results, df, existing_ids=existing_ids)
+                saved = persist_best_samples(repo, results, df, existing_ids=existing_ids)
                 counter += saved
             except Exception as e:
                 instrumentation.record_exception(type(e).__name__)
                 logger.warning(f"Failed to persist: {e}")
             batch_rewards = [] # Initialize batch_rewards for curriculum and reporting
-            for res in diverse_results:
+            diverse_ids = {r.policy_spec.spec_id for r in diverse_results} # Get IDs of diverse results
+            for res in results: # Iterate over all results, not just diverse ones
                 from src.shared.metrics import metrics_to_legacy_dict, aggregate_windows
-                # We need a dict for reporting/learning (legacy format)
+                
+                # Default metrics for logging
+                status_icon = "OK" if res.score > config.EVAL_SCORE_MIN else "NO"
+                t1_share = 0.0
+                
+                # Build metrics dict for reporting and potential learning
+                m_dict = {}
                 if res.best_sample:
                     m_dict = metrics_to_legacy_dict(
                         aggregate_windows([res.best_sample.metrics], eval_score_override=res.score)
                     )
                     m_dict["trade_logic"] = res.best_sample.core.get("trade_logic", {})
                     m_dict["is_rejected"] = res.score <= config.EVAL_SCORE_MIN
+                    t1_share = m_dict.get('top1_share', 0.0)
                     
-                    # For curriculum and reporting, we need the metrics and score
-                    batch_rewards.append((res.score, res.policy_spec, m_dict))
-                    
-                    status_icon = "OK" if res.score > config.EVAL_SCORE_MIN else "NO"
-                    logger.info(
-                        f"  [{counter}] {status_icon} {res.policy_spec.template_id:<20} | Score: {res.score:>6.3f} | T1: {m_dict.get('top1_share', 0):.2f}"
-                    )
+                    # Only learn from diverse winners
+                    if res.policy_spec.spec_id in diverse_ids:
+                        batch_rewards.append((res.score, res.policy_spec, m_dict))
+                
+                # [V18] Log all results so user sees what happened in the batch
+                logger.info(
+                    f"  [{results.index(res) + 1}] {status_icon} {res.policy_spec.template_id:<20} | Score: {res.score:>8.3f} | T1: {t1_share:.2f}"
+                )
             
             # 5. [V11] 배치 학습 (Parallel Mode)
             if batch_rewards:
@@ -528,21 +529,34 @@ def infinite_loop(
         cache_stats = get_feature_cache().stats
         
         # Best result in this batch
-        best_sharpe = max([r.metrics.get('sharpe', 0) for r in batch_rewards if r[2]] + [0])
+        best_sharpe = max([r[2].get('sharpe', 0) for r in batch_rewards if len(r) > 2 and r[2]] + [0])
+        
+        diag_str = diagnostic_status.get('status', 'SOFT') if isinstance(diagnostic_status, dict) else str(diagnostic_status)
         
         report = []
         report.append("=" * 100)
-        report.append(f"[{'BATCH #' + str(batch_idx):^15}] Time: {batch_duration:4.1f}s | Status: {diagnostic_status:<10} | Cache Hit: {cache_stats['hit_rate_pct']:>3}%")
+        report.append(f"[{'BATCH #' + str(batch_idx):^15}] Time: {batch_duration:4.1f}s | Status: {diag_str:<10} | Cache Hit: {cache_stats['hit_rate_pct']:>3}%")
         report.append("-" * 100)
         report.append(f"[SYSTEM] Regime: {regime.label:<12} | Eps: {e_snap['epsilon']:<6.4f} | Steps: {e_snap['step_count']:<5} | Reheat: {e_snap['last_reheat']}")
         report.append(f"[STAGE ] {c_info['description']} ({c_info['current_stage']}) | Pass: {c_info['stage_passes']:>2} / {c_info['threshold_to_next']:>2} to Next | Target: {c_info['target_return_pct']}%")
         report.append(f"[EVAL  ] Total: {len(policies):>2} | Valid: {len(valid_results):>2} | Diverse: {len(diverse_results):>2} | Best Sharpe: {best_sharpe:>5.2f}")
         
-        if hasattr(tuner, 'current_levers'):
-            levers = tuner.current_levers
-            active = [p for p in tuner.interventions if p.status == "ACTIVE"]
-            int_str = f" | {active[0].intervention_id}({active[0].cause})" if active else " | IDLE"
-            report.append(f"[TUNER ] S1_Adj: {levers.get('s1_threshold_adjust', 0):.2f} | Mut: {levers.get('mutation_strength', 0):.2f} | Div: {levers.get('diversity_pressure', 0):.2f}{int_str}")
+        # [V18] LogicTree Diagnostics KPI
+        from src.shared.logic_tree_diagnostics import get_and_reset_diagnostics
+        lt_diag = get_and_reset_diagnostics(batch_id=f"batch_{batch_idx}")
+        if lt_diag.total_condition_evals > 0:
+            status_icon = "✓" if lt_diag.is_healthy else "⚠"
+            report.append(
+                f"[TREE  ] {status_icon} Match: {lt_diag.match_rate:.1%} | "
+                f"Direct: {lt_diag.matched_direct} | Fuzzy: {lt_diag.matched_fuzzy} | "
+                f"Ambig: {lt_diag.ambiguous} | Unmatch: {lt_diag.unmatched}"
+            )
+            if lt_diag.unmatched_keys:
+                report.append(f"[TREE  ] Missing keys: {lt_diag.unmatched_keys[:5]}")
+        
+        if hasattr(tuner, 'current_weights'):
+            tw = tuner.current_weights
+            report.append(f"[TUNER ] W_CAGR: {tw['reward_cagr']:.2f} | W_MDD: {tw['reward_mdd']:.2f} | W_Complex: {tw['complexity_penalty']:.2f}")
             
         report.append("=" * 100)
         
@@ -557,9 +571,6 @@ def infinite_loop(
 
         # F. Iterate
         time.sleep(sleep_sec)
-    
-    # G. Cleanup (Actually theoretically unreachable, but for DoD)
-    stop_main_logging()
 
 
 if __name__ == "__main__":

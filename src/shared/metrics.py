@@ -50,6 +50,7 @@ class WindowMetrics:
     rejection_reason: str = "PASS"
     raw_score: float = 0.0
     bars_total: int = 0
+    complexity_score: float = 0.0 # [V17] Structural AST complexity
     
     # Metadata
     start_date: Optional[str] = None
@@ -79,6 +80,7 @@ class AggregateMetrics:
     
     # Final Decision
     final_score: float = 0.0
+    mean_complexity: float = 0.0 # [V17]
     
     # Artifacts (captured from the best window/sample)
     best_sample_id: Optional[str] = None
@@ -223,7 +225,8 @@ def compute_window_metrics(
     benchmark_roi_pct: float = 0.0,
     exposure_mask: Optional[np.ndarray] = None,
     start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    end_date: Optional[str] = None,
+    complexity_score: float = 0.0
 ) -> WindowMetrics:
     """
     Combined helper to get both trade and equity stats for a window.
@@ -237,7 +240,8 @@ def compute_window_metrics(
         equity=e_stats,
         bars_total=bars_total,
         start_date=start_date,
-        end_date=end_date
+        end_date=end_date,
+        complexity_score=complexity_score
     )
 
 # =============================================================================
@@ -263,6 +267,7 @@ def aggregate_windows(
     median_ret = float(np.median(returns))
     mean_sharpe = float(np.mean(sharpes))
     mean_mdd = float(np.mean(mdds))
+    mean_complexity = float(np.mean([w.complexity_score for w in window_results]))
     
     violation_rate = float(sum(violations) / len(violations))
     
@@ -282,7 +287,8 @@ def aggregate_windows(
         violation_rate=violation_rate,
         score_p10=score_p10,
         score_std=score_std,
-        final_score=final_score
+        final_score=final_score,
+        mean_complexity=mean_complexity
     )
 
 # =============================================================================
@@ -310,6 +316,7 @@ def metrics_to_legacy_dict(agg: AggregateMetrics) -> Dict[str, Any]:
         "top1_share": np.mean([w.trades.top1_share for w in agg.window_results]) if agg.window_results else 0.0,
         "top3_share": np.mean([w.trades.top3_share for w in agg.window_results]) if agg.window_results else 0.0,
         "excess_return": np.mean([w.equity.excess_return for w in agg.window_results]) if agg.window_results else 0.0,
+        "complexity_score": agg.mean_complexity,
     }
     
     # Add oos_bars (sum of all windows)
