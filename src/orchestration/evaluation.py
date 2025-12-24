@@ -51,24 +51,31 @@ class OperationalQACollector:
         self.performance_stats = {
             "returns": [],
             "mdds": [],
-            "annual_trades": []
+            "annual_trades": [],
+            "zero_trades": 0,
+            "scores": []
         }
         self.similarity_stats = {
             "avg_jaccard": 0.0,
             "collision_rate": 0.0
         }
 
-    def collect(self, passed: bool, reason: str, metrics: Optional[SampleMetrics] = None):
+    def collect(self, passed: bool, reason: str, metrics: Optional[SampleMetrics] = None, score: float = config.EVAL_SCORE_MIN):
         self.total_samples += 1
+        self.performance_stats["scores"].append(score)
         if passed and metrics:
             self.passed_samples += 1
             self.performance_stats["returns"].append(metrics.total_return_pct)
             self.performance_stats["mdds"].append(metrics.mdd_pct)
             self.performance_stats["annual_trades"].append(metrics.trades_per_year)
+            if metrics.trades.trade_count == 0:
+                self.performance_stats["zero_trades"] += 1
         else:
             # Extract FAIL_XXX code
             fail_code = reason.split("(")[0].strip() if "(" in reason else reason
             self.failure_counts[fail_code] = self.failure_counts.get(fail_code, 0) + 1
+            if fail_code == "FAIL_ZERO_EXPOSURE":
+                self.performance_stats["zero_trades"] += 1
 
     def _get_category(self, fail_code: str) -> str:
         for cat, codes in config.FAILURE_TAXONOMY.items():
@@ -167,7 +174,7 @@ class OperationalQACollector:
         logger.info(f"Diagnostic Result: >>> {status} <<<")
         
         # [V14] Persist for Dashboard
-        self._persist_diagnostics(
+        report_data = self._persist_diagnostics(
             pass_rate, 
             rej_rate, 
             status, 
@@ -176,7 +183,13 @@ class OperationalQACollector:
         )
 
         logger.info("------------------------------------------")
-        return status
+        
+        # Add rich metrics for AutoTuner
+        report_data["mean_tpy"] = avg_tpy
+        report_data["zero_trade_ratio"] = self.performance_stats["zero_trades"] / self.total_samples if self.total_samples > 0 else 0
+        report_data["best_score"] = max(self.performance_stats.get("scores", [config.EVAL_SCORE_MIN])) # We should collect scores
+        
+        return report_data
 
     def _persist_diagnostics(self, pass_rate, rej_rate, status, taxonomy, similarity=None):
         try:
@@ -205,9 +218,12 @@ class OperationalQACollector:
             history_file = diag_dir / "history.jsonl"
             with open(history_file, "a") as f:
                 f.write(json.dumps(report_data) + "\n")
+            
+            return report_data
                 
         except Exception as e:
             logger.error(f"Failed to persist diagnostics: {e}")
+            return {"status": status, "pass_rate": pass_rate}
 
 
 # Dataclasses moved to src.evaluation.contracts

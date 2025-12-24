@@ -301,6 +301,20 @@ class BaseConfig:
     SCORE_WINRATE_PENALTY_START: float = 0.80  # 패널티 시작 승률
     
     # =========================================================
+    # [V16] AutoTuner Settings
+    # =========================================================
+    AUTOTUNE_ENABLED: bool = True
+    AUTOTUNE_HISTORY_SIZE: int = 20         # 분석할 최근 배치 수
+    AUTOTUNE_RIGID_THRESHOLD: float = 0.05  # 5% 미만 개선 시 정체로 판단
+    AUTOTUNE_PASS_RATE_TARGET: float = 0.15 # 목표 통과율 (Stage 2)
+    AUTOTUNE_DIVERSITY_TARGET: float = 0.4  # 목표 Jaccard 거리 (평균)
+    AUTOTUNE_INTERVENTION_M_BATCHES: int = 10 # 개입 효과 검증 기간
+    
+    # Mutation Levers
+    AUTOTUNE_MUTATION_BASE: float = 0.1
+    AUTOTUNE_INDICATOR_SWAP_PROB: float = 0.2
+
+    # =========================================================
     # [V11] Curriculum Learning - 설계도 기반 단계별 목표
     # "500%는 목표이지 출발선이 아니다"
     # =========================================================

@@ -149,14 +149,31 @@ class MetaAgent:
         # 1. Standard RL Flow
         logger.debug(f"[MetaAgent] Regime Detected: {regime.label} (Trend: {regime.trend_score:.2f}, VIX: {regime.vol_level:.2f})")
 
-        # Get Action from RL (Multi-head Integrated)
-        if config.D3QN_ENABLED:
-            action_name, action_idx, risk_profile_id, risk_action_idx = self.integrated_rl.get_action(
-                regime, df=self._current_df
-            )
+        from src.l3_meta.auto_tuner import get_auto_tuner
+        tuner = get_auto_tuner()
+        levers = tuner.get_levers()
+        
+        # [V16] AutoTuner intervention: search_profile_mix
+        mix = levers.get("search_profile_mix")
+        if mix and isinstance(mix, dict):
+            # Sample action name from mix
+            profiles = list(mix.keys())
+            weights = list(mix.values())
+            action_name = random.choices(profiles, weights=weights, k=1)[0]
+            action_idx = self.integrated_rl.strategy_actions.index(action_name) if hasattr(self.integrated_rl, 'strategy_actions') and action_name in self.integrated_rl.strategy_actions else 0
+            
+            # Risk profile still from RL for now or default
+            _, _, risk_profile_id, risk_action_idx = self.integrated_rl.get_action(regime, df=self._current_df)
+            logger.info(f"    [AutoTuner] Override Action: {action_name} (from mix)")
         else:
-            action_name, action_idx = self.strategy_rl.get_action(regime)
-            risk_profile_id, risk_action_idx = self.risk_rl.get_action(regime)
+            # Get Action from RL (Multi-head Integrated)
+            if config.D3QN_ENABLED:
+                action_name, action_idx, risk_profile_id, risk_action_idx = self.integrated_rl.get_action(
+                    regime, df=self._current_df
+                )
+            else:
+                action_name, action_idx = self.strategy_rl.get_action(regime)
+                risk_profile_id, risk_action_idx = self.risk_rl.get_action(regime)
         
         risk_profile = self._resolve_risk_profile(risk_profile_id)
         
@@ -173,6 +190,7 @@ class MetaAgent:
             "risk_profile": risk_profile_id,
             "risk_action_idx": risk_action_idx,
             "d3qn_mode": config.D3QN_ENABLED,
+            "tuner_intervened": mix is not None
         }
         
         spec = self._make_spec(feature_genome, action_name, regime, risk_profile=risk_profile, rl_meta=rl_meta)
@@ -190,8 +208,13 @@ class MetaAgent:
             np.random.seed(seed)
             
         from src.l3_meta.sampler import sample_with_diversity
+        from src.l3_meta.auto_tuner import get_auto_tuner
         
-        jaccard_th = getattr(config, 'DIVERSITY_JACCARD_TH', 0.8)
+        tuner = get_auto_tuner()
+        levers = tuner.get_levers()
+        
+        # [V16] Use dynamic diversity pressure from tuner
+        jaccard_th = levers.get("diversity_pressure", getattr(config, 'DIVERSITY_JACCARD_TH', 0.8))
         
         # Iterative proposal to fill the batch with diverse candidates
         return sample_with_diversity(
@@ -274,7 +297,12 @@ class MetaAgent:
                 p1 = random.choice(elite_records).policy_spec
                 p2 = random.choice(elite_records).policy_spec
                 feature_genome = crossover(p1, p2).feature_genome
-                if random.random() < 0.3:
+                
+                # [V16] Use mutation_strength from AutoTuner
+                from src.l3_meta.auto_tuner import get_auto_tuner
+                mut_strength = get_auto_tuner().get_levers().get("mutation_strength", 0.3)
+                
+                if random.random() < mut_strength:
                     temp_spec = copy.deepcopy(p1)
                     temp_spec.feature_genome = feature_genome
                     feature_genome = mutate(temp_spec).feature_genome
@@ -498,10 +526,14 @@ class MetaAgent:
         
         # [V6] Autonomy - Entry Threshold Control
         # Instead of fixed global threshold, let the agent decide per strategy.
+        from src.l3_meta.auto_tuner import get_auto_tuner
+        tuner_adj = get_auto_tuner().get_levers().get("s1_threshold_adjust", 0.0)
+        
         entry_threshold = round(random.uniform(
             config.ENTRY_THRESHOLD_MIN, 
             config.ENTRY_THRESHOLD_MAX
-        ), 2)
+        ) + tuner_adj, 2)
+        entry_threshold = max(0.1, min(0.9, entry_threshold)) # Sanity clamp
         
         return PolicySpec(
             spec_id=str(uuid.uuid4()),

@@ -389,12 +389,24 @@ def infinite_loop(
             results, diagnostic_status = evaluate_v12_batch(policies, df, regime.label, n_jobs)
             
             # [V14] Self-Healing: 진단 결과에 따라 정책 조정 (Epsilon 재가열 등)
-            agent.adjust_policy(diagnostic_status)
+            agent.adjust_policy(diagnostic_status.get("status", "OK"))
             
-            # [V15] Auto-Tuning (Reward Weights, etc.)
+            # [V15] Auto-Tuning (Reward Weights, search_profile_mix, etc.)
             from src.l3_meta.auto_tuner import get_auto_tuner
             tuner = get_auto_tuner()
-            tuner.process_diagnostics(diagnostic_status, {})
+            
+            # Gather extra context for tuner
+            s1_pass_rate = diagnostic_status.get("pass_rate", 0.0) # Placeholder if not separate
+            # In V14 evaluation, instrumentation already has S1 pass rate
+            s1_metrics = instrumentation.current_batch.get("stage1", {})
+            
+            extra_tuner_info = {
+                "batch_id": batch_idx,
+                "pass_rate_s1": s1_metrics.get("pass_rate", 0.0),
+                "exception_count": instrumentation.current_batch.get("exceptions", 0),
+                "search_profile_mix": {} # TBD
+            }
+            tuner.process_diagnostics(diagnostic_status, extra_tuner_info)
 
             # 3. [V11.3] Diversity Selection & Persistence
             from src.l1_judge.diversity import select_diverse_top_k
@@ -526,9 +538,11 @@ def infinite_loop(
         report.append(f"[STAGE ] {c_info['description']} ({c_info['current_stage']}) | Pass: {c_info['stage_passes']:>2} / {c_info['threshold_to_next']:>2} to Next | Target: {c_info['target_return_pct']}%")
         report.append(f"[EVAL  ] Total: {len(policies):>2} | Valid: {len(valid_results):>2} | Diverse: {len(diverse_results):>2} | Best Sharpe: {best_sharpe:>5.2f}")
         
-        if hasattr(tuner, 'current_weights'):
-            tw = tuner.current_weights
-            report.append(f"[TUNER ] W_CAGR: {tw['reward_cagr']:.2f} | W_MDD: {tw['reward_mdd']:.2f} | W_Complex: {tw['complexity_penalty']:.2f}")
+        if hasattr(tuner, 'current_levers'):
+            levers = tuner.current_levers
+            active = [p for p in tuner.interventions if p.status == "ACTIVE"]
+            int_str = f" | {active[0].intervention_id}({active[0].cause})" if active else " | IDLE"
+            report.append(f"[TUNER ] S1_Adj: {levers.get('s1_threshold_adjust', 0):.2f} | Mut: {levers.get('mutation_strength', 0):.2f} | Div: {levers.get('diversity_pressure', 0):.2f}{int_str}")
             
         report.append("=" * 100)
         

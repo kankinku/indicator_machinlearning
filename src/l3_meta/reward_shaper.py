@@ -258,13 +258,24 @@ class RewardShaper:
         n_features = len([k for k in genome.keys() if not k.startswith("__")])
         r_complexity = -self._clip(n_features * 0.05, 0, 0.3)
         
+        # [V16] AutoTuner Dynamic Weights
+        from src.l3_meta.auto_tuner import get_auto_tuner
+        tuner = get_auto_tuner()
+        levers = tuner.get_levers()
+        
+        w_return = levers.get("reward_w_return", self.w_return)
+        w_rr = levers.get("reward_w_rr", self.w_rr)
+        w_top_trades = levers.get("reward_w_top_trades", self.w_top_trades)
+        w_trades = levers.get("reward_w_trades", self.w_trades)
+        w_mdd = levers.get("reward_w_mdd", self.w_mdd)
+
         # [합산]
         total = (
-            self.w_return * r_return
-            + self.w_rr * r_rr
-            + self.w_top_trades * r_top_trades
-            + self.w_trades * r_trades
-            + self.w_mdd * r_mdd
+            w_return * r_return
+            + w_rr * r_rr
+            + w_top_trades * r_top_trades
+            + w_trades * r_trades
+            + w_mdd * r_mdd
             + r_winrate_penalty
             + r_complexity
         )        
