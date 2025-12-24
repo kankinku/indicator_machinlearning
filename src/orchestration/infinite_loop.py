@@ -196,7 +196,7 @@ def _run_batch_sequential(
             
             # 3. 저장
             existing_ids = {r.policy_spec.spec_id for r in history}
-            saved = persist_best_samples(repo, results, existing_ids=existing_ids)
+            saved = persist_best_samples(repo, results, df, existing_ids=existing_ids)
             saved_total += saved
             
             # 4. 즉시 학습
@@ -386,13 +386,7 @@ def infinite_loop(
             
             # 2. 병렬 평가 (V14 Optimized)
             logger.info(f"  >>> [V14] Evaluating {len(policies)} experiments in batch (Parallel)...")
-            s2_start = time.time()
             results, diagnostic_status = evaluate_v12_batch(policies, df, regime.label, n_jobs)
-            s2_duration = time.time() - s2_start
-            
-            # Instrument Stage 2 (Detailed)
-            p_rate = len([r for r in results if r.score > config.EVAL_SCORE_MIN]) / len(results) if results else 0
-            instrumentation.record_stage2(s2_duration, p_rate)
             
             # [V14] Self-Healing: 진단 결과에 따라 정책 조정 (Epsilon 재가열 등)
             agent.adjust_policy(diagnostic_status)
@@ -429,7 +423,7 @@ def infinite_loop(
             
             # 4. [V16] One-Pass Persistence
             try:
-                saved = persist_best_samples(repo, diverse_results, existing_ids=existing_ids)
+                saved = persist_best_samples(repo, diverse_results, df, existing_ids=existing_ids)
                 counter += saved
             except Exception as e:
                 instrumentation.record_exception(type(e).__name__)

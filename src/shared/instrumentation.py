@@ -69,12 +69,15 @@ class BatchInstrumentation:
             return
             
         self.current_metrics.total_time = time.time() - self._batch_start_time
+        self.current_metrics.overhead_time = self.current_metrics.total_time - (
+            self.current_metrics.stage1_time + self.current_metrics.stage2_time
+        )
         
         # Save to file
         with open(self.history_file, "a") as f:
             f.write(self.current_metrics.to_jsonl() + "\n")
             
-        logger.info(f"=== [INSTRUMENTATION] Batch {self.current_metrics.batch_id} End: {self.current_metrics.total_time:.2f}s ===")
+        logger.info(f"=== [INSTRUMENTATION] Batch {self.current_metrics.batch_id} End: {self.current_metrics.total_time:.2f}s (S1: {self.current_metrics.stage1_time:.2f}s, S2: {self.current_metrics.stage2_time:.2f}s, OH: {self.current_metrics.overhead_time:.2f}s) ===")
         self.current_metrics = None
 
     def record_stage1(self, duration: float, pass_rate: float):

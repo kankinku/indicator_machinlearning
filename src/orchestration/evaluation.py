@@ -429,8 +429,8 @@ def _evaluate_policy_windows(
                         metrics=metrics,
                         sample_score=sample_score,
                         core=core,
-                        X_features=X_window,
-                        window_df=window_df
+                        X_features=None, # [V14-O] Slimmed
+                        window_df=None # [V14-O] Slimmed
                     )
 
             agg = aggregate_sample_scores(sample_scores, violations)
@@ -447,6 +447,11 @@ def _evaluate_policy_windows(
                     avg_alpha=avg_alpha,
                 )
             )
+
+            # [V14-O] Early Exit: If this window failed hard gates significantly, skip remaining windows
+            if agg["violation_rate"] > 0.8:
+                logger.debug(f" [EarlyExit] Policy {policy_spec.template_id} rejected at {window_id}")
+                break
 
         # [V11.4] After evaluation, compute trade logic for the overall best sample to provide feedback
         if best_sample and "trade_logic" not in best_sample.core:
@@ -599,21 +604,42 @@ def evaluate_stage(
         logger.info(f">>> [Evaluation] Running {len(subset)} / {len(policies)} policies (after ResultStore Filter)")
         
         from src.shared.logger import _log_queue, setup_worker_logging
+        from src.orchestration.parallel_manager import get_parallel_pool
         def worker_setup(q):
             setup_worker_logging(q)
 
-        subset_results = Parallel(
-            n_jobs=n_jobs, 
-            verbose=0,
-            initializer=worker_setup,
-            initargs=(_log_queue,)
-        )(
-            delayed(_evaluate_policy_windows)(
-                policy, df, stage, regime_id, sample_count, 
-                pre_X=feature_map.get(policy.template_id) if feature_map else None
-            )
-            for policy in subset
+        chunk_size = getattr(config, "PARALLEL_CHUNK_SIZE", 10)
+        
+        # [V14-O] Chunking Stage 2
+        def process_chunk_s2(chunk_subset: List[PolicySpec], df_v, df_c, df_i, stage_name, r_id, samples):
+            # Reconstruct DataFrame locally to avoid serialization of the object itself
+            df_local = pd.DataFrame(df_v, columns=df_c, index=df_i)
+            results_chunk = []
+            for p in chunk_subset:
+                res = _evaluate_policy_windows(p, df_local, stage_name, r_id, samples)
+                results_chunk.append(res)
+            return results_chunk
+
+        # Prepare numpy data
+        df_v = df.values
+        df_c = df.columns.tolist()
+        df_i = df.index
+        
+        chunks = [subset[i:i + chunk_size] for i in range(0, len(subset), chunk_size)]
+
+        s2_start = time.time()
+        chunked_results = get_parallel_pool()(
+            delayed(process_chunk_s2)(c, df_v, df_c, df_i, stage, regime_id, sample_count)
+            for c in chunks
         )
+        s2_duration = time.time() - s2_start
+        
+        # Flatten
+        subset_results = [res for chunk in chunked_results for res in chunk]
+        
+        # Record S2
+        p_rate = len([r for r in subset_results if r.module_key != "ERROR"]) / len(subset_results) if subset_results else 0
+        get_instrumentation().record_stage2(s2_duration, p_rate)
         
         for i, res in zip(indices, subset_results):
             p_sig = get_policy_sig(policies[i])
@@ -621,7 +647,6 @@ def evaluate_stage(
             store.put(p_sig, w_sig, res)
             final_results[i] = res
 
-    # results = Parallel(n_jobs=n_jobs, verbose=0)( ... ) removed and replaced above
     results = final_results
 
     # [V14] Aggregate QA across all modules
@@ -655,39 +680,57 @@ def evaluate_v12_batch(
 ) -> Tuple[List[EvaluationResult], str]:
     """
     V12-BT Batch Evaluation Orchestrator
-    Implements 2-stage (Fast -> Real) evaluation for a batch of policies.
+    [V14-O] Optimized with chunking, pool reuse, and reduced data transfer.
     """
     if not policies:
         return []
 
-    # [V15] Lazy Feature Generation (Remove pre-calculating X_list to avoid OOM)
-    # 1. Stage 1: Fast Filter (All Policies)
-    logger.info(f">>> [V12-BT] Stage 1: Fast Filtering {len(policies)} candidates...")
+    # 0. Prepare Data for Workers (numpy-only to avoid massive serialization)
+    df_values = df.values
+    df_columns = df.columns.tolist()
+    df_index = df.index
+    
+    # [V14-O] Load settings
+    from src.orchestration.parallel_manager import get_parallel_pool
+    chunk_size = getattr(config, "PARALLEL_CHUNK_SIZE", 10)
     inst = get_instrumentation()
+
+    # 1. Stage 1: Fast Filter (All Policies)
+    logger.info(f">>> [V12-BT] Stage 1: Fast Filtering {len(policies)} candidates (Chunking: {chunk_size})...")
     s1_start = time.time()
     
-    def get_candidate_signal_lazy(p: PolicySpec):
-        # Generate features locally in the worker
-        X = _generate_features_cached(df.values, df.columns.tolist(), df.index, p.feature_genome)
-        # Train & Predict
-        core = _run_experiment_core(p, df, X, p.risk_budget or {}, include_trade_logic=False)
-        sig = core.get("results_df", pd.DataFrame()).get("pred", pd.Series(dtype=int))
-        return sig
+    # [V14-O] Chunking Stage 1 to reduce IPC overhead
+    def process_chunk_s1(chunk: List[PolicySpec], values, columns, index):
+        from src.orchestration.policy_evaluator import RuleEvaluator
+        evaluator = RuleEvaluator()
+        signals = []
+        for p in chunk:
+            X = _generate_features_cached(values, columns, index, p.feature_genome)
+            # Stage 1 Optimization: Skip backtest engine, just get entry signal
+            entry_sig, _, _ = evaluator.evaluate_signals(X, p)
+            signals.append(entry_sig)
+        return signals
 
-    all_signals = Parallel(n_jobs=n_jobs)(
-        delayed(get_candidate_signal_lazy)(p) for p in policies
+    # Split into chunks
+    chunks = [policies[i:i + chunk_size] for i in range(0, len(policies), chunk_size)]
+    
+    # Run Stage 1 (Single pool call)
+    chunked_signals = get_parallel_pool()(
+        delayed(process_chunk_s1)(c, df_values, df_columns, df_index) 
+        for c in chunks
     )
+    
+    # Flatten signals
+    all_signals = [sig for chunk in chunked_signals for sig in chunk]
     
     fast_filter = FastFilter()
     fast_scores = fast_filter.score_batch(df, all_signals, [p.risk_budget for p in policies])
     s1_duration = time.time() - s1_start
     
     # Record S1 Metrics
-    # In S1, "pass" means the score is above some threshold, but here we promote top_n.
-    # Let's define pass as score > config.EVAL_SCORE_MIN
     s1_pass_count = len([s for s in fast_scores if s > config.EVAL_SCORE_MIN])
     inst.record_stage1(s1_duration, s1_pass_count / len(policies) if policies else 0)
-
+    
     scored_policies = list(zip(fast_scores, policies))
     
     # Selection (Mixed Strategy: Elites + Explorers)
@@ -740,16 +783,32 @@ def select_top_modules(results: List[EvaluationResult], top_pct: float, top_k: i
 def persist_best_samples(
     repo,
     results: List[EvaluationResult],
+    df: pd.DataFrame, # [V14-O] Added df for reconstruction
     existing_ids: Optional[set] = None,
 ) -> int:
     """
     [V16] One-Pass Persistence
     Saves already evaluated results to the ledger without re-calculating.
+    [V14-O] Optimized: Reconstructs window_df and X_features from df to save IPC transfer.
     """
     saved = 0
     skipped = 0
     existing_ids = existing_ids or set()
     
+    # Pre-build windows for reconstruction
+    # We assume stage "full" or whatever the results were evaluated at.
+    # Results should have the stage info. 
+    # Since persist usually happens after full eval, we use results[0].stage
+    if not results:
+        return 0
+    
+    stage = results[0].stage
+    windows = build_windows(df, stage)
+    window_map = {win_id: win_df for win_id, win_df in windows}
+    df_values = df.values
+    df_columns = df.columns.tolist()
+    df_index = df.index
+
     for r in results:
         # Duplication check (Structural ID)
         if r.policy_spec.spec_id in existing_ids:
@@ -764,16 +823,28 @@ def persist_best_samples(
         spec = copy.deepcopy(r.policy_spec)
         spec.risk_budget = best.risk_budget
         
-        df_local = best.window_df
+        # [V14-O] Reconstruct artifacts locally
+        df_local = window_map.get(best.window_id)
         if df_local is None:
-            logger.warning(f"No window_df for {spec.spec_id}, skipping persistence.")
-            continue
+            # Fallback: maybe it's Stage 1 result being persisted (rare but possible)
+            if best.window_id.startswith("FAST"):
+                lookback = min(config.EVAL_FAST_LOOKBACK_BARS, len(df))
+                fast_df = df.iloc[-lookback:]
+                win_idx = int(best.window_id.split("_")[-1])
+                # Simplified window reconstruction
+                total = len(fast_df)
+                cnt = config.EVAL_WINDOW_COUNT_FAST
+                window_size = max(config.EVAL_MIN_WINDOW_BARS, total // cnt)
+                start = win_idx * window_size
+                end = total if win_idx == cnt - 1 else min(total, start + window_size)
+                df_local = fast_df.iloc[start:end]
+            else:
+                logger.warning(f"No window_df for {spec.spec_id}, id={best.window_id}, skipping persistence.")
+                continue
             
-        X_full = best.X_features
-        if X_full is None:
-            logger.warning(f"No X_features for {spec.spec_id}, skipping persistence.")
-            continue
-            
+        # Re-generate features for the window (Should be cached on disk or quick)
+        X_full = _generate_features_cached(df_local.values, df_local.columns.tolist(), df_local.index, spec.feature_genome)
+        
         scorecard = {
             "eval_score": r.score,
             "eval_stage": r.stage,

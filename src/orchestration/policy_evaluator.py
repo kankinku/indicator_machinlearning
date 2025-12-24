@@ -22,6 +22,9 @@ class RuleEvaluator:
     # Allowed symbols for security and DSL parsing
     ALLOWED_OPS = {"<", ">", "<=", ">=", "==", "!=", "and", "or", "not", "(", ")"}
     
+    # [V14-O] Rule Evaluation Cache
+    _rule_cache: Dict[str, Tuple[List[str], float]] = {}
+
     def evaluate_signals(self, df: pd.DataFrame, policy_spec: PolicySpec) -> Tuple[pd.Series, pd.Series, float]:
         """
         Returns (entry_signals, exit_signals, complexity_score).
@@ -32,6 +35,7 @@ class RuleEvaluator:
         entry_expr = policy_spec.decision_rules.get("entry", "False")
         exit_expr = policy_spec.decision_rules.get("exit", "False")
         
+        # Use simple caching to avoid repeated parsing and fuzzy matching
         entry_sig, entry_comp = self._safe_eval(df, entry_expr)
         exit_sig, exit_comp = self._safe_eval(df, exit_expr)
         
@@ -41,100 +45,83 @@ class RuleEvaluator:
     def _safe_eval(self, df: pd.DataFrame, expr: str) -> Tuple[pd.Series, float]:
         """
         Safely evaluates an expression and returns boolean series + structural complexity.
+        [V14-O] Optimized: Caches tokenization and AST complexity.
         """
         if expr == "False" or not expr:
             return pd.Series(False, index=df.index), 0.5
         if expr == "True":
             return pd.Series(True, index=df.index), 0.5
 
-        # Normalize rule (e.g. standardizing whitespace, basic form)
-        expr = self._normalize_rule(expr)
+        # Check Cache
+        if expr in self._rule_cache:
+            processed_tokens, complexity = self._rule_cache[expr]
+        else:
+            # 1. Normalize
+            norm_expr = self._normalize_rule(expr)
+                
+            # 2. Tokenize with Quantile support [q0.xx]
+            tokens = re.findall(r"[a-zA-Z0-9_.\-]+|\[q[0-9.]+\]|[<>=!]+|[\(\)]", norm_expr)
             
-        # [V13.5] Tokenize with Quantile support [q0.xx]
-        tokens = re.findall(r"[a-zA-Z0-9_.\-]+|\[q[0-9.]+\]|[<>=!]+|[\(\)]", expr)
-        complexity = self._calculate_ast_complexity(expr, df.columns)
-        
-        processed_tokens = []
-        for t in tokens:
-            t_lower = t.lower()
-            if t_lower in self.ALLOWED_OPS:
-                processed_tokens.append(t_lower)
-            elif t.startswith("[q") and t.endswith("]"):
-                # Quantile detected: e.g. [q0.3]
-                try:
-                    q_val = float(t[2:-1])
-                    # We can't put the value yet if we don't know the column it applies to
-                    # But pd.eval doesn't support easy quantile mapping per comparison
-                    # So we'll resolve it LATER or keep it as a special token
+            # 3. Complexity (AST)
+            complexity = self._calculate_ast_complexity(norm_expr, df.columns)
+            
+            # 4. Process Tokens & Fuzzy Matching
+            processed_tokens = []
+            for t in tokens:
+                t_lower = t.lower()
+                if t_lower in self.ALLOWED_OPS:
+                    processed_tokens.append(t_lower)
+                elif t.startswith("[q") and t.endswith("]"):
+                    processed_tokens.append(t) # Template for quantile
+                elif t.replace('.', '', 1).isdigit() or (t.startswith('-') and t[1:].replace('.', '', 1).isdigit()):
                     processed_tokens.append(t)
-                except:
-                    processed_tokens.append("0.0")
-            elif t.replace('.', '', 1).isdigit() or (t.startswith('-') and t[1:].replace('.', '', 1).isdigit()):
-                processed_tokens.append(t)
-            elif t in df.columns:
-                processed_tokens.append(f"`{t}`")
-            else:
-                # [V16] Fuzzy/Prefix Matching for Dynamic Column Names
-                # Handles cases like ADAPTIVE_RAVI_V1__ravi guessed by Agent
-                # OR just ADAPTIVE_RAVI_V1 used as a token
-                match = None
-                
-                # A. Exact Match (Case-Insensitive)
-                matches = [c for c in df.columns if c.lower() == t_lower]
-                if matches:
-                    match = matches[0]
-                
-                # B. Prefix + Signal Match (e.g. FEAT__signal or FEAT__FEAT_14)
-                if not match:
-                    # If t contains '__', try to match by prefix and a partial suffix
-                    if "__" in t:
-                        prefix, suffix = t.split("__", 1)
-                        # Find all columns for this feature
-                        feat_cols = [c for c in df.columns if c.startswith(prefix + "__")]
-                        if feat_cols:
-                            # Try to find one that contains the suffix
-                            suffix_matches = [c for c in feat_cols if suffix.lower() in c.lower()]
-                            if suffix_matches:
-                                match = suffix_matches[0]
-                            else:
-                                # Fallback to first column of that feature
-                                match = feat_cols[0]
-                    else:
-                        # If just FEATURE_ID is used, pick its first column
-                        feat_cols = [c for c in df.columns if c.startswith(t + "__")]
-                        if feat_cols:
-                            match = feat_cols[0]
-
-                if match:
-                    processed_tokens.append(f"`{match}`")
+                elif t in df.columns:
+                    processed_tokens.append(f"`{t}`")
                 else:
-                    logger.warning(f"[Evaluator] Unknown token: {t}")
-                    return pd.Series(False, index=df.index), 10.0
+                    # Fuzzy/Prefix Match
+                    match = None
+                    matches = [c for c in df.columns if c.lower() == t_lower]
+                    if matches:
+                        match = matches[0]
+                    if not match:
+                        if "__" in t:
+                            prefix, suffix = t.split("__", 1)
+                            feat_cols = [c for c in df.columns if c.startswith(prefix + "__")]
+                            if feat_cols:
+                                suffix_matches = [c for c in feat_cols if suffix.lower() in c.lower()]
+                                match = suffix_matches[0] if suffix_matches else feat_cols[0]
+                        else:
+                            feat_cols = [c for c in df.columns if c.startswith(t + "__")]
+                            if feat_cols:
+                                match = feat_cols[0]
+                    
+                    if match:
+                        processed_tokens.append(f"`{match}`")
+                    else:
+                        logger.warning(f"[Evaluator] Unknown token: {t}")
+                        return pd.Series(False, index=df.index), 10.0
+            
+            # Store in Cache
+            self._rule_cache[expr] = (processed_tokens, complexity)
 
-        # Resolving Quantiles: x < [q0.3] -> x < column_quantile
-        # This is tricky in one-pass eval. 
-        # Better: Pre-resolve [q...] tokens if they are preceded by a column and a comparison op
-        for i in range(len(processed_tokens)):
-            if processed_tokens[i].startswith("[q"):
+        # 5. Resolve Quantiles Dynamically (Values depend on window)
+        eval_tokens = list(processed_tokens)
+        for i in range(len(eval_tokens)):
+            if eval_tokens[i].startswith("[q"):
                 try:
                     if i >= 2:
-                        col_wrapped = processed_tokens[i-2]
+                        col_wrapped = eval_tokens[i-2]
                         if col_wrapped.startswith("`") and col_wrapped.endswith("`"):
                             col_name = col_wrapped[1:-1]
                             col_vals = df[col_name]
-                            
-                            # [V14] Collision Detection
-                            if col_vals.std() < 1e-9:
-                                logger.warning(f"[Evaluator] Collapsed distribution for feature '{col_name}' - possible constant value.")
-                            
-                            q_val = float(processed_tokens[i][2:-1])
+                            q_val = float(eval_tokens[i][2:-1])
                             quant_val = col_vals.quantile(q_val)
-                            processed_tokens[i] = str(round(quant_val, 6))
+                            eval_tokens[i] = str(round(quant_val, 6))
                 except Exception as e:
                     logger.error(f"[Evaluator] Quantile resolution failed: {e}")
-                    processed_tokens[i] = "0.0"
+                    eval_tokens[i] = "0.0"
 
-        safe_expr = " ".join(processed_tokens)
+        safe_expr = " ".join(eval_tokens)
         try:
             result = df.eval(safe_expr, engine='python')
             if isinstance(result, pd.Series):

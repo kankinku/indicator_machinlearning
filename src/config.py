@@ -74,8 +74,14 @@ class BaseConfig:
     USE_FAST_MODE: bool = True
     
     PARALLEL_ENABLED: bool = True
+    PARALLEL_MAX_WORKERS: int = field(
+        default_factory=lambda: int(os.getenv("PARALLEL_MAX_WORKERS", str(os.cpu_count())))
+    )
     PARALLEL_BATCH_SIZE: int = field(
         default_factory=lambda: int(os.getenv("PARALLEL_BATCH_SIZE", "0"))
+    )
+    PARALLEL_CHUNK_SIZE: int = field(
+        default_factory=lambda: int(os.getenv("PARALLEL_CHUNK_SIZE", "10"))
     )
     PARALLEL_BACKEND: str = "loky"
     PARALLEL_TIMEOUT: int = 600
