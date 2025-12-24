@@ -87,12 +87,84 @@ const app = {
     // === Dashboard ===
     initDashboard: async function () {
         await this.fetchData();
+        await this.initDiagnostics(); // [V14]
+
         const cb = document.getElementById('dash-include-rejected');
         if (cb) cb.checked = this.restoreState('dash-include-rejected');
 
         this.renderKPIs();
         this.renderHallOfFame();
         this.renderDashTable();
+    },
+
+    initDiagnostics: async function () {
+        const diagData = await this.fetchDataDiagnostics();
+        if (diagData && diagData.summary) {
+            this.renderDiagnostics(diagData);
+        }
+    },
+
+    fetchDataDiagnostics: async function () {
+        try {
+            const res = await fetch('/api/v1/diagnostics');
+            if (!res.ok) throw new Error("Failed to fetch diagnostics");
+            return await res.json();
+        } catch (err) {
+            console.error(err);
+            return null;
+        }
+    },
+
+    renderDiagnostics: function (data) {
+        const section = document.getElementById('diag-section');
+        if (!section) return;
+
+        const summary = data.summary;
+        if (!summary || summary.status === "UNKNOWN") {
+            section.style.display = 'none';
+            return;
+        }
+
+        section.style.display = 'block';
+
+        const statusEl = document.getElementById('diag-status');
+        statusEl.textContent = summary.status;
+
+        // Clean class list and add new status
+        statusEl.className = 'status-badge';
+        const cleanStatus = summary.status.toLowerCase().replace(/[^a-z0-9_]/g, '');
+        statusEl.classList.add(`status-${cleanStatus}`);
+
+        document.getElementById('diag-pass-rate').textContent = (summary.pass_rate * 100).toFixed(1) + '%';
+        document.getElementById('diag-rej-rate').textContent = (summary.rej_rate * 100).toFixed(1) + '%';
+
+        const simRate = (summary.similarity && summary.similarity.avg_jaccard !== undefined)
+            ? (summary.similarity.avg_jaccard * 100).toFixed(1) + '%'
+            : '0%';
+        document.getElementById('diag-sim-rate').textContent = simRate;
+
+        // Render Taxonomy Bars
+        const container = document.getElementById('diag-taxonomy-bars');
+        container.innerHTML = '';
+
+        if (summary.taxonomy) {
+            Object.entries(summary.taxonomy).forEach(([issue, count]) => {
+                const pct = (count / (summary.rej_rate * 100 || 1)) * 100; // rough estimate or just raw count
+                // Actually taxonomy in summary is counts. Let's show as bars relative to total rejections.
+                const totalRej = Object.values(summary.taxonomy).reduce((a, b) => a + b, 0);
+                const barPct = totalRej > 0 ? (count / totalRej) * 100 : 0;
+
+                const item = document.createElement('div');
+                item.className = 'tax-item';
+                item.innerHTML = `
+                    <span class="tax-label">${issue.replace('_', ' ')} (${count})</span>
+                    <div class="tax-bar-bg">
+                        <div class="tax-bar-fill" style="width: ${barPct}%"></div>
+                    </div>
+                `;
+                container.appendChild(item);
+            });
+        }
     },
 
     renderKPIs: function () {

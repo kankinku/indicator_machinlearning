@@ -11,6 +11,11 @@ import numpy as np
 from src.config import config
 from src.l3_meta.risk_profiles import get_default_risk_profiles
 from src.shared.logger import get_logger
+from src.shared.metrics import (
+    compute_trades_stats, compute_equity_stats, compute_window_metrics,
+    WindowMetrics as SampleMetrics, # Alias for compatibility
+    TradeStats, EquityStats
+)
 
 logger = get_logger("l1.evaluator")
 
@@ -31,20 +36,7 @@ class RiskSample:
     horizon: int
 
 
-@dataclass
-class SampleMetrics:
-    total_return_pct: float
-    mdd_pct: float
-    reward_risk: float
-    vol_pct: float
-    trade_count: int
-    valid_trade_count: int = 0  # [V11.2] Regime-Aligned 유효 거래 수
-    win_rate: float
-    sharpe: float
-    benchmark_roi_pct: float = 0.0  # [V11.2] 벤치마크(Buy&Hold) 수익률
-    exposure_ratio: float = 0.0  # [vNext] 시장 참여율 추적
-    top1_share: float = 0.0  # [V11.3] Anti-Luck: 상위 1개 트레이드 비중
-    top3_share: float = 0.0  # [V11.3] Anti-Luck: 상위 3개 트레이드 비중
+# [V16] SampleMetrics is now an alias for WindowMetrics from src.shared.metrics
 
 
 # ========================================
@@ -190,132 +182,79 @@ def sample_risk_params(
     
     return samples
 
-def compute_sample_metrics(trade_returns: np.ndarray, trade_count: int) -> SampleMetrics:
-    # ... (Existing logic for return/mdd/etc) ...
-    # This function calculates based on trade returns only.
-    # Exposure must be set externally.
-    
-    if trade_returns.size == 0:
-        return SampleMetrics(
-            total_return_pct=0.0,
-            mdd_pct=0.0,
-            reward_risk=0.0,
-            vol_pct=0.0,
-            trade_count=0,
-            win_rate=0.0,
-            sharpe=0.0,
-            exposure_ratio=0.0
-        )
-
-    equity = np.cumprod(1.0 + trade_returns)
-    total_return_pct = (equity[-1] - 1.0) * 100.0
-
-    peak = np.maximum.accumulate(equity)
-    drawdown = (equity / peak) - 1.0
-    mdd_pct = abs(np.min(drawdown)) * 100.0
-
-    wins = trade_returns[trade_returns > 0]
-    losses = trade_returns[trade_returns < 0]
-    if wins.size > 0 and losses.size > 0:
-        reward_risk = np.median(wins) / abs(np.median(losses))
-    else:
-        reward_risk = 0.0
-
-    vol_pct = float(np.std(trade_returns)) * 100.0
-    win_rate = float((trade_returns > 0).sum() / max(1, (trade_returns != 0).sum()))
-
-    # Basic Trade-based Sharpe (Safe Div)
-    avg_ret = np.mean(trade_returns)
-    std_ret = np.std(trade_returns)
-    sharpe = float(avg_ret / std_ret) if std_ret > 1e-9 else 0.0
-
-    # [V11.3] Anti-Luck Metrics
-    pos_returns = trade_returns[trade_returns > 0]
-    total_pos_pnl = np.sum(pos_returns) if pos_returns.size > 0 else 0.0
-    
-    if total_pos_pnl > 1e-9:
-        sorted_pos = np.sort(pos_returns)[::-1]
-        top1_share = sorted_pos[0] / total_pos_pnl
-        top3_share = np.sum(sorted_pos[:3]) / total_pos_pnl
-    else:
-        top1_share = 0.0
-        top3_share = 0.0
-
-    return SampleMetrics(
-        total_return_pct=float(total_return_pct),
-        mdd_pct=float(mdd_pct),
-        reward_risk=float(reward_risk),
-        vol_pct=float(vol_pct),
-        trade_count=int(trade_count),
-        win_rate=win_rate,
-        sharpe=sharpe,
-        exposure_ratio=0.0,
-        top1_share=float(top1_share),
-        top3_share=float(top3_share)
+def compute_sample_metrics(
+    trade_returns: np.ndarray, 
+    trade_count: int,
+    bars_total: int,
+    benchmark_roi_pct: float = 0.0,
+    valid_trade_count: Optional[int] = None,
+    full_returns: Optional[np.ndarray] = None,
+    exposure_mask: Optional[np.ndarray] = None
+) -> SampleMetrics:
+    """
+    [V16] Unified Metric Extraction
+    Redirects to src.shared.metrics.compute_window_metrics.
+    """
+    if full_returns is None:
+        # If full_returns not provided, use trade_returns as a fallback (should avoid)
+        full_returns = trade_returns if trade_returns.any() else np.zeros(bars_total)
+        
+    return compute_window_metrics(
+        window_id="sample",
+        trade_returns=trade_returns,
+        full_returns=full_returns,
+        bars_total=bars_total,
+        benchmark_roi_pct=benchmark_roi_pct,
+        exposure_mask=exposure_mask
     )
-
 
 def validate_sample(metrics: SampleMetrics) -> Tuple[bool, str]:
     """
-    [V11.2] Validation Layer (Hard Gates)
-    Stage별 설계도에 따른 '절대 생존 기준' 검사.
+    [V14] Validation Layer (Standardized Failure Codes)
+    Uses period-normalized metrics (trades_per_year) and annualized excess return gates.
     """
-    current_stage = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
-    stages = getattr(config, 'CURRICULUM_STAGES', {})
-    stage_cfg = stages.get(current_stage, stages.get(1, {}))
+    curr_stage = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
+    stage_cfg = config.CURRICULUM_STAGES.get(curr_stage, {})
     
-    min_raw_trades = stage_cfg.get("min_trades", config.VAL_MIN_TRADES)
-    min_valid_trades = stage_cfg.get("min_valid_trades", config.VAL_MIN_VALID_TRADES)
-    min_valid_ratio = stage_cfg.get("min_valid_ratio", config.VAL_MIN_VALID_RATIO)
-    
-    max_mdd = stage_cfg.get("max_mdd_pct", config.VAL_MAX_MDD_PCT)
-    min_wr = stage_cfg.get("min_winrate", config.VAL_WINRATE_MIN)
-    max_wr = stage_cfg.get("max_winrate", config.VAL_WINRATE_MAX)
+    # 1. Minimum Activity (Annualized)
+    min_tpy = getattr(stage_cfg, "min_trades_per_year", 2.0)
+    if metrics.trades.trades_per_year < min_tpy:
+        return False, f"FAIL_MIN_TRADES ({metrics.trades.trades_per_year:.1f} < {min_tpy})"
 
-    # 1. Trade Count Gate (Raw Activity)
-    if metrics.trade_count < min_raw_trades:
-        return False, f"MIN_RAW_TRADES ({metrics.trade_count} < {min_raw_trades})"
-        
-    # 2. Valid Trade Gate (Regime Aligned)
-    if metrics.valid_trade_count < min_valid_trades:
-        return False, f"MIN_VALID_TRADES ({metrics.valid_trade_count} < {min_valid_trades})"
-        
-    # 3. Valid Ratio Gate
-    valid_ratio = metrics.valid_trade_count / max(1, metrics.trade_count)
-    if valid_ratio < min_valid_ratio:
-        return False, f"VALID_RATIO_LOW ({valid_ratio:.1%} < {min_valid_ratio:.1%})"
+    # 2. Exposure Gate
+    min_exp = getattr(stage_cfg, "min_exposure", 0.05)
+    if metrics.equity.exposure_ratio < min_exp:
+        return False, f"FAIL_LOW_EXPOSURE ({metrics.equity.exposure_ratio:.1%} < {min_exp:.1%})"
 
-    # 4. Exposure Gate
-    if metrics.exposure_ratio < config.VAL_MIN_EXPOSURE:
-        return False, f"LOW_EXPOSURE ({metrics.exposure_ratio:.1%} < {config.VAL_MIN_EXPOSURE:.1%})"
-        
-    # 5. [V11.3] Anti-Luck Filter (Structural Alpha)
-    if metrics.top1_share > config.ANTILUCK_TOP1_SHARE_MAX:
-        return False, f"LUCKY_STRIKE_T1 ({metrics.top1_share:.2f} > {config.ANTILUCK_TOP1_SHARE_MAX})"
-    
-    if metrics.top3_share > config.ANTILUCK_TOP3_SHARE_MAX:
-        return False, f"LUCKY_STRIKE_T3 ({metrics.top3_share:.2f} > {config.ANTILUCK_TOP3_SHARE_MAX})"
+    # 3. Excess Return PA Gate (Stage Dependent)
+    min_excess = getattr(stage_cfg, "min_excess_return_pa", 0.0)
+    if metrics.equity.excess_return < min_excess:
+        return False, f"FAIL_LOW_RETURN ({metrics.equity.excess_return:.1f}% < {min_excess}%)"
 
-    # 6. MDD Gate
-    if metrics.mdd_pct > max_mdd:
-        return False, f"MAX_DD_BREACH ({metrics.mdd_pct:.1f}% > {max_mdd}%)"
-    
-    # 7. 승률 상한 Gate
-    if metrics.win_rate > max_wr:
-        return False, f"WINRATE_TOO_HIGH ({metrics.win_rate:.1%} > {max_wr:.1%})"
-    
-    # 8. 승률 하한 Gate
-    if metrics.win_rate < min_wr:
-        return False, f"WINRATE_TOO_LOW ({metrics.win_rate:.1%} < {min_wr:.1%})"
-    
-    # 9. 최소 손익비 검증 (구조적 결함 방지)
-    if metrics.reward_risk < 0.5 and metrics.trade_count >= 20:
-        return False, f"RR_TOO_LOW ({metrics.reward_risk:.2f} < 0.5)"
+    # 4. Winrate Limits
+    if metrics.trades.win_rate < config.VAL_WINRATE_MIN:
+        return False, f"FAIL_WINRATE_LOW ({metrics.trades.win_rate:.1%} < {config.VAL_WINRATE_MIN:.1%})"
+    if metrics.trades.win_rate > config.VAL_WINRATE_MAX:
+        return False, f"FAIL_WINRATE_HIGH ({metrics.trades.win_rate:.1%} < {config.VAL_WINRATE_MAX:.1%})"
+
+    # 5. MDD Gate
+    max_mdd = getattr(stage_cfg, "max_mdd_pct", config.VAL_MAX_MDD_PCT)
+    if metrics.equity.max_drawdown_pct > max_mdd:
+        return False, f"FAIL_MDD_BREACH ({metrics.equity.max_drawdown_pct:.1f}% > {max_mdd}%)"
+
+    # 6. Profit Factor Gate
+    min_pf = getattr(stage_cfg, "min_profit_factor", 1.0)
+    if metrics.trades.profit_factor < min_pf:
+        return False, f"FAIL_PF ({metrics.trades.profit_factor:.2f} < {min_pf})"
+
+    # 7. Anti-Luck (Lucky Strike)
+    if metrics.trades.top1_share > config.ANTILUCK_TOP1_SHARE_MAX:
+        return False, f"FAIL_LUCKY_STRIKE (T1: {metrics.trades.top1_share:.2f} > {config.ANTILUCK_TOP1_SHARE_MAX})"
         
     return True, "PASS"
 
 
-def score_sample(metrics: SampleMetrics) -> float:
+def score_sample(metrics: WindowMetrics) -> float:
     """
     [V11] Evaluation Layer (Scoring)
     '잘 버는 전략' 우선순위로 점수 산출.
@@ -330,47 +269,50 @@ def score_sample(metrics: SampleMetrics) -> float:
     score = 0.0
     
     # [1순위] 복리 성과 (Total Return or CAGR)
-    score += metrics.total_return_pct * config.SCORE_W_CAGR
+    score += metrics.equity.total_return_pct * config.SCORE_W_CAGR
     
     # [2순위] 손익비(R:R) 보너스 - "크게 이기는" 전략 유도
     target_rr = getattr(config, 'REWARD_TARGET_RR', 1.5)
     excellent_rr = getattr(config, 'REWARD_EXCELLENT_RR', 2.0)
     
-    if metrics.reward_risk >= excellent_rr:
+    rr = metrics.trades.reward_risk
+    if rr >= excellent_rr:
         # R:R >= 2.0: 높은 보너스
         rr_bonus = 50.0
-    elif metrics.reward_risk >= target_rr:
+    elif rr >= target_rr:
         # R:R >= 1.5: 보통 보너스
-        rr_bonus = 25.0 + (metrics.reward_risk - target_rr) / (excellent_rr - target_rr) * 25.0
-    elif metrics.reward_risk >= 1.0:
+        rr_bonus = 25.0 + (rr - target_rr) / (excellent_rr - target_rr) * 25.0
+    elif rr >= 1.0:
         # R:R 1.0~1.5: 작은 보너스
-        rr_bonus = (metrics.reward_risk - 1.0) / (target_rr - 1.0) * 25.0
+        rr_bonus = (rr - 1.0) / (target_rr - 1.0) * 25.0
     else:
         # R:R < 1.0: 패널티
-        rr_bonus = -25.0 * (1.0 - metrics.reward_risk)
+        rr_bonus = -25.0 * (1.0 - rr)
     
     score += rr_bonus
     
     # [3순위] 리스크 패널티 (MDD, Vol)
-    score -= metrics.mdd_pct * config.SCORE_W_MDD
-    score -= metrics.vol_pct * config.SCORE_W_VOL
+    score -= metrics.equity.max_drawdown_pct * config.SCORE_W_MDD
+    score -= metrics.equity.vol_pct * config.SCORE_W_VOL
     
     # [4순위] 거래 활동 - 점진적 감점 메커니즘
     # 0회 = 최대 패널티, 목표 = 패널티 0
     target_trades = config.SCORE_TARGET_TRADES
-    if metrics.trade_count <= 0:
+    tc = metrics.trades.trade_count
+    if tc <= 0:
         # 무거래 = 최대 패널티
         score -= target_trades * config.SCORE_PENALTY_LOW_TRADE
-    elif metrics.trade_count < target_trades:
+    elif tc < target_trades:
         # 0 ~ 목표: 점진적으로 패널티 감소
-        shortage = target_trades - metrics.trade_count
+        shortage = target_trades - tc
         score -= shortage * config.SCORE_PENALTY_LOW_TRADE
     # 목표 이상은 패널티 없음
         
     # [5순위] 승률 과적합 강력 견제 (80% 이상부터 패널티 시작!)
-    if metrics.win_rate > config.SCORE_WINRATE_PENALTY_START:
+    wr = metrics.trades.win_rate
+    if wr > config.SCORE_WINRATE_PENALTY_START:
         # 80% 초과분에 대해 강력 패널티
-        excess_pct = (metrics.win_rate - config.SCORE_WINRATE_PENALTY_START) * 100.0
+        excess_pct = (wr - config.SCORE_WINRATE_PENALTY_START) * 100.0
         score -= excess_pct * config.SCORE_PENALTY_HIGH_WR
         
     # [6순위] 승률 보너스 폐지 - 수익률이 높으면 보너스 없이도 상위권

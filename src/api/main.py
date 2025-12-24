@@ -679,6 +679,57 @@ def test_model(exp_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/diagnostics")
+def get_diagnostics():
+    """
+    [V14] Returns latest QA Diagnostic reports and taxonomy breakdown.
+    """
+    try:
+        diag_dir = PROJECT_ROOT / "ledger" / "diagnostics"
+        if not diag_dir.exists():
+            return {"latest": {}, "history": []}
+
+        # 1. Get latest per stage
+        latest = {}
+        for f in diag_dir.glob("latest_*.json"):
+            try:
+                with open(f, "r") as r:
+                    data = json.load(r)
+                    latest[data["stage"]] = data
+            except:
+                continue
+
+        # 2. Get history (last 20)
+        history = []
+        history_path = diag_dir / "history.jsonl"
+        if history_path.exists():
+            with open(history_path, "r") as f:
+                lines = f.readlines()
+                # Get last 20 lines
+                for line in lines[-20:]:
+                    try:
+                        history.append(json.loads(line))
+                    except:
+                        continue
+        
+        # 3. Enhanced Summary for Top Bar
+        # Get "full" stage as primary indicator
+        main_diag = latest.get("full", {}) or (history[-1] if history else {})
+        
+        return {
+            "latest": latest,
+            "history": history[::-1], # Reversed for chart
+            "summary": {
+                "status": main_diag.get("status", "UNKNOWN"),
+                "pass_rate": main_diag.get("pass_rate", 0.0),
+                "rej_rate": main_diag.get("rejection_rate", 0.0),
+                "taxonomy": main_diag.get("taxonomy", {})
+            }
+        }
+    except Exception as e:
+        print(f"Diagnostics Error: {e}")
+        return {"error": str(e)}
+
 @app.get("/api/v1/stats/regime")
 def get_regime_stats():
     """

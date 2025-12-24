@@ -126,31 +126,24 @@ class RewardShaper:
         stages = getattr(config, 'CURRICULUM_STAGES', {})
         stage_cfg = stages.get(current_stage, stages.get(1, {}))
         
-        stage_benchmark = stage_cfg.get("min_return_pct", 50.0)
-        stage_min_trades = stage_cfg.get("min_trades", 20)
+        stage_benchmark = getattr(stage_cfg, "target_return_pct", 50.0)
+        stage_min_trades = getattr(stage_cfg, "min_trades_per_year", 20.0)
         
-        # [1] 데이터 추출 및 시장 벤치마크 획득
+        # [1] 데이터 추출 (shared/metrics에서 계산된 값들 우선)
         total_return_pct = metrics.get("total_return_pct", 0.0)
         mdd_pct = abs(metrics.get("mdd_pct", 0.0))
-        n_trades = metrics.get("n_trades", 0)
+        n_trades = metrics.get("n_trades", metrics.get("trade_count", 0))
         win_rate = metrics.get("win_rate", 0.5)
         reward_risk = metrics.get("reward_risk", 1.0)
         
-        # [V11.2] Alpha 계산을 위한 연간화 수익률(CAGR) 추정
-        days = metrics.get("oos_bars", 252)
-        if days > 0 and total_return_pct > -100:
-            cagr = ((1 + total_return_pct/100) ** (252/days) - 1) * 100
-        else:
-            cagr = -99.9
-            
-        # 벤치마크 CAGR 결정 (metrics에 benchmark_roi_pct가 있으면 연간화하여 사용)
-        bench_roi = metrics.get("benchmark_roi_pct")
-        if bench_roi is not None:
-            bench_cagr = ((1 + bench_roi/100) ** (252/days) - 1) * 100
-        else:
+        # Alpha (excess_return) 가 있으면 사용, 없으면 직접 계산 자제 (SSOT 원칙)
+        alpha = metrics.get("excess_return", 0.0)
+        if "excess_return" not in metrics and "total_return_pct" in metrics:
+            # Fallback for legacy (but should avoid)
+            days = metrics.get("oos_bars", 252)
+            cagr = ((1 + total_return_pct/100) ** (252/max(1, days)) - 1) * 100
             bench_cagr = getattr(config, 'REWARD_BENCHMARK_RETURN', 15.0)
-            
-        alpha = cagr - bench_cagr
+            alpha = cagr - bench_cagr
         
         # [2] Hard Validation Gate (V11.2 핵심)
         # ================================================
@@ -158,9 +151,9 @@ class RewardShaper:
         rejection_reason = None
         
         # 1. 거래 횟수 Gate (Raw & Valid)
-        min_raw = stage_cfg.get("min_trades", config.VAL_MIN_TRADES)
-        min_valid = stage_cfg.get("min_valid_trades", config.VAL_MIN_VALID_TRADES)
-        min_ratio = stage_cfg.get("min_valid_ratio", config.VAL_MIN_VALID_RATIO)
+        min_raw = getattr(stage_cfg, "min_trades_per_year", config.VAL_MIN_TRADES)
+        min_valid = getattr(stage_cfg, "min_valid_trades", config.VAL_MIN_VALID_TRADES)
+        min_ratio = getattr(stage_cfg, "min_valid_ratio", config.VAL_MIN_VALID_RATIO)
         
         valid_trades = metrics.get("valid_trade_count", n_trades) # 없으면 raw와 동일 취급
         valid_ratio = valid_trades / max(1, n_trades)
@@ -176,17 +169,17 @@ class RewardShaper:
             rejection_reason = f"LOW_VALID_RATIO ({valid_ratio:.1%} < {min_ratio:.1%})"
         
         # 2. MDD Gate
-        elif mdd_pct > stage_cfg.get("max_mdd_pct", 60.0):
+        elif mdd_pct > getattr(stage_cfg, "max_mdd_pct", 60.0):
             is_rejected = True
-            rejection_reason = f"MAX_MDD ({mdd_pct:.1f}% > {stage_cfg.get('max_mdd_pct')}%)"
+            rejection_reason = f"MAX_MDD ({mdd_pct:.1f}% > {getattr(stage_cfg, 'max_mdd_pct', 60.0)}%)"
             
         # 3. 승률 범위 Gate
-        elif win_rate < stage_cfg.get("min_winrate", 0.25):
+        elif win_rate < getattr(stage_cfg, "min_winrate", 0.25):
             is_rejected = True
-            rejection_reason = f"LOW_WINRATE ({win_rate:.1%} < {stage_cfg.get('min_winrate'):.1%})"
-        elif win_rate > stage_cfg.get("max_winrate", 0.90):
+            rejection_reason = f"LOW_WINRATE ({win_rate:.1%} < {getattr(stage_cfg, 'min_winrate', 0.25):.1%})"
+        elif win_rate > getattr(stage_cfg, "max_winrate", 0.90):
             is_rejected = True
-            rejection_reason = f"HIGH_WINRATE ({win_rate:.1%} > {stage_cfg.get('max_winrate'):.1%})"
+            rejection_reason = f"HIGH_WINRATE ({win_rate:.1%} > {getattr(stage_cfg, 'max_winrate', 0.90):.1%})"
 
         # [3] REJECTED 처리 - 학습 대상에서 제외 (Selection Pressure)
         # ================================================
@@ -225,22 +218,17 @@ class RewardShaper:
             r_rr = -self._clip((1.0 - reward_risk) * 2.0)
         r_rr = self._clip(r_rr)
         
-        # C. 상위 트레이드 기여도 보상
-        top_trades_contrib = metrics.get("top_trades_contrib", None)
-        trade_returns = metrics.get("trade_returns", None)
-        if top_trades_contrib is not None:
-            contrib = float(top_trades_contrib)
-        elif trade_returns is not None and len(trade_returns) > 0:
-            contrib = self._compute_top_trades_contribution(trade_returns)
-        else:
-            contrib = 0.0
-            
-        if contrib >= 0.8:
+        # C. 상위 트레이드 기여도 보상 (SSOT: top1_share 사용)
+        # 0.2 (20%) 가 넘지 않는 것을 목표로 함 (집중도 낮추기)
+        top1 = metrics.get("top1_share", 0.0)
+        
+        # top1_share가 높을수록 패널티, 낮을수록 보상
+        if top1 <= 0.2:
             r_top_trades = 1.0
-        elif contrib >= self.top_trade_contrib_target:
-            r_top_trades = 0.5 + (contrib - self.top_trade_contrib_target) / (0.8 - self.top_trade_contrib_target) * 0.5
+        elif top1 <= 0.4:
+            r_top_trades = 0.5
         else:
-            r_top_trades = max(0.0, contrib / self.top_trade_contrib_target * 0.5)
+            r_top_trades = 0.0
         r_top_trades = self._clip(r_top_trades)
         
         # D. Regime Gating (보상이 아닌 활동성 필터)
@@ -264,6 +252,12 @@ class RewardShaper:
             excess = (win_rate - self.winrate_penalty_start) / (1.0 - self.winrate_penalty_start)
             r_winrate_penalty = -self._clip(excess) * 1.0
             
+        # [V14] F. Complexity Penalty
+        # Encourage parsimony: more features = higher penalty
+        genome = metrics.get("genome", {})
+        n_features = len([k for k in genome.keys() if not k.startswith("__")])
+        r_complexity = -self._clip(n_features * 0.05, 0, 0.3)
+        
         # [합산]
         total = (
             self.w_return * r_return
@@ -272,6 +266,7 @@ class RewardShaper:
             + self.w_trades * r_trades
             + self.w_mdd * r_mdd
             + r_winrate_penalty
+            + r_complexity
         )        
         return RewardBreakdown(
             total=float(total),
@@ -288,34 +283,6 @@ class RewardShaper:
             alpha=float(alpha),
         )
     
-    def _compute_top_trades_contribution(self, trade_returns: List[float]) -> float:
-        """
-        상위 N% 트레이드가 전체 수익에 기여하는 비율을 계산합니다.
-        
-        예: 상위 20% 트레이드가 전체 수익의 80%를 기여하면 0.8 반환
-        """
-        if not trade_returns or len(trade_returns) == 0:
-            return 0.0
-        
-        returns = np.array(trade_returns)
-        
-        # 양수 수익만 고려
-        positive_returns = returns[returns > 0]
-        if len(positive_returns) == 0:
-            return 0.0
-        
-        # 내림차순 정렬
-        sorted_returns = np.sort(positive_returns)[::-1]
-        total_profit = np.sum(sorted_returns)
-        
-        if total_profit <= 0:
-            return 0.0
-        
-        # 상위 N% 선택
-        top_n = max(1, int(len(sorted_returns) * self.top_trade_pct))
-        top_profit = np.sum(sorted_returns[:top_n])
-        
-        return float(top_profit / total_profit)
     
     def compute_from_cpcv(
         self,

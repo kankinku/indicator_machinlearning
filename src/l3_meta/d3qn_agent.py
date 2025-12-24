@@ -24,13 +24,10 @@ from src.l3_meta.state_encoder import StateEncoder, get_state_encoder
 from src.l3_meta.replay_buffer import ReplayBuffer, Experience, create_replay_buffer
 from src.l3_meta.reward_shaper import RewardShaper, get_reward_shaper
 from src.l3_meta.d3qn import (
-    DuelingDQN, 
-    MultiHeadDuelingDQN,
-    create_dqn_pair, 
-    soft_update, 
     TORCH_AVAILABLE,
     get_device,
 )
+from src.l3_meta.epsilon_manager import get_epsilon_manager
 
 logger = get_logger("l3.d3qn_agent")
 
@@ -40,14 +37,17 @@ if TORCH_AVAILABLE:
     import torch.nn.functional as F
 
 
-# 기본 행동 공간 (QLearner와 동일)
+# [V14] Search Profiles - High-level operational configurations
 DEFAULT_ACTIONS = [
-    "TREND_FOLLOWING",  # MA, MACD, Parabolic SAR
-    "MEAN_REVERSION",   # RSI, Bollinger, Stochastic
-    "VOLATILITY_BREAK", # ATR, Keltner, Bands
-    "MOMENTUM_ALPHA",   # ROC, CCI, AO
-    "DIP_BUYING",       # Trend Long + RSI Oversold
-    "DEFENSIVE"         # Strict risk, slow MAs
+    "TREND_ALPHA",      # 2 features, tail bias (extreme structural edges)
+    "TREND_STABLE",     # 3 features, center bias (stable trend patterns)
+    "MOMENTUM_TAIL",    # 2 features, tail bias (overextended reversals)
+    "MOMENTUM_CENTER",  # 2 features, center bias (oscillation/ranging)
+    "VOLATILITY_SNIPER",# 2 features, tail bias (breakouts/shocks)
+    "PATTERN_COMPLEX",  # 4 features, spread bias (multi-factor patterns)
+    "DEFENSIVE_CORE",   # 2 features, center bias, (conservative trend)
+    "SCALPING_FAST",    # 1-2 features, spread bias, high frequency
+    "EVOLVE"            # Evolutionary RL: Elite-based generation
 ]
 
 
@@ -120,17 +120,8 @@ class D3QNAgent:
         # 하이퍼파라미터
         self.gamma = config.D3QN_GAMMA
         self.tau = config.D3QN_TAU
-        self.epsilon = config.RL_EPSILON_START
-        self.epsilon_decay = config.RL_EPSILON_DECAY
-        self.epsilon_min = config.RL_EPSILON_MIN
-        self.update_freq = config.D3QN_UPDATE_FREQ
-        self.target_update_freq = config.D3QN_TARGET_UPDATE_FREQ
-        
-        # [V10] Epsilon Reheat 설정 - 정책 고착 방지
-        self.reheat_enabled = config.RL_EPSILON_REHEAT_ENABLED
-        self.reheat_period = config.RL_EPSILON_REHEAT_PERIOD
-        self.reheat_value = config.RL_EPSILON_REHEAT_VALUE
-        self.reheat_count = 0  # Reheat 횟수 추적
+        # Epsilon management is now handled by get_epsilon_manager()
+        self.eps_manager = get_epsilon_manager()
         
         # 상태 추적
         self.last_state: Optional[np.ndarray] = None
@@ -174,7 +165,8 @@ class D3QNAgent:
             state = self.state_encoder.encode_from_regime(regime)
         
         # Epsilon-greedy 행동 선택
-        if random.random() < self.epsilon:
+        epsilon = self.eps_manager.get_epsilon()
+        if random.random() < epsilon:
             action_idx = random.randint(0, self.n_actions - 1)
             exploration = True
         else:
@@ -189,7 +181,7 @@ class D3QNAgent:
         
         # 로깅
         if exploration:
-            logger.debug(f"    [D3QN] 탐색 (ε={self.epsilon:.3f}) -> {action_name}")
+            logger.debug(f"    [D3QN] 탐색 (ε={epsilon:.3f}) -> {action_name}")
         else:
             logger.debug(f"    [D3QN] 활용 -> {action_name}")
         
@@ -292,20 +284,12 @@ class D3QNAgent:
                     logger.debug(f"    [D3QN] Target 네트워크 업데이트됨")
         
         # Epsilon 감소
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+        # self.epsilon decay logic removed (handled by EpsilonManager externally)
         
-        # [V11.2] 정체 감지 기반 Epsilon Reheat
-        if self.reheat_enabled and self.step_count > 0 and self.step_count % self.reheat_period == 0:
+        # [V11.2] Stagnation check remains but delegates reheat to manager
+        if self.step_count > 0 and self.step_count % config.RL_EPSILON_REHEAT_PERIOD == 0:
             if self._is_stagnated():
-                old_epsilon = self.epsilon
-                self.epsilon = max(self.epsilon, self.reheat_value)
-                self.reheat_count += 1
-                logger.warning(
-                    f"    [D3QN] 🔥 STAGNATION DETECTED! Reheat #{self.reheat_count} | "
-                    f"ε: {old_epsilon:.3f} → {self.epsilon:.3f} | "
-                    f"지표 개선 정체로 인한 탐색 강제 재개"
-                )
+                self.eps_manager.request_reheat("STAGNATION")
             else:
                 logger.info(f"    [D3QN] Performance improving (Top 10% Alpha), skipping reheat.")
         
@@ -315,7 +299,7 @@ class D3QNAgent:
         
         logger.info(
             f"    [D3QN] 보상: {reward:.3f} | 버퍼: {len(self.replay_buffer)} | "
-            f"ε: {self.epsilon:.3f} | 학습: {self.learn_count} | Reheat: {self.reheat_count}"
+            f"ε: {self.eps_manager.get_epsilon():.3f} | 학습: {self.learn_count}"
         )
     
     def _is_stagnated(self) -> bool:
@@ -511,6 +495,7 @@ class IntegratedD3QNAgent(D3QNAgent):
         self.reward_shaper = get_reward_shaper()
         
         # RL Hyperparams
+        self.eps_manager = get_epsilon_manager()
         self.epsilon = config.D3QN_EPSILON
         self.gamma = config.D3QN_GAMMA
         self.tau = config.D3QN_TAU
@@ -538,7 +523,8 @@ class IntegratedD3QNAgent(D3QNAgent):
         else:
             state = self.state_encoder.encode_from_regime(regime)
             
-        if random.random() < self.epsilon:
+        epsilon = self.eps_manager.get_epsilon()
+        if random.random() < epsilon:
             s_idx = random.randint(0, self.head_dims[0] - 1)
             r_idx = random.randint(0, self.head_dims[1] - 1)
         else:
@@ -574,14 +560,16 @@ class IntegratedD3QNAgent(D3QNAgent):
                     soft_update(self.online_net, self.target_net, self.tau)
 
         # Decay epsilon
-        self.epsilon = max(config.D3QN_EPSILON_MIN, self.epsilon * config.D3QN_EPSILON_DECAY)
+        # Epsilon decay handled by manager
         
         # Reheat logic
         if self.step_count > 0 and self.step_count % self.reheat_period == 0:
             if self._is_stagnated():
-                self.epsilon = max(self.epsilon, self.reheat_value)
-                self.reheat_count += 1
-                logger.warning(f"[IntegratedD3QN] 🔥 Stagnation detected. Reheat #{self.reheat_count} ε={self.epsilon:.2f}")
+                self.reheat_exploration()
+
+    def reheat_exploration(self, target_epsilon: float = 0.3):
+        """Delegates reheat to EpsilonManager."""
+        self.eps_manager.request_reheat("INTEGRATED_D3QN_MANUAL", strength=target_epsilon)
 
         if self.step_count % 100 == 0:
             self.save()
@@ -630,10 +618,9 @@ class IntegratedD3QNAgent(D3QNAgent):
             'online_state_dict': self.online_net.state_dict(),
             'target_state_dict': self.target_net.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'epsilon': self.epsilon,
+            'epsilon': self.eps_manager.get_epsilon(),
             'step_count': self.step_count,
             'learn_count': self.learn_count,
-            'reheat_count': self.reheat_count,
             'strategy_actions': self.strategy_actions,
             'risk_actions': self.risk_actions,
         }, self.model_path)
@@ -646,10 +633,9 @@ class IntegratedD3QNAgent(D3QNAgent):
                 self.target_net.load_state_dict(ckpt['target_net_state_dict'] if 'target_net_state_dict' in ckpt else ckpt['target_state_dict'])
                 if 'optimizer_state_dict' in ckpt:
                     self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                self.epsilon = ckpt.get('epsilon', self.epsilon)
+                # self.epsilon = ckpt.get('epsilon', self.epsilon) -> Managed externally
                 self.step_count = ckpt.get('step_count', 0)
                 self.learn_count = ckpt.get('learn_count', 0)
-                self.reheat_count = ckpt.get('reheat_count', 0)
                 logger.info(f"Integrated D3QN loaded: {self.model_path}")
             except Exception as e:
                 logger.error(f"Load failed: {e}")

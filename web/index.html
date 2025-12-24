@@ -59,6 +59,38 @@
                 <p class="subtitle">Real-time Performance Overview</p>
             </header>
 
+            <!-- [V14] System Health Section -->
+            <div id="diag-section" class="diagnostic-grid" style="display:none;">
+                <div class="card diag-card">
+                    <div class="diag-header">
+                        <span class="label">SYSTEM HEALTH</span>
+                        <span id="diag-status" class="status-badge">UNKNOWN</span>
+                    </div>
+                    <div class="diag-split">
+                        <div class="diag-main">
+                            <div class="diag-stat">
+                                <span class="d-label">Pass Rate</span>
+                                <span id="diag-pass-rate" class="d-value">0%</span>
+                            </div>
+                            <div class="diag-stat">
+                                <span class="d-label">Rejection</span>
+                                <span id="diag-rej-rate" class="d-value">0%</span>
+                            </div>
+                            <div class="diag-stat">
+                                <span class="d-label">Similarity</span>
+                                <span id="diag-sim-rate" class="d-value">0%</span>
+                            </div>
+                        </div>
+                        <div class="diag-details">
+                            <span class="d-label">Issue Taxonomy</span>
+                            <div id="diag-taxonomy-bars" class="taxonomy-bars">
+                                <!-- Bars injected by JS -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <div id="kpi-grid" class="kpi-grid"></div>
 
             <div id="hof-section" class="hof-section" style="display:none;">

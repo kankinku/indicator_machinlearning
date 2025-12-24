@@ -44,9 +44,9 @@ from src.config import config
 from src.templates.registry import TemplateRegistry
 from src.features.factory import FeatureFactory
 from src.shared.caching import cache, get_feature_cache, get_label_cache
-from src.shared.backtest import run_signal_backtest, build_signal_series, derive_trade_params
-from src.features.context_engineering import add_time_features, add_relative_features, add_statistical_features
 from src.shared.logger import get_logger
+from src.backtest.engine import DeterministicBacktestEngine
+from src.orchestration.policy_evaluator import RuleEvaluator
 import ta
 
 logger = get_logger("orchestration.experiment")
@@ -107,227 +107,71 @@ def _run_experiment_core(
     include_trade_logic: bool = True,
 ) -> Dict[str, Any]:
     """
-    핵심 실험 실행 함수.
+    핵심 실험 실행 함수. (V13-PRO Rigorous Version)
     
-    [V9 Major Refactor] Single Source of Truth
-    - 모든 평가 지표는 run_signal_backtest 결과에서만 추출
-    - 라벨 일치 기반 평가 완전 제거
+    [V13-PRO]
+    - Separate Entry/Exit logic from RuleEvaluator.
+    - Deterministic State Machine in BacktestEngine.
+    - Complexity-aware scoring.
     """
-    prices = df["close"]
-
-    k_up = risk_budget.get("k_up", 1.0)
-    k_down = risk_budget.get("k_down", 1.0)
-    h_param = risk_budget.get("horizon", 20)
-    vol_span = 20
-
-    k_param = (k_up + k_down) / 2
-    logger.debug(f"[Experiment] Barrier Params: k_up={k_up:.2f}, k_down={k_down:.2f}, horizon={h_param}")
-
-    label_df = _generate_labels_cached(
-        price_values=prices.values,
-        price_index=prices.index,
-        k=k_param,
-        h=h_param,
-        vol_span=vol_span
-    )
-
-    common_idx = X_features.index.intersection(label_df.index)
-    valid_mask = label_df.loc[common_idx, "label"].notna()
-    final_idx = common_idx[valid_mask]
-
-    if len(final_idx) < 50:
-        logger.warning(f"[Experiment] Insufficient data: {len(final_idx)} samples")
-        return _empty_core_result(k_up, k_down, h_param, k_param)
-
-    X_final_df = X_features.loc[final_idx]
-    y_final_series = label_df.loc[final_idx, "label"].astype(int)
-    trgt_final_series = label_df.loc[final_idx, "trgt"]
-
-    t_train_start = time.time()
-
-    # LightGBM 파라미터 설정
-    if config.USE_FAST_MODE:
-        lgb_params = {
-            'objective': 'binary',
-            'num_class': 1,
-            'metric': 'binary_logloss',
-            'is_unbalance': True,  # [V9.1] Encourage trading
-            'verbosity': -1,
-            'boosting_type': 'gbdt',
-            'n_estimators': 15,
-            'num_leaves': 7,
-            'learning_rate': 0.10,
-            'min_child_samples': 40,
-            'feature_fraction': 0.7,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 1,
-            'lambda_l1': 0.2,
-            'lambda_l2': 0.2,
-            'seed': 42
-        }
-    else:
-        lgb_params = {
-            'objective': 'binary',
-            'num_class': 1,
-            'metric': 'binary_logloss',
-            'is_unbalance': True,  # [V9.1] Encourage trading
-            'verbosity': -1,
-            'boosting_type': 'gbdt',
-            'n_estimators': 100,
-            'num_leaves': 31,
-            'learning_rate': 0.05,
-            'feature_fraction': 0.9,
-            'seed': 42
-        }
-
-    # Walk-Forward Split with Purge
-    purge_bars = max(10, h_param)  # Triple Barrier horizon 고려
-    split_point = int(len(X_final_df) * 0.7)  # 70/30 분할
+    # 1. Evaluate Signals from Rules
+    evaluator = RuleEvaluator()
+    entry_sig, exit_sig, complexity = evaluator.evaluate_signals(X_features, policy_spec)
     
-    # Purge: 학습 데이터 끝에서 purge_bars 만큼 제외
-    train_end = max(50, split_point - purge_bars)
-    train_idx = np.arange(0, train_end)
-    test_idx = np.arange(split_point, len(X_final_df))
+    # 2. Run Deterministic Backtest
+    bt_engine = DeterministicBacktestEngine()
+    bt_result = bt_engine.run(df["close"], entry_sig, exit_sig)
     
-    if len(test_idx) < 30:
-        logger.warning(f"[Experiment] Test set too small: {len(test_idx)}")
-        return _empty_core_result(k_up, k_down, h_param, k_param)
-
-    splits = [(train_idx, test_idx)]
-
-    oos_preds = []
-    oos_indices = []
-    oos_scales = []
-    oos_probs = []
-
-    for train_idx, test_idx in splits:
-        X_train = X_final_df.iloc[train_idx]
-        y_train = y_final_series.iloc[train_idx]
-        X_test = X_final_df.iloc[test_idx]
-
-        guard = MLGuard(params=lgb_params)
-        guard.train(features=X_train, targets=y_train)
-
-        # [V9] Entry Threshold 대폭 완화 - 더 많은 신호 생성
-        dyn_threshold = policy_spec.tuned_params.get("entry_threshold", config.EVAL_ENTRY_THRESHOLD)
-        
-        res_df = guard.predict(
-            X_test,
-            threshold=dyn_threshold,
-            max_prob=config.EVAL_ENTRY_MAX_PROB,
-        )
-
-        oos_indices.extend(final_idx[test_idx])
-        oos_preds.extend(res_df["signal"].tolist())
-        oos_scales.extend(res_df["scale"].tolist())
-        oos_probs.extend(res_df["raw_prob"].tolist())
-    
-    t_train_end = time.time()
-    t_train = t_train_end - t_train_start
-
-    if not oos_indices:
-        return _empty_core_result(k_up, k_down, h_param, k_param)
-
-    # OOS 결과 DataFrame 생성
+    # 3. Format results for ledger
     results_df = pd.DataFrame({
-        "pred": oos_preds,
-        "scale": oos_scales,
-        "prob": oos_probs,
-    }, index=oos_indices)
+        "entry_sig": entry_sig,
+        "exit_sig": exit_sig,
+        "pred": entry_sig, # For compatibility with V12/V14 evaluation orchestrator
+        "pos": [0] * len(df) # Logic moved to engine, but kept for schema
+    }, index=df.index)
+    
+    # Phase 1 Filter: Cheap Checks
+    # [V13.5] Early rejection for extreme outliers
+    if bt_result.trades_per_year < 2.0 or bt_result.trades_per_year > 300.0:
+        bt_result.total_return = -99.9 # Force rejection
+        
+    # metrics for scoring
+    cpcv = {
+        "n_trades": bt_result.trade_count,
+        "win_rate": bt_result.win_rate,
+        "total_return_pct": bt_result.total_return,
+        "mdd_pct": bt_result.mdd,
+        "profit_factor": bt_result.profit_factor,
+        "exposure_ratio": bt_result.exposure,
+        "avg_trade_return": bt_result.avg_trade_return,
+        "complexity_score": complexity,
+        "trades_per_year": bt_result.trades_per_year, # [V13.5]
+        "excess_return": bt_result.excess_return,     # [V13.5]
+        "oos_bars": len(df),
+    }
 
-    results_df = results_df[~results_df.index.duplicated(keep='first')]
-    results_df = results_df.sort_index()
-
-    # =====================================================
-    # [V9 CORE CHANGE] Single Source of Truth: Backtest
-    # 라벨 일치 기반 평가 완전 제거
-    # 실제 가격 기반 Backtest만 사용
-    # =====================================================
-    
-    # OOS 구간의 가격 데이터 추출
-    oos_start = results_df.index.min()
-    oos_end = results_df.index.max()
-    oos_price_df = df.loc[oos_start:oos_end].copy()
-    
-    cost_bps = policy_spec.execution_assumption.get("cost_bps", config.DEFAULT_COST_BPS)
-    
-    # 실제 가격 기반 Backtest 실행
-    bt_result = run_signal_backtest(
-        price_df=oos_price_df,
-        results_df=results_df,
-        risk_budget=risk_budget,
-        cost_bps=cost_bps,
-    )
-    
-    # Backtest 결과에서 모든 지표 추출
-    n_trades = bt_result.trade_count
-    win_rate = bt_result.win_rate
-    total_return_pct = bt_result.total_return_pct
-    mdd_pct = bt_result.mdd_pct
-    
-    # 거래별 수익률로 CPCV 계산 (Backtest 기반)
-    trade_returns = [t["return_pct"] / 100.0 for t in bt_result.trades]
-    if trade_returns:
-        cpcv = compute_cpcv_metrics(trade_returns)
-    else:
-        cpcv = {"cpcv_mean": 0.0, "cpcv_worst": 0.0, "cpcv_std": 0.0}
-    
-    # PBO 계산
-    pbo = compute_pbo([trade_returns], target_idx=0) if trade_returns else 1.0
-    
-    # 턴오버 계산
-    turnover = n_trades / len(results_df) if len(results_df) > 0 else 0.0
-    
-    # [V9] CPCV metrics에 Backtest 결과 저장
-    cpcv["n_trades"] = n_trades
-    cpcv["win_rate"] = win_rate
-    cpcv["total_return_pct"] = total_return_pct
-    cpcv["mdd_pct"] = mdd_pct
-    cpcv["turnover"] = turnover
-    cpcv["oos_bars"] = len(results_df)
-    cpcv["signal_count"] = int((results_df["pred"] != 0).sum())
-
-    # [vNext] Exposure Ratio Calculation (Anti-Zero Exposure)
-    exposure_ratio = 0.0
-    if len(results_df) > 0:
-        exposure_ratio = float((results_df["pred"] != 0).sum()) / len(results_df)
-    cpcv["exposure_ratio"] = exposure_ratio
-
-    # Trade Logic 추출
-    trade_logic = {}
-    final_guard = None
-    
-    if include_trade_logic:
-        final_guard = MLGuard(params=lgb_params)
-        final_guard.train(features=X_final_df, targets=y_final_series)
-
-        feat_imp = final_guard.get_feature_importance()
-        sorted_imp = dict(sorted(feat_imp.items(), key=lambda item: item[1], reverse=True))
-
-        top_features = list(sorted_imp.keys())[:3]
-        trade_logic = {
-            "top_features": top_features,
-            "feature_importance": {k: float(v) for k, v in sorted_imp.items()},
-            "description": f"Model relied mostly on {', '.join(top_features)} to make decisions."
-        }
-
-    label_hash = f"triple_barrier_k{k_param:.2f}_h{h_param}"
+    # Trade Logic description
+    trade_logic = {
+        "rules": policy_spec.decision_rules,
+        "complexity": complexity,
+        "description": f"V13-PRO Deterministic Strategy | Rules: {policy_spec.decision_rules}"
+    }
     
     return {
         "results_df": results_df,
         "cpcv": cpcv,
-        "pbo": pbo,
-        "turnover": turnover,
-        "n_trades": n_trades,
-        "win_rate": win_rate,
-        "total_return_pct": total_return_pct,
-        "mdd_pct": mdd_pct,
+        "pbo": 0.0,
+        "turnover": bt_result.trade_count / len(df) if len(df) > 0 else 0.0,
+        "n_trades": bt_result.trade_count,
+        "win_rate": bt_result.win_rate,
+        "total_return_pct": bt_result.total_return,
+        "mdd_pct": bt_result.mdd,
         "trade_logic": trade_logic,
-        "final_guard": final_guard,
-        "label_config": {"k_up": k_up, "k_down": k_down, "horizon": h_param},
-        "label_hash": label_hash,
-        "t_train": t_train,
-        "bt_result": bt_result,  # Backtest 결과 전체 저장
+        "final_guard": None,
+        "label_config": {},
+        "label_hash": "v13_pro_deterministic",
+        "t_train": 0.0,
+        "bt_result": bt_result,
     }
 
 

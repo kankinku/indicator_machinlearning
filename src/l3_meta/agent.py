@@ -2,6 +2,7 @@
 import random
 import uuid
 import copy
+import numpy as np
 from typing import List, Dict, Any, Optional
 import pandas as pd
 import json
@@ -15,6 +16,7 @@ from src.config import config
 from src.shared.logger import get_logger
 from src.l3_meta.q_learner import QLearner
 from src.l3_meta.risk_profiles import RiskProfile, get_default_risk_profiles
+from src.l3_meta.epsilon_manager import get_epsilon_manager
 
 # D3QN 조건부 임포트
 if config.D3QN_ENABLED:
@@ -23,6 +25,7 @@ if config.D3QN_ENABLED:
 
 from src.l3_meta.curriculum_controller import get_curriculum_controller, CurriculumController
 from src.l3_meta.analyst import get_indicator_analyst
+from src.shared.hashing import generate_policy_id
 
 logger = get_logger("meta.agent")
 
@@ -60,6 +63,9 @@ class MetaAgent:
         # [V11.3] Warm-start Baselines
         self.baselines = self._load_baselines()
         
+        # Epsilon Manager
+        self.eps_manager = get_epsilon_manager()
+        
         # 현재 시장 데이터 참조 (D3QN용)
         self._current_df: Optional[pd.DataFrame] = None
     
@@ -88,6 +94,26 @@ class MetaAgent:
     def set_market_data(self, df: pd.DataFrame) -> None:
         """현재 시장 데이터를 설정합니다 (D3QN 상태 인코딩용)."""
         self._current_df = df
+        
+    def adjust_policy(self, diagnostic_status: str) -> None:
+        """
+        [V15] Self-Healing Feedback Loop (SSOT EpsilonManager)
+        """
+        if "RIGID" in diagnostic_status:
+            self.eps_manager.request_reheat("RIGID_DIAGNOSTIC", strength=0.7)
+            
+        elif "COLLAPSED" in diagnostic_status:
+            self.eps_manager.request_reheat("COLLAPSED_DIAGNOSTIC", strength=0.5)
+                
+        elif "STAGNANT" in diagnostic_status:
+            self.eps_manager.request_reheat("STAGNANT_DIAGNOSTIC", strength=0.4)
+
+        elif "SOFT" in diagnostic_status:
+            # Maybe slow down decay or just log
+            logger.info(f"[MetaAgent] 🛡 Self-Healing: SOFT state. Exploitation favored.")
+
+            
+
     def propose_policy(self, regime: RegimeState, history: List[LedgerRecord]) -> PolicySpec:
         """
         [V11.3] Warm-start Integrated Policy Construction.
@@ -106,17 +132,19 @@ class MetaAgent:
         if self.baselines and random.random() < baseline_prob:
             base = random.choice(self.baselines)
             logger.debug(f"[MetaAgent] Warm-start: Using baseline '{base.get('name')}'")
-            return self._make_spec(
+            spec = self._make_spec(
                 genome=base["feature_genome"],
-                template_tag=base["template_id"],
+                template_tag=base.get("template_id", "BASELINE"),
                 regime=regime,
-                # risk_profile is optional in baseline, but we can override or use it
                 rl_meta={
                     "is_baseline": True,
                     "baseline_name": base.get("name"),
                     "state_key": regime.label,
                 }
             )
+            # Override spec_id with deterministic hash
+            spec.spec_id = generate_policy_id(spec)
+            return spec
 
         # 1. Standard RL Flow
         logger.debug(f"[MetaAgent] Regime Detected: {regime.label} (Trend: {regime.trend_score:.2f}, VIX: {regime.vol_level:.2f})")
@@ -133,7 +161,10 @@ class MetaAgent:
         risk_profile = self._resolve_risk_profile(risk_profile_id)
         
         # Build Genome based on Action AND Regime
-        feature_genome = self._construct_genome_from_action(action_name, regime)
+        feature_genome = self._construct_genome_from_action(action_name, regime, history)
+        
+        # Build Decision Rules from Genome (V13)
+        decision_rules = self._construct_rules_from_genome(feature_genome)
         
         rl_meta = {
             "state_key": regime.label,
@@ -144,7 +175,32 @@ class MetaAgent:
             "d3qn_mode": config.D3QN_ENABLED,
         }
         
-        return self._make_spec(feature_genome, action_name, regime, risk_profile=risk_profile, rl_meta=rl_meta)
+        spec = self._make_spec(feature_genome, action_name, regime, risk_profile=risk_profile, rl_meta=rl_meta)
+        spec.decision_rules = decision_rules
+        spec.spec_id = generate_policy_id(spec)
+        return spec
+
+    def propose_batch(self, regime: RegimeState, history: List[LedgerRecord], n: int, seed: Optional[int] = None) -> List[PolicySpec]:
+        """
+        [V15] Propose a batch of N diverse policies.
+        Uses sample_with_diversity to strike a balance between quality (RL/Ontology) and novelty.
+        """
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            
+        from src.l3_meta.sampler import sample_with_diversity
+        
+        jaccard_th = getattr(config, 'DIVERSITY_JACCARD_TH', 0.8)
+        
+        # Iterative proposal to fill the batch with diverse candidates
+        return sample_with_diversity(
+            self.propose_policy, 
+            n, 
+            regime, 
+            history, 
+            jaccard_th=jaccard_th
+        )
 
 
     def learn(
@@ -193,58 +249,63 @@ class MetaAgent:
             if risk_idx is not None:
                 self.risk_rl.update(reward, next_regime, state_key=state_key, action_idx=risk_idx)
 
-    def _construct_genome_from_action(self, action_name: str, regime: RegimeState) -> Dict[str, Any]:
+    def _construct_genome_from_action(self, action_name: str, regime: RegimeState, history: List[LedgerRecord]) -> Dict[str, Any]:
         """
-        [V2 Evolution Logic]
-        Decodes the high-level RL action into a specific set of indicators and parameters
-        using the Dynamic Feature Registry.
+        [V14] Decodes Search Profile into Feature Genome Constraints.
         """
-        # Map Action to Feature Category
-        category_map = {
-            "TREND_FOLLOWING": ["TREND", "ADAPTIVE"],
-            "MEAN_REVERSION": ["MOMENTUM", "VOLUME", "MEAN_REVERSION"], 
-            "VOLATILITY_BREAK": ["VOLATILITY", "TREND"],
-            "MOMENTUM_ALPHA": ["MOMENTUM", "PRICE_ACTION"],
-            "DIP_BUYING": ["MOMENTUM", "TREND", "PATTERN"], 
-            "DEFENSIVE": ["VOLATILITY", "TREND", "ADAPTIVE"]
+        profile_map = {
+            "TREND_ALPHA":      (["TREND", "ADAPTIVE"], 2, 2, "tail"),
+            "TREND_STABLE":     (["TREND"], 3, 3, "center"),
+            "MOMENTUM_TAIL":    (["MOMENTUM", "PRICE_ACTION"], 2, 2, "tail"),
+            "MOMENTUM_CENTER":  (["MOMENTUM"], 2, 2, "center"),
+            "VOLATILITY_SNIPER":(["VOLATILITY"], 2, 2, "tail"),
+            "PATTERN_COMPLEX":  (["TREND", "MOMENTUM", "VOLATILITY"], 3, 4, "spread"),
+            "DEFENSIVE_CORE":   (["TREND", "ADAPTIVE"], 2, 2, "center"),
+            "SCALPING_FAST":    (["MOMENTUM", "VOLATILITY"], 1, 2, "spread"),
+            "EVOLVE":           (["TREND", "MOMENTUM"], 2, 3, "center") # Mapping for fallback
         }
         
-        target_categories = category_map.get(action_name, ["TREND", "MOMENTUM"])
+        # [V15] Special handling for EVOLVE
+        if action_name == "EVOLVE":
+            from src.evolution.ops import crossover, mutate
+            # Pick elite parents from history
+            elite_records = [r for r in history if not r.is_rejected and (r.cpcv_metrics.get("sharpe", 0) > 1.0)]
+            if len(elite_records) >= 2:
+                p1 = random.choice(elite_records).policy_spec
+                p2 = random.choice(elite_records).policy_spec
+                feature_genome = crossover(p1, p2).feature_genome
+                if random.random() < 0.3:
+                    temp_spec = copy.deepcopy(p1)
+                    temp_spec.feature_genome = feature_genome
+                    feature_genome = mutate(temp_spec).feature_genome
+                return feature_genome
+            else:
+                logger.debug("    [MetaAgent] Not enough elites for EVOLVE, falling back to Trend Alpha")
+                action_name = "TREND_ALPHA"
+
+        cats, f_min, f_max, q_bias = profile_map.get(action_name, (["TREND"], 2, 2, "center"))
         
         # 1. Fetch Candidates from Registry
         target_candidates = []
-        for cat in target_categories:
+        for cat in cats:
             target_candidates.extend(self.registry.list_by_category(cat))
             
-        # [V5 Autonomy Enforced]
-        # We respect the RL's choice. If RL says "MOMENTUM", we give MOMENTUM.
-        # We do NOT dilute it with random indicators from other categories just to fill a quota.
-        
         selected_features = []
+        subset_size = random.randint(f_min, f_max)
+        
         if target_candidates:
-            # [V11.2] Stage-based Feature Count Expansion
-            # Stage가 올라갈수록 더 복잡한 전략(더 많은 지표)을 시도하도록 유도
-            stage = self.curriculum.current_stage
-            min_count = config.GENOME_FEATURE_COUNT_MIN + (stage - 1)
-            max_count = min(len(target_candidates), config.GENOME_FEATURE_COUNT_MAX + (stage - 1) * 2)
+            # Weighted Sampling by Category Priors
+            priors = self.analyst.get_priors(regime.label)
             
-            subset_size = random.randint(min_count, max_count)
-            
-            # [V11.4] Weighted Sampling by Category Priors
-            priors = self.analyst.get_priors(regime.name)
-            
-            # Filter and normalize priors for target categories
-            valid_target_cats = [cat for cat in target_categories if self.registry.list_by_category(cat)]
+            valid_target_cats = [cat for cat in cats if self.registry.list_by_category(cat)]
             if not valid_target_cats:
-                selected_features = random.sample(target_candidates, subset_size)
+                selected_features = random.sample(target_candidates, min(len(target_candidates), subset_size))
             else:
                 cat_weights = [priors.get(cat, 0.1) for cat in valid_target_cats]
                 sum_w = sum(cat_weights)
                 cat_weights = [w/sum_w for w in cat_weights]
                 
                 selected_features = []
-                # Distribute slots among categories based on weights
-                # Using random.choices for category selection, then random.choice for indicator within category
                 for _ in range(subset_size):
                     chosen_cat = random.choices(valid_target_cats, weights=cat_weights, k=1)[0]
                     cat_items = self.registry.list_by_category(chosen_cat)
@@ -259,7 +320,6 @@ class MetaAgent:
                     if remaining:
                         selected_features.extend(random.sample(remaining, min(len(remaining), subset_size - len(selected_features))))
         else:
-            # Fallback: If registry is empty or category missing, pick 1 random from all.
             all_candidates = self.registry.list_all()
             if all_candidates:
                 selected_features = random.sample(all_candidates, 1)
@@ -270,7 +330,63 @@ class MetaAgent:
             params = self._evolve_params(feature_meta, action_name, regime)
             genome[feature_meta.feature_id] = params
             
+        # Store bias for rule generation
+        genome["__meta__"] = {"q_bias": q_bias, "profile": action_name}
         return genome
+
+    def _construct_rules_from_genome(self, genome: Dict[str, Any]) -> Dict[str, str]:
+        """
+        [V14] Managed Rule Generation using Profile-driven Bias.
+        """
+        if not genome:
+            return {"entry": "False", "exit": "True"}
+            
+        # Extract meta provided by _construct_genome_from_action
+        meta = genome.get("__meta__", {})
+        q_bias = meta.get("q_bias", "center") or "center"
+        
+        cur_stage = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
+        stages = getattr(config, 'CURRICULUM_STAGES', {})
+        stage_cfg = stages.get(cur_stage, stages.get(1, {}))
+        
+        # [V14] Logic Complexity (AND terms) based on Stage & Profile
+        and_range = getattr(stage_cfg, "and_terms_range", (1, 3))
+        n_terms = random.randint(and_range[0], and_range[1])
+        
+        # Filter out meta keys
+        feature_ids = [fid for fid in genome.keys() if not fid.startswith("__")]
+        selected_fids = random.sample(feature_ids, min(len(feature_ids), n_terms)) if feature_ids else []
+
+        # Quantile Sampling Logic
+        quantiles = [round(x * 0.1, 1) for x in range(1, 10)]
+        if q_bias == "center":
+            weights = [0.05, 0.05, 0.2, 0.2, 0.2, 0.2, 0.05, 0.05, 0.05]
+        elif q_bias == "tail":
+            weights = [0.3, 0.15, 0.05, 0.0, 0.0, 0.0, 0.05, 0.15, 0.3]
+        else: # "spread"
+            weights = [0.1, 0.1, 0.1, 0.1, 0.2, 0.1, 0.1, 0.1, 0.1]
+            
+        entry_parts = []
+        for fid in selected_fids:
+            op = ">" if random.random() > 0.5 else "<"
+            q = random.choices(quantiles, weights=weights, k=1)[0]
+            col_name = f"{fid}__" + fid.split('_')[1].lower() if '_' in fid else fid
+            entry_parts.append(f"`{col_name}` {op} [q{q}]")
+            
+        entry_rule = " and ".join(entry_parts) if entry_parts else "True"
+        
+        # Simple Exit Rule
+        exit_rule = "False"
+        if selected_fids:
+            exit_fid = random.choice(selected_fids)
+            col_exit = f"{exit_fid}__" + exit_fid.split('_')[1].lower() if '_' in exit_fid else exit_fid
+            exit_rule = f"`{col_exit}` > [q0.5]" if q_bias == "tail" else f"`{col_exit}` < [q0.3]"
+
+        return {"entry": entry_rule, "exit": exit_rule}
+            
+
+
+
 
     def _evolve_params(self, feature_meta: FeatureMetadata, action_context: str, regime: RegimeState = None) -> Dict[str, Any]:
         """

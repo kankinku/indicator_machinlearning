@@ -1,6 +1,6 @@
 from __future__ import annotations
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from src.contracts import PolicySpec
 from src.config import config
 from src.shared.logger import get_logger
@@ -66,38 +66,49 @@ def select_diverse_top_k(
     k: int,
     jaccard_th: float = 0.7,
     param_th: float = 0.1, # Not used as similarity but distance if we want
-) -> List[Any]:
+) -> Tuple[List[Any], Dict[str, Any]]:
     """
     유사도 제약을 고려하여 상위 K개를 선택합니다.
+    Returns: (selected_list, stats_dict)
     """
     if not candidates:
-        return []
+        return [], {"collision_count": 0, "avg_jaccard": 0.0}
         
-    # 점수순 정렬 (이미 되어있을 수 있음)
+    # 점수순 정렬
     sorted_candidates = sorted(candidates, key=lambda x: x.score, reverse=True)
     
     selected = []
+    collision_count = 0
+    all_jaccards = []
     
     for cand in sorted_candidates:
         if len(selected) >= k:
             break
             
+        p_cand = getattr(cand, 'policy_spec', getattr(cand, 'policy', None))
         is_too_similar = False
+        
         for sel in selected:
-            # PolicySpec 추출 (ModuleResult 또는 ExperimentResult 대응)
-            p_cand = getattr(cand, 'policy_spec', getattr(cand, 'policy', None))
             p_sel = getattr(sel, 'policy_spec', getattr(sel, 'policy', None))
             
             if p_cand and p_sel:
                 jaccard = calculate_genome_similarity(p_cand, p_sel)
+                all_jaccards.append(jaccard)
+                
                 if jaccard > jaccard_th:
-                    # 지표 셋이 너무 비슷하면 파라미터 거리 확인
                     param_sim = calculate_param_similarity(p_cand, p_sel)
-                    if param_sim > (1.0 - param_th): # 너무 유사함
+                    if param_sim > (1.0 - param_th): 
                         is_too_similar = True
+                        collision_count += 1
                         break
         
         if not is_too_similar:
             selected.append(cand)
             
-    return selected
+    stats = {
+        "collision_count": collision_count,
+        "avg_jaccard": np.mean(all_jaccards) if all_jaccards else 0.0,
+        "collision_rate": collision_count / len(sorted_candidates) if sorted_candidates else 0
+    }
+    
+    return selected, stats

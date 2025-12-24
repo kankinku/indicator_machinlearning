@@ -20,22 +20,13 @@ import json
 import os
 
 from src.config import config
+from src.shared.stage_schema import StageSpec
 from src.shared.logger import get_logger
 
 logger = get_logger("l3.curriculum")
 
 
-@dataclass
-class StageRequirement:
-    """Stage별 요구 사항."""
-    stage_id: int
-    min_trades: int
-    max_mdd_pct: float
-    min_winrate: float
-    max_winrate: float
-    min_alpha: float
-    min_return_pct: float
-    description: str = ""
+# StageRequirement is replaced by StageSpec in shared/stage_schema.py
 
 
 @dataclass
@@ -61,24 +52,23 @@ class CurriculumController:
     
     def __init__(self, state_file: Optional[str] = None):
         self.state_file = state_file or str(config.LEDGER_DIR / "curriculum_state.json")
+        self._audit_schema()
         self.state = self._load_state()
-        self.stages = self._build_stages()
+        self.stages = config.CURRICULUM_STAGES # Direct use of StageSpec objects
         
-    def _build_stages(self) -> Dict[int, StageRequirement]:
-        """Config에서 Stage 요구사항을 빌드합니다."""
-        stages = {}
-        for stage_id, stage_config in config.CURRICULUM_STAGES.items():
-            stages[stage_id] = StageRequirement(
-                stage_id=stage_id,
-                min_trades=stage_config.get("min_trades", 10),
-                max_mdd_pct=stage_config.get("max_mdd_pct", 60.0),
-                min_winrate=stage_config.get("min_winrate", 0.25),
-                max_winrate=stage_config.get("max_winrate", 0.90),
-                min_alpha=stage_config.get("min_alpha", 0.0),
-                min_return_pct=stage_config.get("target_return_pct", 50.0),
-                description=stage_config.get("description", f"Stage {stage_id}"),
+    def _audit_schema(self) -> None:
+        """[V15] Boot-time Schema Audit."""
+        logger.info("--- [Curriculum] SCHEMA AUDIT ---")
+        for sid, spec in config.CURRICULUM_STAGES.items():
+            logger.info(
+                f"Stage {sid} ({spec.name}): "
+                f"Ret={spec.target_return_pct}% | "
+                f"Alpha={spec.alpha_floor} | "
+                f"Trades={spec.min_trades_per_year} | "
+                f"MDD={spec.max_mdd_pct}% | "
+                f"WF={spec.wf_splits} ({spec.wf_gate_mode})"
             )
-        return stages
+        logger.info("---------------------------------")
     
     def _load_state(self) -> CurriculumState:
         """저장된 상태를 로드합니다."""
@@ -118,14 +108,14 @@ class CurriculumController:
         return self.state.current_stage
     
     @property
-    def current_requirement(self) -> StageRequirement:
+    def current_requirement(self) -> StageSpec:
         """현재 Stage의 요구사항을 반환합니다."""
         return self.stages.get(
             self.state.current_stage,
-            self.stages.get(1, StageRequirement(stage_id=1, min_return_pct=30.0, min_trades=30, max_mdd_pct=50.0, min_winrate=0.4, max_winrate=0.8, min_alpha=0.0))
+            list(self.stages.values())[0] # Fallback to first stage
         )
     
-    def get_previous_requirement(self) -> Optional[StageRequirement]:
+    def get_previous_requirement(self) -> Optional[StageSpec]:
         """이전 Stage의 요구사항을 반환합니다."""
         prev_stage = self.state.current_stage - 1
         return self.stages.get(prev_stage)
@@ -133,46 +123,46 @@ class CurriculumController:
     def evaluate_against_current(
         self,
         total_return_pct: float,
-        n_trades: int,
+        trades_per_year: float,
         mdd_pct: float,
         win_rate: float,
         alpha: float = 0.0,
+        profit_factor: float = 1.0,
     ) -> Tuple[bool, str]:
         """
-        [V11.2] 현재 Stage 기준으로 전략을 평가합니다. (Hard Gate + Alpha)
+        [V15] 현재 Stage 기준으로 전략을 평가합니다. (StageSpec SSOT 사용)
         """
         req = self.current_requirement
         
         reasons = []
         passed = True
         
-        # 1. 최소 거래
-        if n_trades < req.min_trades:
+        # 1. 최소 거래 (연간 기준)
+        if trades_per_year < req.min_trades_per_year:
             passed = False
-            reasons.append(f"LOW_TRADES ({n_trades} < {req.min_trades})")
+            reasons.append(f"LOW_TRADES ({trades_per_year:.1f} < {req.min_trades_per_year:.1f})")
         
         # 2. 최대 MDD
         if abs(mdd_pct) > req.max_mdd_pct:
             passed = False
             reasons.append(f"MDD ({abs(mdd_pct):.1f}% > {req.max_mdd_pct}%)")
-        
-        # 3. 승률 범위
-        if win_rate < req.min_winrate:
-            passed = False
-            reasons.append(f"WINRATE_LOW ({win_rate:.1%} < {req.min_winrate:.1%})")
-        elif win_rate > req.max_winrate:
-            passed = False
-            reasons.append(f"WINRATE_HIGH ({win_rate:.1%} > {req.max_winrate:.1%})")
             
-        # 4. 최소 Alpha (벤치마크 초과 수익)
-        if alpha < req.min_alpha:
+        # 3. 최소 Alpha (벤치마크 초과 수익)
+        if alpha < req.alpha_floor:
             passed = False
-            reasons.append(f"ALPHA_NEGATIVE ({alpha:.4f} < {req.min_alpha:.4f})")
+            reasons.append(f"ALPHA_BELOW_FLOOR ({alpha:.2f} < {req.alpha_floor:.2f})")
             
-        # 5. 목표 수익률 달성 (승급 기여용 보조 체크)
-        if total_return_pct < req.min_return_pct:
+        # 4. 목표 수익률 달성 (승급 기여용 보조 체크)
+        if total_return_pct < req.target_return_pct:
+            # Note: Stage 1에서는 target_return_pct 미달이어도 survival 조건(alpha_floor 등)을 만족하면 
+            # evaluation score는 나올 수 있지만, curriculum PASS 여부에서는 걸러짐.
             passed = False
-            reasons.append(f"TARGET_RETURN ({total_return_pct:.1f}% < {req.min_return_pct}%)")
+            reasons.append(f"TARGET_RETURN ({total_return_pct:.1f}% < {req.target_return_pct}%)")
+
+        # 5. Profit Factor
+        if profit_factor < req.min_profit_factor:
+            passed = False
+            reasons.append(f"LOW_PF ({profit_factor:.2f} < {req.min_profit_factor:.2f})")
         
         if passed:
             return True, f"PASS_STAGE_{req.stage_id}"
@@ -225,13 +215,13 @@ class CurriculumController:
         self._save_state()
         return status_change
     
-    def get_dynamic_min_trades(self) -> int:
-        """현재 Stage에 따른 동적 최소 거래 수를 반환합니다."""
-        return self.current_requirement.min_trades
+    def get_dynamic_min_trades(self) -> float:
+        """현재 Stage에 따른 동적 최소 거래 수(연간)를 반환합니다."""
+        return self.current_requirement.min_trades_per_year
     
     def get_dynamic_min_return(self) -> float:
-        """현재 Stage에 따른 동적 최소 수익률을 반환합니다."""
-        return self.current_requirement.min_return_pct
+        """현재 Stage에 따른 동적 목표 수익률을 반환합니다."""
+        return self.current_requirement.target_return_pct
     
     def get_stage_info(self) -> Dict:
         """현재 Stage 정보를 반환합니다."""
@@ -244,9 +234,9 @@ class CurriculumController:
                 self.state.stage_passes / self.state.stage_attempts 
                 if self.state.stage_attempts > 0 else 0.0
             ),
-            "min_return_pct": req.min_return_pct,
-            "min_trades": req.min_trades,
-            "description": req.description,
+            "target_return_pct": req.target_return_pct,
+            "min_trades_per_year": req.min_trades_per_year,
+            "description": req.name,
             "threshold_to_next": config.CURRICULUM_STAGE_UP_THRESHOLD,
         }
 

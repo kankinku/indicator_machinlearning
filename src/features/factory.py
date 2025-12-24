@@ -47,6 +47,11 @@ class FeatureFactory:
         df = df.copy()
         df.columns = [c.lower() for c in df.columns]
         
+        # [V16] Ensure no NaNs in price data before sending to indicators
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').ffill().fillna(0.0)
+        
         feature_chunks = []
         
         # ============================================
@@ -119,7 +124,8 @@ class FeatureFactory:
                 
             return result
         except Exception as e:
-            print(f"Execution Error for {feature_id}: {e}")
+            import traceback
+            logger.error(f"Execution Error for {feature_id}: {e}\n{traceback.format_exc()}")
             raise e
 
     def generate_single_feature(self, df: pd.DataFrame, meta: Any, params: Dict[str, Any]) -> Optional[pd.DataFrame]:

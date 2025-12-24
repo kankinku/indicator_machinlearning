@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import time
 import copy
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from dataclasses import dataclass, asdict
 
 import numpy as np
 import pandas as pd
@@ -23,43 +25,192 @@ from src.l1_judge.evaluator import (
     stable_hash,
     validate_sample,
 )
-from src.shared.backtest import run_signal_backtest
+from src.evaluation.real_evaluator import RealEvaluator
+from src.evaluation.fast_filter import FastFilter
 from src.orchestration.run_experiment import _generate_features_cached, _run_experiment_core, build_record_and_artifact
+from src.evaluation.contracts import WindowResult, BestSample, ModuleResult, EvaluationResult
+from src.evaluation.result_store import get_result_store, get_policy_sig
 from src.shared.logger import get_logger
+from src.shared.instrumentation import get_instrumentation
+from src.shared.hashing import generate_policy_id
+from src.l3_meta.reward_shaper import get_reward_shaper
 
 logger = get_logger("orchestration.evaluation")
 
 
-@dataclass
-class WindowResult:
-    window_id: str
-    raw_score: float
-    median_score: float
-    p10_score: float
-    std_score: float
-    violation_rate: float
-    avg_alpha: float = 0.0  # [V11.3] Walk-forward Alpha Consistency
-    normalized_score: float = 0.0
+class OperationalQACollector:
+    """
+    [V14] Operational QA Monitoring
+    Tracks strategy pass/fail rates and failure taxonomy across a batch.
+    """
+    def __init__(self, stage_name: str):
+        self.stage_name = stage_name
+        self.total_samples = 0
+        self.passed_samples = 0
+        self.failure_counts = {}
+        self.performance_stats = {
+            "returns": [],
+            "mdds": [],
+            "annual_trades": []
+        }
+        self.similarity_stats = {
+            "avg_jaccard": 0.0,
+            "collision_rate": 0.0
+        }
+
+    def collect(self, passed: bool, reason: str, metrics: Optional[SampleMetrics] = None):
+        self.total_samples += 1
+        if passed and metrics:
+            self.passed_samples += 1
+            self.performance_stats["returns"].append(metrics.total_return_pct)
+            self.performance_stats["mdds"].append(metrics.mdd_pct)
+            self.performance_stats["annual_trades"].append(metrics.trades_per_year)
+        else:
+            # Extract FAIL_XXX code
+            fail_code = reason.split("(")[0].strip() if "(" in reason else reason
+            self.failure_counts[fail_code] = self.failure_counts.get(fail_code, 0) + 1
+
+    def _get_category(self, fail_code: str) -> str:
+        for cat, codes in config.FAILURE_TAXONOMY.items():
+            if fail_code in codes:
+                return cat
+        return "UNKNOWN_ISSUE"
+
+    def similarity_analysis(self, policies: List[PolicySpec]):
+        """[V14] Detects redundant strategies in the batch."""
+        from src.l1_judge.diversity import calculate_genome_similarity
+        if len(policies) < 2:
+            return
+            
+        jaccards = []
+        collisions = 0
+        n = len(policies)
+        
+        # Simple sampling if batch is too large
+        sample_size = min(n, 20)
+        subset = policies[:sample_size]
+        
+        for i in range(len(subset)):
+            for j in range(i + 1, len(subset)):
+                sim = calculate_genome_similarity(subset[i], subset[j])
+                jaccards.append(sim)
+                if sim > 0.8: # Hard threshold for collision detection
+                    collisions += 1
+                    
+        pairs = len(jaccards)
+        if pairs > 0:
+            self.similarity_stats["avg_jaccard"] = np.mean(jaccards)
+            self.similarity_stats["collision_rate"] = collisions / pairs
+            
+        if self.similarity_stats["collision_rate"] > 0.3:
+            logger.warning(f"!!! [QA] Similarity Alert: Batch collision rate {self.similarity_stats['collision_rate']:.1%}")
+
+    def report(self):
+        if self.total_samples == 0:
+            logger.warning(f"QA Report [{self.stage_name}]: No samples collected.")
+            return
+
+        pass_rate = self.passed_samples / self.total_samples
+        rej_rate = 1.0 - pass_rate
+        
+        logger.info(f"--- [V14] QA DIAGNOSTIC: {self.stage_name.upper()} ---")
+        logger.info(f"Summary: Success {pass_rate:.1%} | Rejection {rej_rate:.1%} (n={self.total_samples})")
+        
+        # 1. Failure Taxonomy Grouping
+        taxonomy = {}
+        if self.failure_counts:
+            for code, count in self.failure_counts.items():
+                cat = self._get_category(code)
+                taxonomy[cat] = taxonomy.get(cat, 0) + count
+            
+            tax_str = ", ".join([f"{k}: {v}" for k, v in taxonomy.items()])
+            logger.info(f"Taxonomy: {tax_str}")
+            
+            top_raw = sorted(self.failure_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+            raw_str = ", ".join([f"{k}({v})" for k, v in top_raw])
+            logger.info(f"Top Reasons: {raw_str}")
+
+        # 2. Performance Profiling
+        avg_tpy = 0.0
+        if self.passed_samples > 0:
+            avg_ret = np.mean(self.performance_stats["returns"])
+            avg_mdd = np.mean(self.performance_stats["mdds"])
+            avg_tpy = float(np.mean(self.performance_stats["annual_trades"]))
+            logger.info(f"Perf: Avg Ret {avg_ret:.2f}% | Avg MDD {avg_mdd:.2f}% | Avg Trades/Y {avg_tpy:.1f}")
+
+        # 3. [V14] Self-Healing Status Determination (Numerical Triggers)
+        # =============================================================
+        status = "SOFT" # Default
+        
+        # A. RIGID Check (Exploration Stagnation)
+        is_rigid = (rej_rate > 0.90) or (pass_rate < 0.01)
+        
+        # B. COLLAPSED Check (Search Space Narrowing)
+        coll_rate = self.similarity_stats.get("collision_rate", 0.0)
+        avg_jaccard = self.similarity_stats.get("avg_jaccard", 0.0)
+        # unique_ratio < 0.3 means collision_rate > 0.7
+        is_collapsed = (avg_jaccard > 0.70) or (coll_rate > 0.70)
+        
+        if is_rigid:
+            status = "RIGID"
+        elif is_collapsed:
+            status = "COLLAPSED"
+            
+        # Optional: Stage-specific health rules from config
+        health_rules = getattr(config, 'STAGE_HEALTH_RULES', {})
+        health_cfg = health_rules.get(self.stage_name, {})
+        if "median_tpy_range" in health_cfg:
+            t_min, t_max = health_cfg["median_tpy_range"]
+            if avg_tpy > 0 and avg_tpy < t_min:
+                status += "_LOW_ACTIVITY"
+        
+        logger.info(f"Diagnostic Result: >>> {status} <<<")
+        
+        # [V14] Persist for Dashboard
+        self._persist_diagnostics(
+            pass_rate, 
+            rej_rate, 
+            status, 
+            taxonomy if self.failure_counts else {},
+            similarity=self.similarity_stats
+        )
+
+        logger.info("------------------------------------------")
+        return status
+
+    def _persist_diagnostics(self, pass_rate, rej_rate, status, taxonomy, similarity=None):
+        try:
+            diag_dir = Path(getattr(config, 'LEDGER_DIR', 'ledger')) / "diagnostics"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Group by stage
+            stage_file = diag_dir / f"latest_{self.stage_name}.json"
+            
+            report_data = {
+                "timestamp": time.time(),
+                "stage": self.stage_name,
+                "total_samples": self.total_samples,
+                "pass_rate": pass_rate,
+                "rejection_rate": rej_rate,
+                "status": status,
+                "taxonomy": taxonomy,
+                "similarity": similarity or {},
+                "top_reasons": dict(sorted(self.failure_counts.items(), key=lambda x: x[1], reverse=True)[:5])
+            }
+            
+            with open(stage_file, "w") as f:
+                json.dump(report_data, f, indent=2)
+                
+            # Also keep history (last 50 batches)
+            history_file = diag_dir / "history.jsonl"
+            with open(history_file, "a") as f:
+                f.write(json.dumps(report_data) + "\n")
+                
+        except Exception as e:
+            logger.error(f"Failed to persist diagnostics: {e}")
 
 
-@dataclass
-class BestSample:
-    sample_id: str
-    window_id: str
-    risk_budget: Dict[str, float]
-    metrics: SampleMetrics
-    sample_score: float
-    core: Dict[str, object]
-
-
-@dataclass
-class ModuleResult:
-    policy_spec: PolicySpec
-    module_key: str
-    score: float
-    window_results: List[WindowResult]
-    best_sample: Optional[BestSample]
-    stage: str
+# Dataclasses moved to src.evaluation.contracts
 
 
 def _split_contiguous_windows(df: pd.DataFrame, count: int, prefix: str) -> List[Tuple[str, pd.DataFrame]]:
@@ -152,172 +303,196 @@ def _evaluate_policy_windows(
     stage: str,
     regime_id: str,
     sample_count: int,
-) -> ModuleResult:
-    if df.empty:
-        return ModuleResult(policy_spec=policy_spec, module_key="", score=config.EVAL_SCORE_MIN, window_results=[], best_sample=None, stage=stage)
+    pre_X: Optional[pd.DataFrame] = None, # [V12-O] Pre-calculated features
+) -> EvaluationResult:
+    try:
+        if df.empty:
+            return ModuleResult(policy_spec=policy_spec, module_key="", score=config.EVAL_SCORE_MIN, window_results=[], best_sample=None, stage=stage)
 
-    df_local = df.copy()
-    df_local.columns = [c.lower() for c in df_local.columns]
-    X_full = _generate_features_cached(
-        df_values=df_local.values,
-        df_columns=df_local.columns.tolist(),
-        df_index=df_local.index,
-        genome=policy_spec.feature_genome,
-    )
+        df_local = df.copy()
+        df_local.columns = [c.lower() for c in df_local.columns]
+        
+        # [V12-O] Use pre-calculated X if available
+        if pre_X is not None:
+            X_full = pre_X
+        else:
+            X_full = _generate_features_cached(
+                df_values=df_local.values,
+                df_columns=df_local.columns.tolist(),
+                df_index=df_local.index,
+                genome=policy_spec.feature_genome,
+            )
 
-    risk_budget = policy_spec.risk_budget or {}
-    risk_profile_id = risk_budget.get("risk_profile", "DEFAULT")
-    base_sl = risk_budget.get("stop_loss")
-    base_rr = risk_budget.get("risk_reward_ratio")
-    base_tp = None
-    if base_sl is not None and base_rr is not None:
-        try:
-            base_tp = float(base_sl) * float(base_rr)
-        except (TypeError, ValueError):
-            base_tp = None
-    base_h = risk_budget.get("horizon")
+        risk_budget = policy_spec.risk_budget or {}
+        risk_profile_id = risk_budget.get("risk_profile", "DEFAULT")
+        base_sl = risk_budget.get("stop_loss")
+        base_rr = risk_budget.get("risk_reward_ratio")
+        base_tp = None
+        if base_sl is not None and base_rr is not None:
+            try:
+                base_tp = float(base_sl) * float(base_rr)
+            except (TypeError, ValueError):
+                base_tp = None
+        base_h = risk_budget.get("horizon")
 
-    tp_dist, sl_dist, h_dist = get_risk_distributions(
-        template_id=policy_spec.template_id,
-        regime_id=regime_id,
-        risk_profile_id=risk_profile_id,
-        base_tp=base_tp,
-        base_sl=base_sl,
-        base_h=base_h,
-    )
+        tp_dist, sl_dist, h_dist = get_risk_distributions(
+            template_id=policy_spec.template_id,
+            regime_id=regime_id,
+            risk_profile_id=risk_profile_id,
+            base_tp=base_tp,
+            base_sl=base_sl,
+            base_h=base_h,
+        )
 
-    entry_threshold_id = f"th{config.EVAL_ENTRY_THRESHOLD:.2f}_mp{config.EVAL_ENTRY_MAX_PROB:.2f}"
-    data_window_id = str(policy_spec.data_window.get("lookback", "full"))
-    cost_bps = float(policy_spec.execution_assumption.get("cost_bps", 5))
-    cost_model_id = f"bps{int(round(cost_bps))}"
+        entry_threshold_id = f"th{config.EVAL_ENTRY_THRESHOLD:.2f}_mp{config.EVAL_ENTRY_MAX_PROB:.2f}"
+        data_window_id = str(policy_spec.data_window.get("lookback", "full"))
+        cost_bps = float(policy_spec.execution_assumption.get("cost_bps", 5))
+        cost_model_id = f"bps{int(round(cost_bps))}"
 
-    module_key = build_module_key(
-        template_id=policy_spec.template_id,
-        regime_id=regime_id,
-        tp_dist_id=tp_dist.dist_id,
-        sl_dist_id=sl_dist.dist_id,
-        horizon_dist_id=h_dist.dist_id,
-        entry_threshold_id=entry_threshold_id,
-        data_window_id=data_window_id,
-        cost_model_id=cost_model_id,
-    )
+        module_key = build_module_key(
+            template_id=policy_spec.template_id,
+            regime_id=regime_id,
+            tp_dist_id=tp_dist.dist_id,
+            sl_dist_id=sl_dist.dist_id,
+            horizon_dist_id=h_dist.dist_id,
+            entry_threshold_id=entry_threshold_id,
+            data_window_id=data_window_id,
+            cost_model_id=cost_model_id,
+        )
 
-    windows = build_windows(df_local, stage)
-    window_results: List[WindowResult] = []
-    best_sample: Optional[BestSample] = None
+        windows = build_windows(df_local, stage)
+        window_results: List[WindowResult] = []
+        best_sample: Optional[BestSample] = None
 
-    for window_id, window_df in windows:
-        X_window = X_full.loc[window_df.index]
-        seed = stable_hash(f"{module_key}|{window_id}")
-        samples = sample_risk_params(tp_dist, sl_dist, h_dist, sample_count, seed)
+        for window_id, window_df in windows:
+            X_window = X_full.loc[window_df.index]
+            seed = stable_hash(f"{module_key}|{window_id}")
+            samples = sample_risk_params(tp_dist, sl_dist, h_dist, sample_count, seed)
 
-        sample_scores: List[float] = []
-        violations: List[bool] = []
-        alphas: List[float] = []
-
-        for sample in samples:
-            sample_risk = _build_sample_risk_budget(risk_budget, sample.tp_pct, sample.sl_pct, sample.horizon)
-            core = _run_experiment_core(
+            # [V12-O] Single-Train, Multi-Test Optimization
+            # Train once per window using the base risk budget to get the "model signals"
+            core_base = _run_experiment_core(
                 policy_spec=policy_spec,
                 df=window_df,
                 X_features=X_window,
-                risk_budget=sample_risk,
+                risk_budget=risk_budget, # base risk
                 include_trade_logic=False,
             )
-            bt = run_signal_backtest(
-                price_df=window_df,
-                results_df=core.get("results_df"),
-                risk_budget=sample_risk,
-                cost_bps=cost_bps,
-                target_regime=regime_id, # [V11.2]
-            )
-            trade_returns = np.array([t["return_pct"] / 100.0 for t in bt.trades], dtype=float)
-            metrics = compute_sample_metrics(trade_returns, bt.trade_count)
-            metrics.total_return_pct = bt.total_return_pct
-            metrics.mdd_pct = bt.mdd_pct
-            metrics.win_rate = bt.win_rate
-            metrics.trade_count = bt.trade_count
-            metrics.valid_trade_count = bt.valid_trade_count # [V11.2]
-            
-            # [V11.2] Bench ROI (Buy & Hold) calculation for Alpha
-            bench_start = float(window_df["close"].iloc[0])
-            bench_end = float(window_df["close"].iloc[-1])
-            bench_roi_pct = ((bench_end / bench_start) - 1.0) * 100.0
-            metrics.benchmark_roi_pct = bench_roi_pct
-            
-            # Alpha = Strat ROI - Bench ROI
-            alpha = (bt.total_return_pct - bench_roi_pct) / 100.0
-            alphas.append(alpha)
+            base_signals = core_base.get("results_df", pd.DataFrame()).get("pred", pd.Series(dtype=int))
 
-            # [vNext] Calc Exposure Ratio
-            results_df = core.get("results_df")
-            if results_df is not None and not results_df.empty:
-                exposure_ratio = float((results_df["pred"] != 0).sum()) / len(results_df)
-            else:
-                exposure_ratio = 0.0
-            metrics.exposure_ratio = exposure_ratio
+            sample_scores: List[float] = []
+            violations: List[bool] = []
+            alphas: List[float] = []
 
-            # [vNext] Validation (Hard Gate)
-            passed, reason = validate_sample(metrics)
-
-            if not passed:
-                sample_score = float(config.EVAL_SCORE_MIN)
-                violation = True
-            else:
-                sample_score = score_sample(metrics)
-                violation = False
-
-            sample_scores.append(sample_score)
-            violations.append(violation)
-
-            if best_sample is None or sample_score > best_sample.sample_score:
-                best_sample = BestSample(
-                    sample_id=sample.sample_id,
-                    window_id=window_id,
+            for sample in samples:
+                sample_risk = _build_sample_risk_budget(risk_budget, sample.tp_pct, sample.sl_pct, sample.horizon)
+                
+                # [Optimization] Re-use base_signals, only re-run physical backtest
+                evaluator = RealEvaluator(cost_bps=cost_bps)
+                metrics, bt = evaluator.evaluate(
+                    df=window_df,
+                    signals=base_signals,
                     risk_budget=sample_risk,
-                    metrics=metrics,
-                    sample_score=sample_score,
-                    core=core,
+                    target_regime=regime_id,
                 )
 
-        agg = aggregate_sample_scores(sample_scores, violations)
-        avg_alpha = float(np.mean(alphas)) if alphas else 0.0
-        
-        window_results.append(
-            WindowResult(
-                window_id=window_id,
-                raw_score=agg["score"],
-                median_score=agg["median_score"],
-                p10_score=agg["p10_score"],
-                std_score=agg["std_score"],
-                violation_rate=agg["violation_rate"],
-                avg_alpha=avg_alpha,
-            )
-        )
+                # Alpha = Strat ROI - Bench ROI
+                alpha = evaluator.get_alpha(metrics)
+                alphas.append(alpha)
 
-    # [V11.4] After evaluation, compute trade logic for the overall best sample to provide feedback
-    if best_sample and "trade_logic" not in best_sample.core:
-        # We need X_features for that window
-        best_window_df = next(win_df for win_id, win_df in windows if win_id == best_sample.window_id)
-        X_best = X_full.loc[best_window_df.index]
-        
-        best_core_with_logic = _run_experiment_core(
+                # [vNext] Validation (Hard Gate)
+                passed, reason = validate_sample(metrics)
+                
+                # [V14] Track rejection for QA
+                from dataclasses import replace
+                metrics = replace(metrics, is_rejected=(not passed), rejection_reason=reason)
+
+                if not passed:
+                    sample_score = float(config.EVAL_SCORE_MIN)
+                    violation = True
+                else:
+                    sample_score = score_sample(metrics)
+                    violation = False
+
+                sample_scores.append(sample_score)
+                violations.append(violation)
+                
+                if best_sample is None or sample_score > best_sample.sample_score:
+                    # Capture core artifacts only for the best sample to save memory
+                    core = _run_experiment_core(
+                        policy_spec, window_df, X_window, sample_risk, include_trade_logic=False
+                    )
+                    best_sample = BestSample(
+                        sample_id=sample.sample_id,
+                        window_id=window_id,
+                        risk_budget=sample_risk,
+                        metrics=metrics,
+                        sample_score=sample_score,
+                        core=core,
+                        X_features=X_window,
+                        window_df=window_df
+                    )
+
+            agg = aggregate_sample_scores(sample_scores, violations)
+            avg_alpha = float(np.mean(alphas)) if alphas else 0.0
+            
+            window_results.append(
+                WindowResult(
+                    window_id=window_id,
+                    raw_score=agg["score"],
+                    median_score=agg["median_score"],
+                    p10_score=agg["p10_score"],
+                    std_score=agg["std_score"],
+                    violation_rate=agg["violation_rate"],
+                    avg_alpha=avg_alpha,
+                )
+            )
+
+        # [V11.4] After evaluation, compute trade logic for the overall best sample to provide feedback
+        if best_sample and "trade_logic" not in best_sample.core:
+            # We need X_features for that window
+            best_window_df = next(win_df for win_id, win_df in windows if win_id == best_sample.window_id)
+            X_best = X_full.loc[best_window_df.index]
+            
+            best_core_with_logic = _run_experiment_core(
+                policy_spec=policy_spec,
+                df=best_window_df,
+                X_features=X_best,
+                risk_budget=best_sample.risk_budget,
+                include_trade_logic=True,
+            )
+            best_sample.core["trade_logic"] = best_core_with_logic.get("trade_logic", {})
+            
+        # [V16] Reward Breakdown calculation for learning SSOT
+        reward_breakdown = None
+        if best_sample:
+            shaper = get_reward_shaper()
+            reward_breakdown = asdict(shaper.compute_breakdown(asdict(best_sample.metrics)))
+
+        return EvaluationResult(
             policy_spec=policy_spec,
-            df=best_window_df,
-            X_features=X_best,
-            risk_budget=best_sample.risk_budget,
-            include_trade_logic=True,
+            module_key=module_key,
+            score=config.EVAL_SCORE_MIN,
+            window_results=window_results,
+            best_sample=best_sample,
+            stage=stage,
+            reward_breakdown=reward_breakdown,
+            fingerprint=generate_policy_id(policy_spec)
         )
-        best_sample.core["trade_logic"] = best_core_with_logic.get("trade_logic", {})
-        
-    return ModuleResult(
-        policy_spec=policy_spec,
-        module_key=module_key,
-        score=config.EVAL_SCORE_MIN,
-        window_results=window_results,
-        best_sample=best_sample,
-        stage=stage,
-    )
+    except Exception as e:
+        import traceback
+        exc_type = type(e).__name__
+        err_msg = f"Worker Exception ({exc_type}): {str(e)}\n{traceback.format_exc()}"
+        logger.error(f"!!! [{stage}] Evaluation failed for {policy_spec.template_id}: {err_msg}")
+        return EvaluationResult(
+            policy_spec=policy_spec,
+            module_key="ERROR",
+            score=config.EVAL_SCORE_MIN,
+            window_results=[],
+            best_sample=None,
+            stage=stage,
+            metadata={"error": err_msg, "exc_type": exc_type}
+        )
 
 
 def _normalize_window_scores(results: List[ModuleResult]) -> None:
@@ -348,36 +523,35 @@ def _finalize_module_scores(results: List[ModuleResult]) -> None:
         std_score = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
         violation_rate = float(np.mean([w.violation_rate for w in r.window_results]))
 
-        # [V11.3] Walk-forward Consistency Gate
-        wf_failed = False
-        if config.WF_GATE_ENABLED and r.stage == "full":
-            if current_stage_idx == 1:
-                alpha_floor = config.WF_ALPHA_FLOOR_STAGE1
-            elif current_stage_idx == 2:
-                alpha_floor = config.WF_ALPHA_FLOOR_STAGE2
-            else:
-                alpha_floor = config.WF_ALPHA_FLOOR_STAGE3
-            
-            # 모든 구간에서 Alpha 가 하한선 이상이어야 함 (또는 대다수)
-            # 여기서는 '모근 구간 무조건 통과' 옵션 (Deterministic)
-            for w in r.window_results:
-                if w.avg_alpha < alpha_floor:
-                    wf_failed = True
-                    break
-
-        if violation_rate > 0.5 or wf_failed:
-             # [V11.3] WF 실패 시 Rejection 수준의 페널티
-             r.score = config.EVAL_SCORE_MIN
-        else:
-            r.score = (
-                median_score
-                + (config.EVAL_SCORE_W_RETURN_Q * p10_score)
-                - (config.EVAL_SCORE_W_VOL * std_score)
-                - (config.EVAL_SCORE_W_VIOLATION * violation_rate)
-            )
+        # [V15] Stage-based Walk-forward Alpha Consistency (Soft/Hard)
+        stage_id = config.CURRICULUM_CURRENT_STAGE
+        spec = config.CURRICULUM_STAGES.get(stage_id)
         
-        # 하한선 적용 (RL 안정성)
-        r.score = max(float(config.EVAL_SCORE_MIN), float(r.score))
+        alpha_floor = spec.alpha_floor if spec else -5.0
+        gate_mode = spec.wf_gate_mode if spec else "soft"
+        
+        alphas = [w.avg_alpha for w in r.window_results]
+        consistent_alpha = all(a >= alpha_floor for a in alphas)
+        
+        if not consistent_alpha and gate_mode == "hard":
+            r.score = config.EVAL_SCORE_MIN
+            continue
+            
+        # Base Score Calc
+        final_score = (
+            median_score
+            + (config.EVAL_SCORE_W_RETURN_Q * p10_score)
+            - (config.EVAL_SCORE_W_VOL * std_score)
+            - (config.EVAL_SCORE_W_VIOLATION * violation_rate)
+        )
+        
+        # Apply Soft Penalty if not consistent
+        if not consistent_alpha:
+            worst_alpha = min(alphas)
+            penalty = abs(worst_alpha - alpha_floor) * 10.0
+            final_score -= penalty
+            
+        r.score = max(float(config.EVAL_SCORE_MIN), float(final_score))
 
 
 def evaluate_stage(
@@ -386,7 +560,8 @@ def evaluate_stage(
     stage: str,
     regime_id: str,
     n_jobs: int,
-) -> List[ModuleResult]:
+    feature_map: Optional[Dict[str, pd.DataFrame]] = None, # [V12-O] Optional map
+) -> Tuple[List[EvaluationResult], str]:
     if not policies:
         return []
 
@@ -395,19 +570,164 @@ def evaluate_stage(
     elif stage == "reduced":
         sample_count = config.EVAL_RISK_SAMPLES_REDUCED
     else:
-        sample_count = config.EVAL_RISK_SAMPLES_FULL
+        # [V12-O] Curriculum-aware sample count
+        curr_stage = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
+        stage_cfg = config.CURRICULUM_STAGES.get(curr_stage)
+        if stage_cfg is not None and hasattr(stage_cfg, "eval_samples"):
+            sample_count = getattr(stage_cfg, "eval_samples")
+        else:
+            sample_count = config.EVAL_RISK_SAMPLES_FULL
 
-    results = Parallel(n_jobs=n_jobs, verbose=0)(
-        delayed(_evaluate_policy_windows)(policy, df, stage, regime_id, sample_count)
-        for policy in policies
-    )
+    # [V15] Check ResultStore first
+    store = get_result_store()
+    remaining_policies = []
+    final_results = [None] * len(policies)
+    
+    # Use any available window signature logic. Here we use 'stage' as part of sig.
+    for i, p in enumerate(policies):
+        p_sig = get_policy_sig(p)
+        w_sig = f"{stage}_{regime_id}"
+        cached = store.get(p_sig, w_sig)
+        if cached:
+            # logger.debug(f"[ResultStore] Hit for {p.template_id}")
+            final_results[i] = cached
+        else:
+            remaining_policies.append((i, p))
+            
+    if remaining_policies:
+        indices, subset = zip(*remaining_policies)
+        logger.info(f">>> [Evaluation] Running {len(subset)} / {len(policies)} policies (after ResultStore Filter)")
+        
+        from src.shared.logger import _log_queue, setup_worker_logging
+        def worker_setup(q):
+            setup_worker_logging(q)
+
+        subset_results = Parallel(
+            n_jobs=n_jobs, 
+            verbose=0,
+            initializer=worker_setup,
+            initargs=(_log_queue,)
+        )(
+            delayed(_evaluate_policy_windows)(
+                policy, df, stage, regime_id, sample_count, 
+                pre_X=feature_map.get(policy.template_id) if feature_map else None
+            )
+            for policy in subset
+        )
+        
+        for i, res in zip(indices, subset_results):
+            p_sig = get_policy_sig(policies[i])
+            w_sig = f"{stage}_{regime_id}"
+            store.put(p_sig, w_sig, res)
+            final_results[i] = res
+
+    # results = Parallel(n_jobs=n_jobs, verbose=0)( ... ) removed and replaced above
+    results = final_results
+
+    # [V14] Aggregate QA across all modules
+    qa_collector = OperationalQACollector(stage)
+    qa_collector.similarity_analysis(policies) # [V14] Check batch redundancy early
+    for res in results:
+        if res.best_sample:
+            qa_collector.collect(
+                passed=not res.best_sample.metrics.is_rejected,
+                reason=res.best_sample.metrics.rejection_reason,
+                metrics=res.best_sample.metrics
+            )
+        elif res.module_key == "ERROR":
+            qa_collector.collect(
+                passed=False,
+                reason=f"EXCEPTION_{res.metadata.get('exc_type', 'UNKNOWN')}",
+                metrics=None
+            )
+    diagnostic_status = qa_collector.report()
 
     _normalize_window_scores(results)
     _finalize_module_scores(results)
-    return results
+    return results, diagnostic_status
 
 
-def select_top_modules(results: List[ModuleResult], top_pct: float, top_k: int = 0) -> List[ModuleResult]:
+def evaluate_v12_batch(
+    policies: List[PolicySpec],
+    df: pd.DataFrame,
+    regime_id: str,
+    n_jobs: int,
+) -> Tuple[List[EvaluationResult], str]:
+    """
+    V12-BT Batch Evaluation Orchestrator
+    Implements 2-stage (Fast -> Real) evaluation for a batch of policies.
+    """
+    if not policies:
+        return []
+
+    # [V15] Lazy Feature Generation (Remove pre-calculating X_list to avoid OOM)
+    # 1. Stage 1: Fast Filter (All Policies)
+    logger.info(f">>> [V12-BT] Stage 1: Fast Filtering {len(policies)} candidates...")
+    inst = get_instrumentation()
+    s1_start = time.time()
+    
+    def get_candidate_signal_lazy(p: PolicySpec):
+        # Generate features locally in the worker
+        X = _generate_features_cached(df.values, df.columns.tolist(), df.index, p.feature_genome)
+        # Train & Predict
+        core = _run_experiment_core(p, df, X, p.risk_budget or {}, include_trade_logic=False)
+        sig = core.get("results_df", pd.DataFrame()).get("pred", pd.Series(dtype=int))
+        return sig
+
+    all_signals = Parallel(n_jobs=n_jobs)(
+        delayed(get_candidate_signal_lazy)(p) for p in policies
+    )
+    
+    fast_filter = FastFilter()
+    fast_scores = fast_filter.score_batch(df, all_signals, [p.risk_budget for p in policies])
+    s1_duration = time.time() - s1_start
+    
+    # Record S1 Metrics
+    # In S1, "pass" means the score is above some threshold, but here we promote top_n.
+    # Let's define pass as score > config.EVAL_SCORE_MIN
+    s1_pass_count = len([s for s in fast_scores if s > config.EVAL_SCORE_MIN])
+    inst.record_stage1(s1_duration, s1_pass_count / len(policies) if policies else 0)
+
+    scored_policies = list(zip(fast_scores, policies))
+    
+    # Selection (Mixed Strategy: Elites + Explorers)
+    top_n = getattr(config, "V12_ELITE_TOP_N", 5)
+    
+    from src.evaluation.dual_stage import DualStageEvaluator
+    ds_eval = DualStageEvaluator()
+    promoted_policies = ds_eval.select_mixed_candidates(scored_policies, elite_n=top_n)
+    promoted_templates = {p.template_id for p in promoted_policies}
+    
+    logger.info(f">>> [V12-BT] Stage 2: Detailed Evaluation for {len(promoted_policies)} promoted candidates...")
+    
+    # 2. Stage 2: Detailed Evaluation (Promoted only)
+    # feature_map=None as it will be generated locally in workers
+    promoted_results, diagnostic_status = evaluate_stage(promoted_policies, df, "full", regime_id, n_jobs, feature_map=None)
+    
+    # 3. Handle Filtered (Give them base scores/ModuleResults)
+    promoted_map = {res.policy_spec.template_id: res for res in promoted_results}
+    final_results = []
+    
+    for i, p in enumerate(policies):
+        if p.template_id in promoted_map:
+            final_results.append(promoted_map[p.template_id])
+        else:
+            # Create a placeholder ModuleResult for others
+            # Mark score as EVAL_SCORE_MIN but we can add feedback later if needed
+            final_results.append(EvaluationResult(
+                policy_spec=p,
+                module_key="filtered_out",
+                score=config.EVAL_SCORE_MIN,
+                window_results=[],
+                best_sample=None,
+                stage="filtered",
+                fingerprint=generate_policy_id(p)
+            ))
+            
+    return final_results, diagnostic_status
+
+
+def select_top_modules(results: List[EvaluationResult], top_pct: float, top_k: int = 0) -> List[EvaluationResult]:
     if not results:
         return []
     results_sorted = sorted(results, key=lambda r: r.score, reverse=True)
@@ -419,38 +739,55 @@ def select_top_modules(results: List[ModuleResult], top_pct: float, top_k: int =
 
 def persist_best_samples(
     repo,
-    results: List[ModuleResult],
-    df: pd.DataFrame,
+    results: List[EvaluationResult],
+    existing_ids: Optional[set] = None,
 ) -> int:
+    """
+    [V16] One-Pass Persistence
+    Saves already evaluated results to the ledger without re-calculating.
+    """
     saved = 0
+    skipped = 0
+    existing_ids = existing_ids or set()
+    
     for r in results:
+        # Duplication check (Structural ID)
+        if r.policy_spec.spec_id in existing_ids:
+            skipped += 1
+            continue
+
         best = r.best_sample
         if best is None:
             continue
+            
+        # [V16] Use pre-captured artifacts
         spec = copy.deepcopy(r.policy_spec)
         spec.risk_budget = best.risk_budget
-        windows = {win_id: win_df for win_id, win_df in build_windows(df, r.stage)}
-        window_df = windows.get(best.window_id, df)
-        df_local = window_df.copy()
-        df_local.columns = [c.lower() for c in df_local.columns]
-        X_full = _generate_features_cached(
-            df_values=df_local.values,
-            df_columns=df_local.columns.tolist(),
-            df_index=df_local.index,
-            genome=r.policy_spec.feature_genome,
-        )
+        
+        df_local = best.window_df
+        if df_local is None:
+            logger.warning(f"No window_df for {spec.spec_id}, skipping persistence.")
+            continue
+            
+        X_full = best.X_features
+        if X_full is None:
+            logger.warning(f"No X_features for {spec.spec_id}, skipping persistence.")
+            continue
+            
         scorecard = {
             "eval_score": r.score,
             "eval_stage": r.stage,
             "module_key": r.module_key,
             "sample_id": best.sample_id,
             "sample_window_id": best.window_id,
-            "sample_total_return_pct": best.metrics.total_return_pct,
-            "sample_mdd_pct": best.metrics.mdd_pct,
-            "sample_rr": best.metrics.reward_risk,
-            "sample_vol_pct": best.metrics.vol_pct,
-            "sample_trades": best.metrics.trade_count,
-            "sample_win_rate": best.metrics.win_rate,
+            "sample_total_return_pct": best.metrics.equity.total_return_pct,
+            "sample_mdd_pct": best.metrics.equity.max_drawdown_pct,
+            "sample_rr": best.metrics.trades.reward_risk,
+            "sample_vol_pct": best.metrics.equity.vol_pct,
+            "sample_trades": best.metrics.trades.trade_count,
+            "sample_win_rate": best.metrics.trades.win_rate,
+            "fingerprint": r.fingerprint,
+            "reward_breakdown": r.reward_breakdown
         }
 
         record, artifact = build_record_and_artifact(
@@ -462,6 +799,11 @@ def persist_best_samples(
             module_key=r.module_key,
             eval_stage=r.stage,
         )
+        
+        # Check for duplication (via fingerprint/policy_id check if repo supports it)
+        # For now, we trust the caller to have checked or we just save.
         repo.save_record(record, artifact)
         saved += 1
+    if saved > 0 or skipped > 0:
+        logger.info(f">>> [Persistence] Saved {saved} | Skipped {skipped} (One-Pass).")
     return saved

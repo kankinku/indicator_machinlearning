@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
+from src.shared.stage_schema import StageSpec
 
 load_dotenv()
 
@@ -91,6 +92,7 @@ class BaseConfig:
     RL_EPSILON_START: float = field(default_factory=lambda: float(os.getenv("RL_EPSILON_START", "0.7")))
     RL_EPSILON_DECAY: float = field(default_factory=lambda: float(os.getenv("RL_EPSILON_DECAY", "0.998")))
     RL_EPSILON_MIN: float = field(default_factory=lambda: float(os.getenv("RL_EPSILON_MIN", "0.05")))
+    RL_EPSILON_MAX: float = 0.8
     
     # [V10] Epsilon Reheat - 정책 고착 방지
     RL_EPSILON_REHEAT_ENABLED: bool = True
@@ -108,34 +110,19 @@ class BaseConfig:
     D3QN_BUFFER_SIZE: int = 10000
     D3QN_BATCH_SIZE: int = 64
     D3QN_MIN_BUFFER_SIZE: int = 500
+    D3QN_UPDATE_FREQ: int = 4
+    D3QN_TARGET_UPDATE_FREQ: int = 100
     D3QN_EPSILON: float = 0.5      # Initial epsilon (if not using RL_EPSILON)
     D3QN_EPSILON_DECAY: float = 0.995
     D3QN_EPSILON_MIN: float = 0.05
     D3QN_REHEAT_PERIOD: int = 200
     D3QN_REHEAT_EPSILON: float = 0.3
+    STATE_WINDOW_SIZE: int = 20
+    STATE_FEATURE_DIM: int = 12
     
     # [V11.2] Gate Rejection Settings
     RL_REJECT_SCORE: float = -50.0          # Gate 실패 시 부여할 강력한 패널티 점수
     RL_SKIP_LEARNING_ON_REJECTION: bool = False  # True면 실패한 경험은 학습 데이터에서 제외 (비권장)
-    
-    # ----------------------------------------
-    # D3QN Settings
-    # ----------------------------------------
-    D3QN_ENABLED: bool = field(default_factory=lambda: os.getenv("D3QN_ENABLED", "true").lower() == "true")
-    D3QN_HIDDEN_DIM: int = 256
-    D3QN_LEARNING_RATE: float = 1e-4
-    D3QN_GAMMA: float = 0.99
-    D3QN_TAU: float = 0.005
-    D3QN_BUFFER_SIZE: int = 10000
-    # [V11] 배치 크기 축소 - 작은 버퍼에서도 학습 가능
-    D3QN_BATCH_SIZE: int = 32
-    # [V11] 버퍼 최소 크기 대폭 축소 - 빠른 학습 시작
-    # 기존: 500 (너무 늦음) → 100 (100번 실험 후 학습 시작)
-    D3QN_MIN_BUFFER_SIZE: int = 100
-    D3QN_UPDATE_FREQ: int = 4
-    D3QN_TARGET_UPDATE_FREQ: int = 100
-    STATE_WINDOW_SIZE: int = 20
-    STATE_FEATURE_DIM: int = 12
     
     # =========================================================
     # [V11] Reward Shaping - 설계도 기반 전면 개선
@@ -311,47 +298,91 @@ class BaseConfig:
     # [V11] Curriculum Learning - 설계도 기반 단계별 목표
     # "500%는 목표이지 출발선이 아니다"
     # =========================================================
+    # [V13-PRO] Complexity Management
+    SCORE_W_COMPLEXITY: float = 2.0    # Token complexity penalty
+    
     CURRICULUM_ENABLED: bool = True
-    CURRICULUM_STAGES: dict = field(default_factory=lambda: {
-        1: {
-            "min_trades": 10,
-            "max_mdd_pct": 60.0,
-            "min_winrate": 0.25,
-            "max_winrate": 0.90,
-            "min_alpha": 0.0,
-            "target_return_pct": 50.0,
-            "description": "Stage 1: 기초 활동성 및 생존 필터"
-        },
-        2: {
-            "min_trades": 30,
-            "max_mdd_pct": 55.0,
-            "min_winrate": 0.30,
-            "max_winrate": 0.85,
-            "min_alpha": 0.0,
-            "target_return_pct": 150.0,
-            "description": "Stage 2: 수익성 개선 및 정밀 타격"
-        },
-        3: {
-            "min_trades": 80,
-            "max_mdd_pct": 50.0,
-            "min_winrate": 0.30,
-            "max_winrate": 0.85,
-            "min_alpha": 0.0,
-            "target_return_pct": 250.0,
-            "description": "Stage 3: 안정적 고수익 및 R:R 최적화"
-        },
-        4: {
-            "min_trades": 150,
-            "max_mdd_pct": 45.0,
-            "min_winrate": 0.35,
-            "max_winrate": 0.80,
-            "min_alpha": 0.0,
-            "target_return_pct": 500.0,
-            "description": "Stage 4: 장기 복리 알파 전략 완성"
-        },
+    CURRICULUM_STAGES: Dict[int, StageSpec] = field(default_factory=lambda: {
+        1: StageSpec(
+            stage_id=1,
+            name="Discovery",
+            target_return_pct=15.0,     # Annualized base target
+            alpha_floor=-5.0,          # Allow negative alpha during discovery
+            min_trades_per_year=6.0,
+            max_mdd_pct=40.0,
+            min_profit_factor=1.0,
+            and_terms_range=(1, 2),
+            quantile_bias="center",
+            wf_splits=3,
+            wf_gate_mode="soft",
+            exploration_slot=0.4
+        ),
+        2: StageSpec(
+            stage_id=2,
+            name="Survival",
+            target_return_pct=30.0,
+            alpha_floor=0.0,
+            min_trades_per_year=12.0,
+            max_mdd_pct=25.0,
+            min_profit_factor=1.1,
+            and_terms_range=(2, 3),
+            quantile_bias="spread",
+            wf_splits=3,
+            wf_gate_mode="soft",
+            exploration_slot=0.2
+        ),
+        3: StageSpec(
+            stage_id=3,
+            name="Deployment",
+            target_return_pct=60.0,
+            alpha_floor=15.0,           # High edge required
+            min_trades_per_year=15.0,
+            max_mdd_pct=15.0,
+            min_profit_factor=1.3,
+            and_terms_range=(2, 4),
+            quantile_bias="tail",
+            wf_splits=5,
+            wf_gate_mode="hard",
+            exploration_slot=0.1
+        )
     })
     CURRICULUM_CURRENT_STAGE: int = 1
-    CURRICULUM_STAGE_UP_THRESHOLD: int = 10  # N개 통과 시 다음 Stage로 승급
+    CURRICULUM_STAGE_UP_THRESHOLD: int = 5
+    
+    # [V14] Failure Taxonomy Tree
+    # Categories: SIGNAL, EDGE, RISK, COMPLEXITY, DATA
+    FAILURE_TAXONOMY: dict = field(default_factory=lambda: {
+        "SIGNAL_ISSUE": ["FAIL_MIN_TRADES", "FAIL_LOW_EXPOSURE", "FAIL_ZERO_EXPOSURE", "FAIL_OVER_EXPOSURE"],
+        "EDGE_ISSUE": ["FAIL_LOW_RETURN", "FAIL_NEG_ALPHA", "FAIL_PF", "FAIL_WINRATE_LOW", "FAIL_WINRATE_HIGH"],
+        "RISK_ISSUE": ["FAIL_MDD_BREACH", "FAIL_LUCKY_STRIKE", "FAIL_WORST_WINDOW"],
+        "COMPLEXITY_ISSUE": ["FAIL_COMPLEXITY_HIGH", "FAIL_AST_DEPTH"],
+        "DATA_ISSUE": ["FAIL_QUANTILE_COLLISION", "FAIL_MISSING_DATA", "FAIL_FEATURE_COLLAPSE"]
+    })
+
+    # [V14] Stage Health Diagnostic Rules
+    # (min_pass_rate, target_rejection_rate, target_annual_trades)
+    STAGE_HEALTH_RULES: dict = field(default_factory=lambda: {
+        1: { # Discovery
+            "rejection_rate_range": (0.3, 0.8),
+            "median_tpy_range": (10, 50),
+            "min_pass_rate": 0.2
+        },
+        2: { # Survival
+            "rejection_rate_range": (0.6, 0.95),
+            "median_tpy_range": (8, 30),
+            "min_pass_rate": 0.05,
+            "min_median_excess_pa": -1.0
+        },
+        3: { # Deployment
+            "rejection_rate_range": (0.8, 0.99),
+            "min_pass_rate": 0.01,
+            "min_oos_pass_rate": 0.01
+        }
+    })
+
+    # [V14] Stagnation Detection
+    STAGNATION_BATCH_WINDOW: int = 5
+    STAGNATION_MIN_PROGRESS: float = 0.01 # Reward improvement floor
     
     # =========================================================
     # [V11.3] New Features: Stability & Diversity

@@ -54,7 +54,7 @@ class ContextFeatureGenerator:
         df.columns = [c.lower() for c in df.columns]
         
         features = pd.DataFrame(index=df.index)
-        close = df["close"]
+        close = pd.to_numeric(df["close"], errors='coerce')
         
         # ============================================
         # 1. CTX_VIX - 변동성 상태 (정규화: 0~1)
@@ -62,7 +62,7 @@ class ContextFeatureGenerator:
         # 실제 VIX가 있으면 사용, 없으면 실현변동성으로 대체
         if "vix_close" in df.columns or "vix" in df.columns:
             vix_col = "vix_close" if "vix_close" in df.columns else "vix"
-            vix = df[vix_col]
+            vix = pd.to_numeric(df[vix_col], errors='coerce')
             # VIX 정규화 (10~80 → 0~1)
             features["CTX_VIX"] = ((vix - 10) / 70).clip(0, 1)
             features["CTX_VIX_CHANGE"] = vix.pct_change(5).clip(-0.5, 0.5)
@@ -128,12 +128,17 @@ class ContextFeatureGenerator:
         # 레짐 카테고리 (연속값 → 이산값)
         # -1~-0.3: RISK_OFF, -0.3~0.3: NEUTRAL, 0.3~1: RISK_ON
         def categorize_regime(score):
-            if score < -0.3:
-                return -1  # RISK_OFF
-            elif score > 0.3:
-                return 1   # RISK_ON
-            else:
-                return 0   # NEUTRAL
+            try:
+                if pd.isna(score) or not isinstance(score, (int, float, np.number)):
+                    return 0
+                if score < -0.3:
+                    return -1  # RISK_OFF
+                elif score > 0.3:
+                    return 1   # RISK_ON
+                else:
+                    return 0   # NEUTRAL
+            except:
+                return 0
         
         features["CTX_REGIME_CAT"] = features["CTX_REGIME"].apply(categorize_regime)
         
@@ -151,8 +156,9 @@ class ContextFeatureGenerator:
         # 6. CTX_VOLUME - 거래량 상태 (추가)
         # ============================================
         if "volume" in df.columns:
-            vol_ma = df["volume"].rolling(20).mean()
-            volume_ratio = df["volume"] / (vol_ma + 1e-8)
+            volume = pd.to_numeric(df["volume"], errors='coerce')
+            vol_ma = volume.rolling(20).mean()
+            volume_ratio = volume / (vol_ma + 1e-8)
             # 0~3 → 0~1
             features["CTX_VOLUME"] = (volume_ratio / 3).clip(0, 1)
         else:
