@@ -32,12 +32,13 @@ class ATRIndicator:
         atr = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=window)
         vals = atr.average_true_range()
         atr_norm = vals / df["close"] * 100
-        return pd.DataFrame({f"ATR_{window}": vals, f"ATR_norm_{window}": atr_norm}, index=df.index)
+        return pd.DataFrame({"atr": vals, "atr_norm": atr_norm}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLATILITY_ATR_V1", name="Average True Range", category="VOLATILITY",
         description="Standard ATR and Normalized ATR.", code_snippet=atr_code, handler_func="ATRIndicator",
-        params=[TunableParamSpec(name="window", param_type="int", min=5, max=50, default=14)], source="builtin"
+        params=[TunableParamSpec(name="window", param_type="int", min=5, max=50, default=14)], source="builtin",
+        outputs={"value": "atr", "norm": "atr_norm"}
     ))
 
     # Bollinger Bands
@@ -49,9 +50,9 @@ class BBIndicator:
     def compute(self, df: pd.DataFrame, window: int = 20, std_dev: float = 2.0) -> pd.DataFrame:
         bb = ta.volatility.BollingerBands(df["close"], window=window, window_dev=std_dev)
         return pd.DataFrame({
-            f"BB_upper_{window}": bb.bollinger_hband(),
-            f"BB_lower_{window}": bb.bollinger_lband(),
-            f"BB_width_{window}": bb.bollinger_wband()
+            "upper": bb.bollinger_hband(),
+            "lower": bb.bollinger_lband(),
+            "width": bb.bollinger_wband()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -60,7 +61,8 @@ class BBIndicator:
         params=[
             TunableParamSpec(name="window", param_type="int", min=10, max=50, default=20),
             TunableParamSpec(name="std_dev", param_type="float", min=1.5, max=3.0, default=2.0, step=0.1)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"upper": "upper", "lower": "lower", "width": "width", "value": "width"}
     ))
     
     # Keltner Channels
@@ -86,8 +88,8 @@ class KCIndicator:
         lower = ema - (scalar * atr)
         
         return pd.DataFrame({
-            f"KC_upper_{length}_{scalar}": upper,
-            f"KC_lower_{length}_{scalar}": lower
+            "upper": upper,
+            "lower": lower
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -96,7 +98,8 @@ class KCIndicator:
         params=[
             TunableParamSpec(name="length", param_type="int", min=10, max=50, default=20),
             TunableParamSpec(name="scalar", param_type="float", min=1.0, max=3.0, default=2.0, step=0.1)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "upper", "upper": "upper", "lower": "lower"}
     ))
 
     # Donchian Channels
@@ -112,8 +115,8 @@ class DonchianIndicator:
         window = max(lower_length, upper_length)
         dc = ta.volatility.DonchianChannel(df["high"], df["low"], df["close"], window=window)
         return pd.DataFrame({
-            f"DC_high_{window}": dc.donchian_channel_hband(),
-            f"DC_low_{window}": dc.donchian_channel_lband()
+            "high": dc.donchian_channel_hband(),
+            "low": dc.donchian_channel_lband()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -122,7 +125,8 @@ class DonchianIndicator:
         params=[
             TunableParamSpec(name="lower_length", param_type="int", min=10, max=50, default=20),
             TunableParamSpec(name="upper_length", param_type="int", min=10, max=50, default=20)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "high", "upper": "high", "lower": "low"}
     ))
     
     # ==========================
@@ -138,8 +142,8 @@ class RSIIndicator:
     def compute(self, df: pd.DataFrame, window: int = 14, threshold_low: int = 30, threshold_high: int = 70) -> pd.DataFrame:
         rsi = ta.momentum.RSIIndicator(df["close"], window=window).rsi()
         return pd.DataFrame({
-            f"RSI_{window}": rsi,
-            f"RSI_signal_{window}": rsi.apply(lambda x: 1 if x < threshold_low else (-1 if x > threshold_high else 0))
+            "rsi": rsi,
+            "signal": rsi.apply(lambda x: 1 if x < threshold_low else (-1 if x > threshold_high else 0))
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -149,7 +153,8 @@ class RSIIndicator:
             TunableParamSpec(name="window", param_type="int", min=5, max=50, default=14),
             TunableParamSpec(name="threshold_low", param_type="int", min=20, max=40, default=30),
             TunableParamSpec(name="threshold_high", param_type="int", min=60, max=80, default=70)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "rsi", "signal": "signal"}
     ))
 
     # MACD
@@ -161,9 +166,9 @@ class MACDIndicator:
     def compute(self, df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
         macd = ta.trend.MACD(df["close"], window_slow=slow, window_fast=fast, window_sign=signal)
         return pd.DataFrame({
-            f"MACD_line_{fast}_{slow}": macd.macd(),
-            f"MACD_diff_{fast}_{slow}": macd.macd_diff(),
-            f"MACD_sig_{fast}_{slow}": macd.macd_signal()
+            "line": macd.macd(),
+            "diff": macd.macd_diff(),
+            "signal": macd.macd_signal()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -173,7 +178,8 @@ class MACDIndicator:
             TunableParamSpec(name="fast", param_type="int", min=5, max=20, default=12),
             TunableParamSpec(name="slow", param_type="int", min=21, max=50, default=26),
             TunableParamSpec(name="signal", param_type="int", min=5, max=15, default=9)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "line", "diff": "diff", "signal": "signal"}
     ))
 
     # Stochastic (Existing)
@@ -185,8 +191,8 @@ class StochIndicator:
     def compute(self, df: pd.DataFrame, window: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> pd.DataFrame:
         stoch = ta.momentum.StochasticOscillator(df["high"], df["low"], df["close"], window=window, smooth_window=smooth_k)
         return pd.DataFrame({
-            f"STOCH_k_{window}": stoch.stoch(),
-            f"STOCH_d_{window}": stoch.stoch_signal()
+            "k": stoch.stoch(),
+            "d": stoch.stoch_signal()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -196,7 +202,8 @@ class StochIndicator:
             TunableParamSpec(name="window", param_type="int", min=5, max=50, default=14),
             TunableParamSpec(name="smooth_k", param_type="int", min=1, max=10, default=3),
             TunableParamSpec(name="smooth_d", param_type="int", min=1, max=10, default=3)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "k", "signal": "d"}
     ))
 
     # CCI (Existing)
@@ -208,7 +215,7 @@ class CCIIndicator:
     def compute(self, df: pd.DataFrame, length: int = 20, c: float = 0.015) -> pd.DataFrame:
         # Fixed: ta.trend.CCIIndicator for updated library versions
         vals = ta.trend.CCIIndicator(df["high"], df["low"], df["close"], window=length, constant=c).cci()
-        return pd.DataFrame({f"CCI_{length}": vals}, index=df.index)
+        return pd.DataFrame({"cci": vals}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="MOMENTUM_CCI_V1", name="Commodity Channel Index", category="MOMENTUM",
@@ -216,7 +223,8 @@ class CCIIndicator:
         params=[
             TunableParamSpec(name="length", param_type="int", min=10, max=100, default=20),
             TunableParamSpec(name="c", param_type="float", min=0.01, max=0.05, default=0.015)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "cci"}
     ))
 
     # ROC
@@ -227,12 +235,13 @@ import ta
 class ROCIndicator:
     def compute(self, df: pd.DataFrame, length: int = 10) -> pd.DataFrame:
         vals = ta.momentum.ROCIndicator(df["close"], window=length).roc()
-        return pd.DataFrame({f"ROC_{length}": vals}, index=df.index)
+        return pd.DataFrame({"roc": vals}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="MOMENTUM_ROC_V1", name="Rate of Change", category="MOMENTUM",
         description="Rate of Change (%).", code_snippet=roc_code, handler_func="ROCIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=1, max=30, default=10)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=1, max=30, default=10)], source="builtin",
+        outputs={"value": "roc"}
     ))
 
     # Williams %R
@@ -243,12 +252,13 @@ import ta
 class WillRIndicator:
     def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
         vals = ta.momentum.WilliamsRIndicator(df["high"], df["low"], df["close"], lbp=length).williams_r()
-        return pd.DataFrame({f"WILLR_{length}": vals}, index=df.index)
+        return pd.DataFrame({"willr": vals}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="MOMENTUM_WILLR_V1", name="Williams %R", category="MOMENTUM",
         description="Williams %R.", code_snippet=willr_code, handler_func="WillRIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=14)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=14)], source="builtin",
+        outputs={"value": "willr"}
     ))
     
     # Momentum (Simple Diff)
@@ -259,12 +269,13 @@ class MomIndicator:
     def compute(self, df: pd.DataFrame, length: int = 10) -> pd.DataFrame:
         # Simple Momentum: Price - Price(n)
         vals = df["close"].diff(periods=length)
-        return pd.DataFrame({f"MOM_{length}": vals}, index=df.index)
+        return pd.DataFrame({"mom": vals}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="MOMENTUM_MOM_V1", name="Momentum", category="MOMENTUM",
         description="Simple Price Momentum.", code_snippet=mom_code, handler_func="MomIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=1, max=30, default=10)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=1, max=30, default=10)], source="builtin",
+        outputs={"value": "mom"}
     ))
 
     # CMO (Using RSI transform)
@@ -277,19 +288,20 @@ class CMOIndicator:
         # CMO = (RSI - 50) * 2
         rsi = ta.momentum.RSIIndicator(df["close"], window=length).rsi()
         cmo = (rsi - 50) * 2
-        return pd.DataFrame({f"CMO_{length}": cmo}, index=df.index)
+        return pd.DataFrame({"cmo": cmo}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="MOMENTUM_CMO_V1", name="Chande Momentum Oscillator", category="MOMENTUM",
         description="CMO Derived from RSI.", code_snippet=cmo_code, handler_func="CMOIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=14)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=14)], source="builtin",
+        outputs={"value": "cmo"}
     ))
 
     # ==========================
     # 3. TREND
     # ==========================
     
-    # MA Cross (Existing)
+    # MA Cross
     macross_code = """
 import pandas as pd
 import ta
@@ -304,7 +316,7 @@ class MACrossIndicator:
             ma_s = ta.trend.SMAIndicator(df["close"], window=slow).sma_indicator()
             
         cross_spread = (ma_f - ma_s) / (ma_s + 1e-6)
-        return pd.DataFrame({f"MA_spread_{fast}_{slow}": cross_spread}, index=df.index)
+        return pd.DataFrame({"spread": cross_spread}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="TREND_MACROSS_V1", name="Moving Average Crossover", category="TREND",
@@ -312,7 +324,8 @@ class MACrossIndicator:
         params=[
             TunableParamSpec(name="fast", param_type="int", min=5, max=50, default=20),
             TunableParamSpec(name="slow", param_type="int", min=20, max=200, default=60)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "spread"}
     ))
     
     # ADX
@@ -325,9 +338,9 @@ class ADXIndicator:
         # Note: ta ADX takes window param
         adx = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=length)
         return pd.DataFrame({
-            f"ADX_{length}": adx.adx(),
-            f"ADX_pos_{length}": adx.adx_pos(),
-            f"ADX_neg_{length}": adx.adx_neg()
+            "adx": adx.adx(),
+            "pos": adx.adx_pos(),
+            "neg": adx.adx_neg()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -335,7 +348,8 @@ class ADXIndicator:
         description="ADX Strength and Direction.", code_snippet=adx_code, handler_func="ADXIndicator",
         params=[
             TunableParamSpec(name="length", param_type="int", min=5, max=50, default=14)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "adx", "pos": "pos", "neg": "neg"}
     ))
 
     # TRIX
@@ -346,12 +360,13 @@ import ta
 class TRIXIndicator:
     def compute(self, df: pd.DataFrame, length: int = 30) -> pd.DataFrame:
         t = ta.trend.TRIXIndicator(df["close"], window=length)
-        return pd.DataFrame({f"TRIX_{length}": t.trix()}, index=df.index)
+        return pd.DataFrame({"trix": t.trix()}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="TREND_TRIX_V1", name="Triple Exponential Average", category="TREND",
         description="TRIX Oscillator.", code_snippet=trix_code, handler_func="TRIXIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=10, max=50, default=30)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=10, max=50, default=30)], source="builtin",
+        outputs={"value": "trix"}
     ))
 
     # Ichimoku
@@ -363,10 +378,10 @@ class IchimokuIndicator:
     def compute(self, df: pd.DataFrame, tenkan: int = 9, kijun: int = 26, senkou: int = 52) -> pd.DataFrame:
         ichi = ta.trend.IchimokuIndicator(df["high"], df["low"], window1=tenkan, window2=kijun, window3=senkou)
         return pd.DataFrame({
-            f"ICHI_conv_{tenkan}": ichi.ichimoku_conversion_line(),
-            f"ICHI_base_{kijun}": ichi.ichimoku_base_line(),
-            f"ICHI_spanA_{senkou}": ichi.ichimoku_a(),
-            f"ICHI_spanB_{senkou}": ichi.ichimoku_b()
+            "conv": ichi.ichimoku_conversion_line(),
+            "base": ichi.ichimoku_base_line(),
+            "spanA": ichi.ichimoku_a(),
+            "spanB": ichi.ichimoku_b()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -376,7 +391,8 @@ class IchimokuIndicator:
             TunableParamSpec(name="tenkan", param_type="int", min=5, max=20, default=9),
             TunableParamSpec(name="kijun", param_type="int", min=20, max=40, default=26),
             TunableParamSpec(name="senkou", param_type="int", min=40, max=60, default=52)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "conv", "conv": "conv", "base": "base", "spanA": "spanA", "spanB": "spanB"}
     ))
 
     # Supertrend (Manual)
@@ -450,9 +466,9 @@ class SupertrendIndicator:
                     tr[i] = -1
                     
         return pd.DataFrame({
-            f"SUP_trend_{length}_{multiplier}": tr,
-            f"SUP_upper_{length}_{multiplier}": fu,
-            f"SUP_lower_{length}_{multiplier}": fl
+            "trend": tr,
+            "upper": fu,
+            "lower": fl
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -461,7 +477,8 @@ class SupertrendIndicator:
         params=[
             TunableParamSpec(name="length", param_type="int", min=5, max=20, default=7),
             TunableParamSpec(name="multiplier", param_type="float", min=1.0, max=4.0, default=3.0, step=0.5)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "trend", "upper": "upper", "lower": "lower"}
     ))
 
     # ==========================
@@ -481,7 +498,8 @@ class OBVIndicator:
     registry.register(FeatureMetadata(
         feature_id="VOLUME_OBV_V1", name="On-Balance Volume", category="VOLUME",
         description="On-Balance Volume.", code_snippet=obv_code, handler_func="OBVIndicator",
-        params=[], source="builtin"
+        params=[], source="builtin",
+        outputs={"value": "OBV"}
     ))
 
     # MFI
@@ -492,12 +510,13 @@ import ta
 class MFIIndicator:
     def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
         mfi = ta.volume.MFIIndicator(df["high"], df["low"], df["close"], df["volume"], window=length).money_flow_index()
-        return pd.DataFrame({f"MFI_{length}": mfi}, index=df.index)
+        return pd.DataFrame({"mfi": mfi}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLUME_MFI_V1", name="Money Flow Index", category="VOLUME",
         description="Money Flow Index.", code_snippet=mfi_code, handler_func="MFIIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=14)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=14)], source="builtin",
+        outputs={"value": "mfi"}
     ))
 
     # CMF
@@ -508,12 +527,13 @@ import ta
 class CMFIndicator:
     def compute(self, df: pd.DataFrame, length: int = 20) -> pd.DataFrame:
         cmf = ta.volume.ChaikinMoneyFlowIndicator(df["high"], df["low"], df["close"], df["volume"], window=length).chaikin_money_flow()
-        return pd.DataFrame({f"CMF_{length}": cmf}, index=df.index)
+        return pd.DataFrame({"cmf": cmf}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLUME_CMF_V1", name="Chaikin Money Flow", category="VOLUME",
         description="Chaikin Money Flow.", code_snippet=cmf_code, handler_func="CMFIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=10, max=30, default=20)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=10, max=30, default=20)], source="builtin",
+        outputs={"value": "cmf"}
     ))
 
     # EOM
@@ -524,12 +544,13 @@ import ta
 class EOMIndicator:
     def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
         eom = ta.volume.EaseOfMovementIndicator(df["high"], df["low"], df["volume"], window=length).ease_of_movement()
-        return pd.DataFrame({f"EOM_{length}": eom}, index=df.index)
+        return pd.DataFrame({"eom": eom}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLUME_EOM_V1", name="Ease of Movement", category="VOLUME",
         description="Ease of Movement.", code_snippet=eom_code, handler_func="EOMIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=14)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=14)], source="builtin",
+        outputs={"value": "eom"}
     ))
 
     # ==========================
@@ -545,9 +566,9 @@ class PSARIndicator:
     def compute(self, df: pd.DataFrame, step: float = 0.02, max_step: float = 0.2) -> pd.DataFrame:
         psar = ta.trend.PSARIndicator(df["high"], df["low"], df["close"], step=step, max_step=max_step)
         return pd.DataFrame({
-            f"PSAR_{step}_{max_step}": psar.psar(),
-            f"PSAR_up_{step}_{max_step}": psar.psar_up(),
-            f"PSAR_down_{step}_{max_step}": psar.psar_down()
+            "psar": psar.psar(),
+            "up": psar.psar_up(),
+            "down": psar.psar_down()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -556,7 +577,8 @@ class PSARIndicator:
         params=[
             TunableParamSpec(name="step", param_type="float", min=0.01, max=0.05, default=0.02, step=0.01),
             TunableParamSpec(name="max_step", param_type="float", min=0.1, max=0.5, default=0.2, step=0.1)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "psar", "up": "up", "down": "down"}
     ))
 
     # FRAMA (Fractal Adaptive Moving Average) - Manual Implementation (Not in TA lib directly usually)
@@ -594,15 +616,16 @@ class AroonIndicator:
     def compute(self, df: pd.DataFrame, length: int = 25) -> pd.DataFrame:
         aroon = ta.trend.AroonIndicator(df["high"], df["low"], window=length)
         return pd.DataFrame({
-            f"AROON_up_{length}": aroon.aroon_up(),
-            f"AROON_down_{length}": aroon.aroon_down(),
-            f"AROON_ind_{length}": aroon.aroon_indicator()
+            "up": aroon.aroon_up(),
+            "down": aroon.aroon_down(),
+            "ind": aroon.aroon_indicator()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="TREND_AROON_V1", name="Aroon", category="TREND",
         description="Aroon Up/Down/Indicator.", code_snippet=aroon_code, handler_func="AroonIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=10, max=50, default=25)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=10, max=50, default=25)], source="builtin",
+        outputs={"value": "ind", "up": "up", "down": "down"}
     ))
     
     # II. Momentum
@@ -615,7 +638,7 @@ import ta
 class AOIndicator:
     def compute(self, df: pd.DataFrame, fast: int = 5, slow: int = 34) -> pd.DataFrame:
         ao = ta.momentum.AwesomeOscillatorIndicator(df["high"], df["low"], window1=fast, window2=slow)
-        return pd.DataFrame({f"AO_{fast}_{slow}": ao.awesome_oscillator()}, index=df.index)
+        return pd.DataFrame({"ao": ao.awesome_oscillator()}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="MOMENTUM_AO_V1", name="Awesome Oscillator", category="MOMENTUM",
@@ -623,7 +646,8 @@ class AOIndicator:
         params=[
             TunableParamSpec(name="fast", param_type="int", min=2, max=10, default=5),
             TunableParamSpec(name="slow", param_type="int", min=20, max=50, default=34)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "ao"}
     ))
 
     # TSI (True Strength Index)
@@ -634,7 +658,7 @@ import ta
 class TSIIndicator:
     def compute(self, df: pd.DataFrame, high_len: int = 25, low_len: int = 13) -> pd.DataFrame:
         tsi = ta.momentum.TSIIndicator(df["close"], window_slow=high_len, window_fast=low_len)
-        return pd.DataFrame({f"TSI_{high_len}_{low_len}": tsi.tsi()}, index=df.index)
+        return pd.DataFrame({"tsi": tsi.tsi()}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="MOMENTUM_TSI_V1", name="True Strength Index", category="MOMENTUM",
@@ -642,7 +666,8 @@ class TSIIndicator:
         params=[
             TunableParamSpec(name="high_len", param_type="int", min=15, max=40, default=25),
             TunableParamSpec(name="low_len", param_type="int", min=5, max=20, default=13)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "tsi"}
     ))
 
     # KST (Know Sure Thing)
@@ -654,8 +679,8 @@ class KSTIndicator:
     def compute(self, df: pd.DataFrame, r1: int = 10, r2: int = 15, r3: int = 20, r4: int = 30) -> pd.DataFrame:
         kst = ta.trend.KSTIndicator(df["close"], roc1=r1, roc2=r2, roc3=r3, roc4=r4)
         return pd.DataFrame({
-            f"KST_{r1}_{r2}_{r3}_{r4}": kst.kst(),
-            f"KST_sig_{r1}_{r2}_{r3}_{r4}": kst.kst_sig()
+            "kst": kst.kst(),
+            "signal": kst.kst_sig()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -666,7 +691,8 @@ class KSTIndicator:
              TunableParamSpec(name="r2", param_type="int", min=10, max=20, default=15),
              TunableParamSpec(name="r3", param_type="int", min=15, max=25, default=20),
              TunableParamSpec(name="r4", param_type="int", min=20, max=40, default=30)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "kst", "signal": "signal"}
     ))
 
     # VI (Vortex)
@@ -678,15 +704,16 @@ class VortexIndicator:
     def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
         vortex = ta.trend.VortexIndicator(df["high"], df["low"], df["close"], window=length)
         return pd.DataFrame({
-            f"VI_pos_{length}": vortex.vortex_indicator_pos(),
-            f"VI_neg_{length}": vortex.vortex_indicator_neg(),
-            f"VI_diff_{length}": vortex.vortex_indicator_diff()
+            "pos": vortex.vortex_indicator_pos(),
+            "neg": vortex.vortex_indicator_neg(),
+            "diff": vortex.vortex_indicator_diff()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="MOMENTUM_VORTEX_V1", name="Vortex Indicator", category="MOMENTUM",
         description="Vortex Positive/Negative.", code_snippet=vortex_code, handler_func="VortexIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=5, max=50, default=14)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=5, max=50, default=14)], source="builtin",
+        outputs={"value": "diff", "pos": "pos", "neg": "neg"}
     ))
 
     # PMO (Price Momentum Oscillator)
@@ -721,8 +748,8 @@ class PMOIndicator:
         signal = ema(pmo, 10)
         
         return pd.DataFrame({
-            f"PMO_{len1}_{len2}": pmo,
-            f"PMO_sig_{len1}_{len2}": signal
+            "pmo": pmo,
+            "signal": signal
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -731,7 +758,8 @@ class PMOIndicator:
         params=[
              TunableParamSpec(name="len1", param_type="int", min=20, max=50, default=35),
              TunableParamSpec(name="len2", param_type="int", min=10, max=30, default=20)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "pmo", "signal": "signal"}
     ))
 
     # EFI (Elder's Force Index)
@@ -742,12 +770,13 @@ import ta
 class EFIIndicator:
     def compute(self, df: pd.DataFrame, length: int = 13) -> pd.DataFrame:
         efi = ta.volume.ForceIndexIndicator(df["close"], df["volume"], window=length).force_index()
-        return pd.DataFrame({f"EFI_{length}": efi}, index=df.index)
+        return pd.DataFrame({"efi": efi}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="MOMENTUM_EFI_V1", name="Elders Force Index", category="MOMENTUM",
         description="Force Index.", code_snippet=efi_code, handler_func="EFIIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=13)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=13)], source="builtin",
+        outputs={"value": "efi"}
     ))
 
     # PAM (Price Action Momentum - Proxy)
@@ -768,12 +797,13 @@ class PAMIndicator:
         
         pam = (df['close'] - ma) / (std + 1e-9)
         
-        return pd.DataFrame({f"PAM_{length}": pam}, index=df.index)
+        return pd.DataFrame({"pam": pam}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="MOMENTUM_PAM_V1", name="Price Action Momentum", category="MOMENTUM",
         description="Price Action Momentum (Z-Score from MA).", code_snippet=pam_code, handler_func="PAMIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=10)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=10)], source="builtin",
+        outputs={"value": "pam"}
     ))
 
     # III. Volatility
@@ -786,12 +816,13 @@ import ta
 class UlcerIndicator:
     def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
         ui = ta.volatility.UlcerIndex(df["close"], window=length)
-        return pd.DataFrame({f"UI_{length}": ui.ulcer_index()}, index=df.index)
+        return pd.DataFrame({"ui": ui.ulcer_index()}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLATILITY_UI_V1", name="Ulcer Index", category="VOLATILITY",
         description="Measures dowside risk.", code_snippet=ulcer_code, handler_func="UlcerIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=14)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=5, max=30, default=14)], source="builtin",
+        outputs={"value": "ui"}
     ))
 
     # Bollinger %B and Bandwidth
@@ -803,8 +834,8 @@ class BBAdvIndicator:
     def compute(self, df: pd.DataFrame, window: int = 20, std_dev: float = 2.0) -> pd.DataFrame:
         bb = ta.volatility.BollingerBands(df["close"], window=window, window_dev=std_dev)
         return pd.DataFrame({
-            f"BB_pct_b_{window}": bb.bollinger_pband(),
-            f"BB_width_{window}": bb.bollinger_wband()
+            "pct_b": bb.bollinger_pband(),
+            "width": bb.bollinger_wband()
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -813,7 +844,8 @@ class BBAdvIndicator:
         params=[
             TunableParamSpec(name="window", param_type="int", min=10, max=50, default=20),
             TunableParamSpec(name="std_dev", param_type="float", min=1.5, max=3.0, default=2.0)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "pct_b", "width": "width"}
     ))
 
     # Chaikin Volatility (CV)
@@ -834,7 +866,7 @@ class CVIndicator:
         # 3. ROC of EMA
         cv = ema_hl.pct_change(periods=roc_window) * 100
         
-        return pd.DataFrame({f"CV_{window}_{roc_window}": cv}, index=df.index)
+        return pd.DataFrame({"cv": cv}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLATILITY_CV_V1", name="Chaikin Volatility", category="VOLATILITY",
@@ -842,7 +874,8 @@ class CVIndicator:
         params=[
             TunableParamSpec(name="window", param_type="int", min=5, max=30, default=10),
             TunableParamSpec(name="roc_window", param_type="int", min=5, max=30, default=10)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "cv"}
     ))
 
     # RVI (Relative Volatility Index)
@@ -869,12 +902,13 @@ class RVIIndicator:
         
         rvi = 100 * (up_avg / (up_avg + down_avg + 1e-9))
         
-        return pd.DataFrame({f"RVI_{length}": rvi}, index=df.index)
+        return pd.DataFrame({"rvi": rvi}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLATILITY_RVI_V1", name="Relative Volatility Index", category="VOLATILITY",
         description="RSI applied to StdDev.", code_snippet=rvi_code, handler_func="RVIIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=10, max=30, default=14)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=10, max=30, default=14)], source="builtin",
+        outputs={"value": "rvi"}
     ))
 
     # Average Envelope
@@ -888,8 +922,8 @@ class EnvelopeIndicator:
         lower = ma * (1 - pct)
         
         return pd.DataFrame({
-            f"ENV_up_{length}_{pct}": upper,
-            f"ENV_lo_{length}_{pct}": lower
+            "upper": upper,
+            "lower": lower
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
@@ -898,7 +932,8 @@ class EnvelopeIndicator:
         params=[
             TunableParamSpec(name="length", param_type="int", min=10, max=50, default=20),
             TunableParamSpec(name="pct", param_type="float", min=0.01, max=0.10, default=0.05, step=0.01)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "upper", "upper": "upper", "lower": "lower"}
     ))
 
     # Standard Deviation
@@ -908,12 +943,13 @@ import pandas as pd
 class StdDevIndicator:
     def compute(self, df: pd.DataFrame, length: int = 20) -> pd.DataFrame:
         std = df["close"].rolling(window=length).std()
-        return pd.DataFrame({f"STD_{length}": std}, index=df.index)
+        return pd.DataFrame({"std": std}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLATILITY_STD_V1", name="Standard Deviation", category="VOLATILITY",
         description="Rolling Standard Deviation.", code_snippet=std_code, handler_func="StdDevIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=10, max=50, default=20)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=10, max=50, default=20)], source="builtin",
+        outputs={"value": "std"}
     ))
 
     # Kalman Filter (Simplified 1D)
@@ -951,12 +987,13 @@ class KalmanFilterIndicator:
             x_est[i] = x_pred + K * (prices[i] - x_pred)
             p_est[i] = (1 - K) * p_pred
             
-        return pd.DataFrame({f"Kalman_{r_ratio}": pd.Series(x_est, index=df.index)}, index=df.index)
+        return pd.DataFrame({"kalman": pd.Series(x_est, index=df.index)}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLATILITY_KALMAN_V1", name="Kalman Filter", category="VOLATILITY",
         description="1D Kalman Smoother.", code_snippet=kalman_code, handler_func="KalmanFilterIndicator",
-        params=[TunableParamSpec(name="r_ratio", param_type="float", min=0.01, max=0.5, default=0.1)], source="builtin"
+        params=[TunableParamSpec(name="r_ratio", param_type="float", min=0.01, max=0.5, default=0.1)], source="builtin",
+        outputs={"value": "kalman"}
     ))
     
     # IV. Volume
@@ -974,7 +1011,8 @@ class ADLIndicator:
     registry.register(FeatureMetadata(
         feature_id="VOLUME_ADL_V1", name="Accumulation/Distribution", category="VOLUME",
         description="ADL.", code_snippet=adl_code, handler_func="ADLIndicator",
-        params=[], source="builtin"
+        params=[], source="builtin",
+        outputs={"value": "ADL"}
     ))
 
     # Chaikin Oscillator
@@ -989,7 +1027,7 @@ class ChaikinOscIndicator:
         adl = ta.volume.AccDistIndexIndicator(df["high"], df["low"], df["close"], df["volume"]).acc_dist_index()
         ema_f = ta.trend.EMAIndicator(adl, window=fast).ema_indicator()
         ema_s = ta.trend.EMAIndicator(adl, window=slow).ema_indicator()
-        return pd.DataFrame({f"ChO_{fast}_{slow}": ema_f - ema_s}, index=df.index)
+        return pd.DataFrame({"cho": ema_f - ema_s}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLUME_CHO_V1", name="Chaikin Oscillator", category="VOLUME",
@@ -997,7 +1035,8 @@ class ChaikinOscIndicator:
         params=[
             TunableParamSpec(name="fast", param_type="int", min=2, max=10, default=3),
             TunableParamSpec(name="slow", param_type="int", min=10, max=30, default=10)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "cho"}
     ))
 
     # PVT (Price and Volume Trend)
@@ -1017,7 +1056,8 @@ class PVTIndicator:
     registry.register(FeatureMetadata(
         feature_id="VOLUME_PVT_V1", name="Price and Volume Trend", category="VOLUME",
         description="Cumulative Volume * Price Change.", code_snippet=pvt_code, handler_func="PVTIndicator",
-        params=[], source="builtin"
+        params=[], source="builtin",
+        outputs={"value": "PVT"}
     ))
 
     # VROC (Volume Rate of Change)
@@ -1029,12 +1069,13 @@ class VROCIndicator:
     def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
         # Volume ROC
         vroc = df['volume'].pct_change(periods=length) * 100
-        return pd.DataFrame({f"VROC_{length}": vroc}, index=df.index)
+        return pd.DataFrame({"vroc": vroc}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLUME_VROC_V1", name="Volume ROC", category="VOLUME",
         description="Rate of Change of Volume.", code_snippet=vroc_code, handler_func="VROCIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=5, max=50, default=14)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=5, max=50, default=14)], source="builtin",
+        outputs={"value": "vroc"}
     ))
 
     # VIII. Adaptive
@@ -1047,12 +1088,13 @@ import ta
 class KAMAIndicator:
     def compute(self, df: pd.DataFrame, length: int = 10) -> pd.DataFrame:
         kama = ta.momentum.KAMAIndicator(df["close"], window=length)
-        return pd.DataFrame({f"KAMA_{length}": kama.kama()}, index=df.index)
+        return pd.DataFrame({"kama": kama.kama()}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="ADAPTIVE_KAMA_V1", name="Kaufman Adaptive MA", category="ADAPTIVE",
         description="Adapts to market noise.", code_snippet=kama_code, handler_func="KAMAIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=5, max=50, default=10)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=5, max=50, default=10)], source="builtin",
+        outputs={"value": "kama"}
     ))
 
     # RAVI (Range Action Verification Index)
@@ -1067,7 +1109,7 @@ class RAVIIndicator:
         sma_l = df['close'].rolling(window=long_len).mean()
         
         ravi = np.abs(sma_s - sma_l) / (sma_l + 1e-9) * 100
-        return pd.DataFrame({f"RAVI_{short_len}_{long_len}": ravi}, index=df.index)
+        return pd.DataFrame({"ravi": ravi}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="ADAPTIVE_RAVI_V1", name="RAVI", category="ADAPTIVE",
@@ -1075,7 +1117,8 @@ class RAVIIndicator:
         params=[
             TunableParamSpec(name="short_len", param_type="int", min=5, max=20, default=7),
             TunableParamSpec(name="long_len", param_type="int", min=30, max=100, default=65)
-        ], source="builtin"
+        ], source="builtin",
+        outputs={"value": "ravi"}
     ))
 
     # Adaptive Kalman Trend Filter
@@ -1112,12 +1155,13 @@ class AdaptiveKalmanIndicator:
             x_est[i] = x_pred + K * (prices[i] - x_pred)
             p_est[i] = (1 - K) * p_pred
             
-        return pd.DataFrame({f"Adapt_Kalman_{q}_{r}": x_est}, index=df.index)
+        return pd.DataFrame({"adapt_kalman": x_est}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="ADAPTIVE_KALMAN_V1", name="Adaptive Kalman Filter", category="ADAPTIVE",
         description="Volatility-Adaptive Kalman.", code_snippet=ak_code, handler_func="AdaptiveKalmanIndicator",
-        params=[TunableParamSpec(name="r", param_type="float", min=0.001, max=0.1, default=0.01)], source="builtin"
+        params=[TunableParamSpec(name="r", param_type="float", min=0.001, max=0.1, default=0.01)], source="builtin",
+        outputs={"value": "adapt_kalman"}
     ))
 
     # Polarity Switcher
@@ -1144,12 +1188,13 @@ class PolarityIndicator:
         # Smooth it
         polarity_smooth = polarity.rolling(5).mean()
         
-        return pd.DataFrame({f"Polarity_{length}": polarity_smooth}, index=df.index)
+        return pd.DataFrame({"polarity": polarity_smooth}, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="ADAPTIVE_POLARITY_V1", name="Polarity Switcher", category="ADAPTIVE",
         description="Trend Polarity with Volume.", code_snippet=pol_code, handler_func="PolarityIndicator",
-        params=[TunableParamSpec(name="length", param_type="int", min=10, max=50, default=20)], source="builtin"
+        params=[TunableParamSpec(name="length", param_type="int", min=10, max=50, default=20)], source="builtin",
+        outputs={"value": "polarity"}
     ))
 
 
@@ -1184,16 +1229,17 @@ class PivotPointsIndicator:
         dist_pp = (df['close'] - pp) / pp * 100
         
         return pd.DataFrame({
-            f"Pivot_Level_{window}": pp,
-            f"Dist_to_PP_{window}": dist_pp,
-            f"R1_{window}": r1,
-            f"S1_{window}": s1
+            "level": pp,
+            "dist": dist_pp,
+            "r1": r1,
+            "s1": s1
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="PA_PIVOT_V1", name="Pivot Points", category="PRICE_ACTION",
         description="Rolling Pivot Points.", code_snippet=pivot_code, handler_func="PivotPointsIndicator",
-        params=[TunableParamSpec(name="window", param_type="int", min=5, max=60, default=20)], source="builtin"
+        params=[TunableParamSpec(name="window", param_type="int", min=5, max=60, default=20)], source="builtin",
+        outputs={"value": "dist", "level": "level", "r1": "r1", "s1": "s1"}
     ))
 
     # Fibonacci Retracement (Dynamic)
@@ -1218,14 +1264,15 @@ class FiboIndicator:
         dist_618 = pos - 0.618
         
         return pd.DataFrame({
-            f"Fibo_Pos_{window}": pos,
-            f"Dist_Fib618_{window}": dist_618
+            "pos": pos,
+            "dist_618": dist_618
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="PA_FIBO_V1", name="Fibonacci Retracement", category="PRICE_ACTION",
         description="Position in HL Range.", code_snippet=fibo_code, handler_func="FiboIndicator",
-        params=[TunableParamSpec(name="window", param_type="int", min=20, max=200, default=50)], source="builtin"
+        params=[TunableParamSpec(name="window", param_type="int", min=20, max=200, default=50)], source="builtin",
+        outputs={"value": "pos", "dist": "dist_618"}
     ))
 
     # Support & Resistance Trendlines (Rolling Peaks)
@@ -1246,14 +1293,15 @@ class SRLevelIndicator:
         dist_sup = (df['close'] - sup_level) / df['close'] * 100
         
         return pd.DataFrame({
-            f"Dist_Res_{window}": dist_res,
-            f"Dist_Sup_{window}": dist_sup
+            "dist_res": dist_res,
+            "dist_sup": dist_sup
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="PA_SR_V1", name="S&R Levels", category="PRICE_ACTION",
         description="Distance to Rolling High/Low.", code_snippet=sr_code, handler_func="SRLevelIndicator",
-        params=[TunableParamSpec(name="window", param_type="int", min=10, max=100, default=20)], source="builtin"
+        params=[TunableParamSpec(name="window", param_type="int", min=10, max=100, default=20)], source="builtin",
+        outputs={"value": "dist_res", "upper": "dist_res", "lower": "dist_sup"}
     ))
 
     # HVN / LVN (Volume Profile Proxy)
@@ -1281,14 +1329,15 @@ class VPIndicator:
         # Logic: If price is near VWAP and Volume is High -> HVN interaction
         
         return pd.DataFrame({
-            f"Dist_POC_{window}": dist_vwap,
-            f"Vol_Intensity_{window}": vol_intensity
+            "dist_poc": dist_vwap,
+            "vol_intensity": vol_intensity
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="PA_VP_V1", name="Volume Profile Proxy", category="PRICE_ACTION",
         description="VWAP Distance & Vol Intensity.", code_snippet=vp_code, handler_func="VPIndicator",
-        params=[TunableParamSpec(name="window", param_type="int", min=20, max=100, default=50)], source="builtin"
+        params=[TunableParamSpec(name="window", param_type="int", min=20, max=100, default=50)], source="builtin",
+        outputs={"value": "dist_poc", "intensity": "vol_intensity"}
     ))
     # Note: Explicit LVN/HVN maps require heavy compute (histograms per bar). VWAP is best effective proxy for features.
     
@@ -1358,7 +1407,8 @@ class HeikinAshiIndicator:
     registry.register(FeatureMetadata(
         feature_id="PATTERN_HEIKIN_V1", name="Heikin Ashi", category="PATTERN",
         description="Heikin Ashi Smoothed OHLC.", code_snippet=ha_code, handler_func="HeikinAshiIndicator",
-        params=[], source="builtin"
+        params=[], source="builtin",
+        outputs={"value": "HA_Close", "close": "HA_Close", "open": "HA_Open", "high": "HA_High", "low": "HA_Low"}
     ))
 
     print("Success! Extended population created.")

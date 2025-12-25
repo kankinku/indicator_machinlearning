@@ -149,6 +149,16 @@ class LedgerRecord:
 FeatureParam = TunableParamSpec
 
 @dataclass
+class ColumnRef:
+    """
+    [V18] Reference to a specific output of a feature.
+    Used in LogicTree to replace ambiguous string keys.
+    """
+    feature_id: str
+    output_key: str = "value"  # e.g., "value", "signal", "upper", "lower"
+
+
+@dataclass
 class FeatureMetadata:
     """
     Metadata for a dynamically registered feature (indicator).
@@ -174,4 +184,10 @@ class FeatureMetadata:
     # Stats (updated by L1 Judge)
     fitness_score: float = 0.0
     usage_count: int = 0
+
+    # [V18] Output Schema Definition
+    # Maps standard output keys (value, signal) to raw suffixes (rsi, signal, etc.)
+    # The actual column name will be f"{feature_id}__{suffix}"
+    # Default: {"value": "value"}
+    outputs: Dict[str, str] = field(default_factory=lambda: {"value": "value"})
 

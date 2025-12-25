@@ -408,7 +408,8 @@ class MetaAgent:
         if not target_candidates: target_candidates = self.registry.list_all()
         selected_features = random.sample(target_candidates, min(len(target_candidates), subset_size)) if target_candidates else []
         
-        # Build Entry Tree (Flat AND for now)
+        # [V18] Build Entry Tree (Flat AND for now) with ColumnRef
+        from src.contracts import ColumnRef
         quantiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
         if q_bias == "center": w = [0.05, 0.05, 0.2, 0.2, 0.2, 0.2, 0.05, 0.05, 0.05]
         elif q_bias == "tail": w = [0.3, 0.15, 0.05, 0.0, 0.0, 0.0, 0.05, 0.15, 0.3]
@@ -418,7 +419,12 @@ class MetaAgent:
         for feat in selected_features:
             q = random.choices(quantiles, weights=w, k=1)[0]
             op = ">" if random.random() > 0.5 else "<"
-            entry_nodes.append(ConditionNode(feature_key=feat.feature_id, op=op, value=f"[q{q}]"))
+            entry_nodes.append(ConditionNode(
+                feature_key=feat.feature_id, 
+                column_ref=ColumnRef(feature_id=feat.feature_id, output_key="value"),
+                op=op, 
+                value=f"[q{q}]"
+            ))
             
         if len(entry_nodes) > 1:
             entry_root = LogicalOpNode(op="and", children=entry_nodes)

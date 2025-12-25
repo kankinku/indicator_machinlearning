@@ -18,10 +18,20 @@ class ConditionNode(LogicNode):
     op: str = ">" # >, <, >=, <=, ==, cross_up, cross_down
     value: Union[float, str] = 0.0 # float or feature_key
     lookback: int = 1
+    
+    # [V18] Definitive Column Reference
+    # If present, this takes precedence over feature_key
+    column_ref: Optional[ColumnRef] = None
+
+    def __post_init__(self):
+        # Convert dict to ColumnRef if needed (from deserialization)
+        if isinstance(self.column_ref, dict):
+            self.column_ref = ColumnRef(**self.column_ref)
 
     def __str__(self):
-        v = f"'{self.value}'" if isinstance(self.value, str) else self.value
-        return f"{self.feature_key} {self.op} {v}"
+        val_str = f"'{self.value}'" if isinstance(self.value, str) else self.value
+        subj = self.column_ref.feature_id if self.column_ref else self.feature_key
+        return f"{subj} {self.op} {val_str}"
 
 @dataclass
 class LogicalOpNode(LogicNode):
@@ -55,6 +65,7 @@ class LogicTree:
             if not d: return None
             node_type = d.get("type")
             if node_type == "condition":
+                # Handle ColumnRef manually if needed (though post_init does it)
                 return ConditionNode(**d)
             if node_type == "logical":
                 children = [_build_node(c) for c in d.get("children", []) if c]
@@ -73,7 +84,11 @@ class LogicTree:
         
         def walk(node):
             if isinstance(node, ConditionNode):
-                features.add(node.feature_key)
+                if node.column_ref:
+                    features.add(node.column_ref.feature_id)
+                else:
+                    features.add(node.feature_key)
+                
                 if isinstance(node.value, str) and not node.value.startswith("[q") and node.value != "TRUE" and node.value != "FALSE":
                     features.add(node.value)
             elif isinstance(node, LogicalOpNode):
@@ -106,6 +121,7 @@ def mutate_tree(tree: LogicTree, registry: Any, action_type: str = "MUTATE_THRES
     [V17] Direct Tree Evolution.
     """
     import random
+    from src.contracts import ColumnRef
     new_tree = LogicTree.from_dict(asdict(tree.root)) # Deep copy
     
     # 1. ADD_CONDITION
@@ -113,7 +129,13 @@ def mutate_tree(tree: LogicTree, registry: Any, action_type: str = "MUTATE_THRES
         all_features = registry.list_all_ids() if hasattr(registry, 'list_all_ids') else []
         if all_features:
             new_feat = random.choice(all_features)
-            new_cond = ConditionNode(feature_key=new_feat, op=">", value="[q0.5]")
+            # [V18] Use ColumnRef
+            new_cond = ConditionNode(
+                feature_key=new_feat, # Legacy support
+                column_ref=ColumnRef(feature_id=new_feat, output_key="value"),
+                op=">", 
+                value="[q0.5]"
+            )
             
             # If root is logical, add to children
             if isinstance(new_tree.root, LogicalOpNode):
@@ -142,7 +164,10 @@ def mutate_tree(tree: LogicTree, registry: Any, action_type: str = "MUTATE_THRES
         all_features = registry.list_all_ids() if hasattr(registry, 'list_all_ids') else []
         if conds and all_features:
             target = random.choice(conds)
-            target.feature_key = random.choice(all_features)
+            new_feat = random.choice(all_features)
+            target.feature_key = new_feat
+            # [V18] Update ColumnRef
+            target.column_ref = ColumnRef(feature_id=new_feat, output_key="value")
 
     # 4. CHANGE_OP
     elif action_type == "CHANGE_OP":
@@ -213,13 +238,17 @@ def evaluate_logic_tree(tree: LogicTree, df: pd.DataFrame) -> pd.Series:
     if not tree or not tree.root:
         return pd.Series(True, index=df.index)
         
-    return _evaluate_node(tree.root, df)
+    # [V18] Instantiate Resolver Once
+    from src.shared.column_resolver import ColumnResolver
+    resolver = ColumnResolver(df.columns)
+        
+    return _evaluate_node(tree.root, df, resolver)
 
-def _evaluate_node(node: LogicNode, df: pd.DataFrame) -> pd.Series:
+def _evaluate_node(node: LogicNode, df: pd.DataFrame, resolver) -> pd.Series:
     if isinstance(node, ConditionNode):
-        return _evaluate_condition(node, df)
+        return _evaluate_condition(node, df, resolver)
     if isinstance(node, LogicalOpNode):
-        results = [_evaluate_node(child, df) for child in node.children]
+        results = [_evaluate_node(child, df, resolver) for child in node.children]
         if not results: return pd.Series(True, index=df.index)
         
         final = results[0]
@@ -230,80 +259,49 @@ def _evaluate_node(node: LogicNode, df: pd.DataFrame) -> pd.Series:
                 final = final | res
         return final
     if isinstance(node, NotNode):
-        return ~_evaluate_node(node.child, df)
+        return ~_evaluate_node(node.child, df, resolver)
     
     return pd.Series(True, index=df.index)
 
-def _evaluate_condition(node: ConditionNode, df: pd.DataFrame) -> pd.Series:
+def _evaluate_condition(node: ConditionNode, df: pd.DataFrame, resolver) -> pd.Series:
     """
-    [V18] 4-Stage Feature Matching with KPI Tracking.
-    
-    Stage A: 직접 매칭 성공
-    Stage B: Fuzzy 매칭 (prefix 후보 1개)
-    Stage C: 모호성 (prefix 후보 2개 이상)
-    Stage D: 미매칭 (후보 0개)
-    
-    학습 모드(STRICT=True): C, D에서 즉시 reject
-    운영 모드(STRICT=False): C, D에서 fallback 허용 (KPI 기록 필수)
+    [V18] Definitive Condition Evaluation using ColumnResolver.
     """
-    from src.config import config
-    from src.shared.logic_tree_diagnostics import (
-        get_diagnostics, LogicTreeMatchError
-    )
+    from src.contracts import ColumnRef
+    from src.shared.logic_tree_diagnostics import get_diagnostics, LogicTreeMatchError
     
     diag = get_diagnostics()
-    f_key = node.feature_key
     
-    # 특수 키 처리 (TRUE/FALSE)
-    if f_key in ("TRUE", "False"):
-        return pd.Series(f_key == "TRUE", index=df.index)
+    # Special Keys
+    if node.feature_key in ("TRUE", "False"):
+        return pd.Series(node.feature_key == "TRUE", index=df.index)
+
+    # 1. Resolve Column Name
+    try:
+        if node.column_ref:
+            col_name = resolver.resolve(node.column_ref)
+        else:
+            # Legacy: Resolve via string key
+            col_name = resolver.resolve_str_key(node.feature_key)
+    except LogicTreeMatchError as e:
+        # Rethrow as is (Resolver might raise it via diag)
+        # But actually Resolver raises ColumnResolutionError. 
+        # We should map it or just let it bubble up if we want rejection.
+        # But wait, logic_tree_diagnostics.LogicTreeMatchError is what orchestrator catches.
+        # Resolver uses ColumnResolutionError. We should align them.
+        # Let's import ColumnResolutionError and wrap/re-raise as LogicTreeMatchError for orchestrator compatibility.
+        raise e
+    except Exception as e:
+        # Map other errors to LogicTreeMatchError for consistent handling
+        from src.shared.column_resolver import ColumnResolutionError
+        if isinstance(e, ColumnResolutionError):
+             raise LogicTreeMatchError(e.args[0], e.feature_key, "unmatched")
+        raise e
+
+    col = df[col_name]
     
-    # =========================================================
-    # Stage A: 직접 매칭 시도
-    # =========================================================
-    if f_key in df.columns:
-        diag.record_direct_match(f_key)
-        col = df[f_key]
-        return _apply_comparison(col, node, df)
-    
-    # =========================================================
-    # Stage B~D: Fuzzy Matching 시도
-    # =========================================================
-    if not getattr(config, 'LOGICTREE_FUZZY_MATCH', True):
-        # Fuzzy matching 비활성화 시 직접 unmatched 처리
-        diag.record_unmatched(f_key)
-        return _handle_unmatched(f_key, df, config, diag)
-    
-    # Prefix 기반 후보 검색
-    prefix = f"{f_key}__"
-    candidates = [c for c in df.columns if c.startswith(prefix)]
-    
-    # =========================================================
-    # Stage B: Fuzzy 매칭 성공 (후보 1개)
-    # =========================================================
-    if len(candidates) == 1:
-        actual_col = candidates[0]
-        diag.record_fuzzy_match(f_key, actual_col)
-        
-        from src.shared.logger import get_logger
-        logger = get_logger("shared.logic_tree")
-        logger.debug(f"[LogicTree] Fuzzy match: '{f_key}' -> '{actual_col}'")
-        
-        col = df[actual_col]
-        return _apply_comparison(col, node, df)
-    
-    # =========================================================
-    # Stage C: 모호성 (후보 2개 이상)
-    # =========================================================
-    if len(candidates) > 1:
-        diag.record_ambiguous(f_key, candidates)
-        return _handle_ambiguous(f_key, candidates, node, df, config, diag)
-    
-    # =========================================================
-    # Stage D: 미매칭 (후보 0개)
-    # =========================================================
-    diag.record_unmatched(f_key)
-    return _handle_unmatched(f_key, df, config, diag)
+    return _apply_comparison(col, node, df)
+
 
 
 def _apply_comparison(col: pd.Series, node: ConditionNode, df: pd.DataFrame) -> pd.Series:
