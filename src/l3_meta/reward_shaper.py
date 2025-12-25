@@ -18,7 +18,7 @@ Reward Shaper - 다면적 보상 함수 (Final Design)
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 import numpy as np
 
@@ -49,6 +49,9 @@ class RewardBreakdown:
     # 상태 정보
     is_rejected: bool                # Hard Gate 통과 여부
     rejection_reason: Optional[str]  # 통과 실패 사유
+    failure_codes: List[str] = field(default_factory=list)
+    distance_score: float = 0.0
+    replay_tag: str = "PASS"
     
     raw_metrics: Dict[str, float]
     alpha: float = 0.0              # [V11.2] 초과 수익률 (연간화)
@@ -145,49 +148,40 @@ class RewardShaper:
             bench_cagr = getattr(config, 'REWARD_BENCHMARK_RETURN', 15.0)
             alpha = cagr - bench_cagr
         
-        # [2] Hard Validation Gate (V11.2 핵심)
+        # [2] Validation Failures (Decomposed)
         # ================================================
-        is_rejected = False
-        rejection_reason = None
-        
-        # 1. 거래 횟수 Gate (Raw & Valid)
-        min_raw = getattr(stage_cfg, "min_trades_per_year", config.VAL_MIN_TRADES)
-        min_valid = getattr(stage_cfg, "min_valid_trades", config.VAL_MIN_VALID_TRADES)
-        min_ratio = getattr(stage_cfg, "min_valid_ratio", config.VAL_MIN_VALID_RATIO)
-        
-        valid_trades = metrics.get("valid_trade_count", n_trades) # 없으면 raw와 동일 취급
-        valid_ratio = valid_trades / max(1, n_trades)
-        
-        if n_trades < min_raw:
-            is_rejected = True
-            rejection_reason = f"LOW_RAW_TRADES ({n_trades} < {min_raw})"
-        elif valid_trades < min_valid:
-            is_rejected = True
-            rejection_reason = f"LOW_VALID_TRADES ({valid_trades} < {min_valid})"
-        elif valid_ratio < min_ratio:
-            is_rejected = True
-            rejection_reason = f"LOW_VALID_RATIO ({valid_ratio:.1%} < {min_ratio:.1%})"
-        
-        # 2. MDD Gate
-        elif mdd_pct > getattr(stage_cfg, "max_mdd_pct", 60.0):
-            is_rejected = True
-            rejection_reason = f"MAX_MDD ({mdd_pct:.1f}% > {getattr(stage_cfg, 'max_mdd_pct', 60.0)}%)"
-            
-        # 3. 승률 범위 Gate
-        elif win_rate < getattr(stage_cfg, "min_winrate", 0.25):
-            is_rejected = True
-            rejection_reason = f"LOW_WINRATE ({win_rate:.1%} < {getattr(stage_cfg, 'min_winrate', 0.25):.1%})"
-        elif win_rate > getattr(stage_cfg, "max_winrate", 0.90):
-            is_rejected = True
-            rejection_reason = f"HIGH_WINRATE ({win_rate:.1%} > {getattr(stage_cfg, 'max_winrate', 0.90):.1%})"
+        from src.l1_judge.evaluator import collect_validation_failures_from_dict
+        failures = collect_validation_failures_from_dict(metrics)
+        hard_failures = [f for f in failures if f.is_hard]
+        is_rejected = len(hard_failures) > 0
+        rejection_reason = hard_failures[0].code if hard_failures else None
 
-        # [3] REJECTED 처리 - 학습 대상에서 제외 (Selection Pressure)
+        reason_penalties = getattr(config, "REJECT_REASON_PENALTIES", {})
+        distance_weights = getattr(config, "REJECT_DISTANCE_PENALTY_WEIGHTS", {})
+        failure_codes = [f.code for f in failures]
+        distance_score = float(sum(f.distance for f in failures))
+        reason_penalty_total = float(sum(reason_penalties.get(code, 0.0) for code in failure_codes))
+        distance_penalty_total = float(sum(distance_weights.get(f.code, 0.0) * f.distance for f in failures))
+
+        # [3] REJECTED 처리 - 분해된 패널티 적용
         # ================================================
         if is_rejected:
-            # [V11.2] 강력한 패널티 점수 부여 (-50.0)
-            total = float(getattr(config, 'RL_REJECT_SCORE', -50.0))
+            stage_base = getattr(stage_cfg, "reject_base_penalty", None)
+            if stage_base is not None:
+                base_penalty = float(stage_base)
+            else:
+                base_map = getattr(config, "REJECT_BASE_PENALTY_BY_STAGE", {})
+                base_penalty = float(base_map.get(current_stage, getattr(config, "RL_REJECT_SCORE", -50.0)))
+            total = base_penalty + reason_penalty_total + distance_penalty_total
+            total = max(total, float(getattr(config, "REJECT_SCORE_FLOOR", -100.0)))
+
+            hard_dist = float(sum(f.distance for f in hard_failures))
+            near_max_failures = int(getattr(config, "REJECT_NEAR_PASS_MAX_FAILURES", 2))
+            near_max_distance = float(getattr(config, "REJECT_NEAR_PASS_MAX_DISTANCE", 0.35))
+            replay_tag = "NEAR_PASS" if (len(hard_failures) <= near_max_failures and hard_dist <= near_max_distance) else "HARD_FAIL"
+
             return RewardBreakdown(
-                total=total,
+                total=float(total),
                 return_component=-1.0,
                 rr_component=-1.0,
                 top_trades_component=-1.0,
@@ -198,6 +192,9 @@ class RewardShaper:
                 is_rejected=True,
                 rejection_reason=rejection_reason,
                 raw_metrics=metrics,
+                failure_codes=failure_codes,
+                distance_score=distance_score,
+                replay_tag=replay_tag,
             )
 
         # [4] 보상 계산 (살아남은 전략들만 - Scoring)
@@ -284,7 +281,16 @@ class RewardShaper:
             + w_mdd * r_mdd
             + r_winrate_penalty
             + r_complexity
-        )        
+        )
+
+        if failures:
+            soft_scale = float(getattr(config, "REJECT_SOFT_PENALTY_SCALE", 0.5))
+            soft_failures = [f for f in failures if not f.is_hard]
+            if soft_failures:
+                soft_reason = float(sum(reason_penalties.get(f.code, 0.0) for f in soft_failures))
+                soft_dist = float(sum(distance_weights.get(f.code, 0.0) * f.distance for f in soft_failures))
+                total += (soft_reason + soft_dist) * soft_scale
+
         return RewardBreakdown(
             total=float(total),
             return_component=float(r_return),
@@ -298,6 +304,9 @@ class RewardShaper:
             rejection_reason=rejection_reason,
             raw_metrics=metrics,
             alpha=float(alpha),
+            failure_codes=failure_codes,
+            distance_score=distance_score,
+            replay_tag="PASS",
         )
     
     

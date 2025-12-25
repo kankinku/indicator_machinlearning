@@ -22,6 +22,8 @@ class TradeStats:
     top1_share: float = 0.0
     top3_share: float = 0.0
     trades_per_year: float = 0.0
+    entry_signal_rate: float = 0.0
+    avg_holding_bars: float = 0.0
 
 @dataclass
 class EquityStats:
@@ -35,6 +37,7 @@ class EquityStats:
     max_drawdown_pct: float = 0.0
     mdd_duration: int = 0  # Max drawdown duration in bars
     exposure_ratio: float = 0.0
+    percent_in_market: float = 0.0
     benchmark_roi_pct: float = 0.0
     excess_return: float = 0.0
 
@@ -51,6 +54,7 @@ class WindowMetrics:
     raw_score: float = 0.0
     bars_total: int = 0
     complexity_score: float = 0.0 # [V17] Structural AST complexity
+    failure_codes: List[str] = field(default_factory=list)
     
     # Metadata
     start_date: Optional[str] = None
@@ -202,6 +206,7 @@ def compute_equity_stats(
         exposure_ratio = float(np.mean(exposure_mask))
     else:
         exposure_ratio = 0.0
+    percent_in_market = exposure_ratio
         
     excess_return = total_return_pct - benchmark_roi_pct
     
@@ -213,6 +218,7 @@ def compute_equity_stats(
         max_drawdown_pct=max_mdd_pct,
         mdd_duration=mdd_duration,
         exposure_ratio=exposure_ratio,
+        percent_in_market=percent_in_market,
         benchmark_roi_pct=benchmark_roi_pct,
         excess_return=float(excess_return)
     )
@@ -301,11 +307,14 @@ def metrics_to_legacy_dict(agg: AggregateMetrics) -> Dict[str, Any]:
     expected by dashboard and infinite_loop.
     """
     # Usually we want the aggregated view
+    total_trades = int(np.sum([w.trades.trade_count for w in agg.window_results])) if agg.window_results else 0
+    total_bars = sum([w.bars_total for w in agg.window_results]) if agg.window_results else 252
+    entry_rate = total_trades / max(1, total_bars)
     res = {
         "total_return_pct": agg.mean_return,
         "mdd_pct": agg.mean_mdd,
         "win_rate": np.mean([w.trades.win_rate for w in agg.window_results]) if agg.window_results else 0.0,
-        "n_trades": int(np.sum([w.trades.trade_count for w in agg.window_results])) if agg.window_results else 0,
+        "n_trades": total_trades,
         "valid_trade_count": int(np.sum([w.trades.valid_trade_count for w in agg.window_results])) if agg.window_results else 0,
         "reward_risk": np.mean([w.trades.reward_risk for w in agg.window_results]) if agg.window_results else 0.0,
         "sharpe": agg.mean_sharpe,
@@ -317,8 +326,11 @@ def metrics_to_legacy_dict(agg: AggregateMetrics) -> Dict[str, Any]:
         "top3_share": np.mean([w.trades.top3_share for w in agg.window_results]) if agg.window_results else 0.0,
         "excess_return": np.mean([w.equity.excess_return for w in agg.window_results]) if agg.window_results else 0.0,
         "complexity_score": agg.mean_complexity,
+        "entry_signal_rate": entry_rate,
+        "avg_holding_bars": np.mean([w.trades.avg_holding_bars for w in agg.window_results]) if agg.window_results else 0.0,
+        "percent_in_market": np.mean([w.equity.percent_in_market for w in agg.window_results]) if agg.window_results else 0.0,
     }
     
     # Add oos_bars (sum of all windows)
-    res["oos_bars"] = sum([w.bars_total for w in agg.window_results]) if agg.window_results else 252
+    res["oos_bars"] = total_bars
     return res

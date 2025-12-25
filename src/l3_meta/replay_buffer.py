@@ -11,7 +11,7 @@ Deep RL에서 학습 안정성을 위한 경험 저장 및 샘플링 메커니�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, NamedTuple
+from typing import Dict, List, Optional, Tuple, NamedTuple
 from collections import deque
 import random
 import numpy as np
@@ -104,7 +104,7 @@ class ReplayBuffer:
         # 통계
         self._total_pushed = 0
         
-    def push(self, experience: Experience) -> None:
+    def push(self, experience: Experience, tag: str = "PASS") -> None:
         """
         경험을 버퍼에 추가합니다.
         
@@ -238,7 +238,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         self._max_priority = 1.0
         self._frame = 0
     
-    def push(self, experience: Experience) -> None:
+    def push(self, experience: Experience, tag: str = "PASS") -> None:
         """우선순위와 함께 경험을 추가합니다."""
         with self._lock:
             self.buffer.append(experience)
@@ -350,10 +350,110 @@ class IntegratedReplayBuffer(ReplayBuffer):
         )
 
 
+class TaggedReplayBuffer(ReplayBuffer):
+    """
+    Tag-aware replay buffer that enforces sampling ratios for PASS/NEAR_PASS/HARD_FAIL.
+    """
+    def __init__(
+        self,
+        capacity: int = None,
+        batch_size: int = None,
+        tag_ratios: Optional[Dict[str, float]] = None,
+    ):
+        super().__init__(capacity, batch_size)
+        self.tag_ratios = tag_ratios or getattr(config, "REPLAY_TAG_SAMPLE_RATIOS", {})
+        self.tags: deque[str] = deque(maxlen=self.capacity)
+
+    def push(self, experience: Experience, tag: str = "PASS") -> None:
+        with self._lock:
+            self.buffer.append(experience)
+            self.tags.append(tag)
+            self._total_pushed += 1
+
+    def _normalized_ratios(self) -> Dict[str, float]:
+        ratios = dict(self.tag_ratios or {})
+        total = sum(ratios.values())
+        if total <= 0:
+            return {"PASS": 1.0}
+        return {k: v / total for k, v in ratios.items()}
+
+    def _allocate_counts(self, ratios: Dict[str, float], available: Dict[str, int]) -> Dict[str, int]:
+        counts = {tag: int(ratios.get(tag, 0.0) * self.batch_size) for tag in ratios}
+        for tag, avail in available.items():
+            if counts.get(tag, 0) == 0 and ratios.get(tag, 0.0) > 0 and avail > 0:
+                counts[tag] = 1
+
+        total = sum(counts.values())
+        if total > self.batch_size:
+            overflow = total - self.batch_size
+            for tag in sorted(counts, key=lambda t: counts[t], reverse=True):
+                if overflow <= 0:
+                    break
+                reduce_by = min(overflow, max(0, counts[tag] - 1))
+                counts[tag] -= reduce_by
+                overflow -= reduce_by
+        elif total < self.batch_size:
+            deficit = self.batch_size - total
+            for tag in sorted(available, key=lambda t: ratios.get(t, 0.0), reverse=True):
+                if deficit <= 0:
+                    break
+                if available[tag] > counts.get(tag, 0):
+                    counts[tag] = counts.get(tag, 0) + 1
+                    deficit -= 1
+        return counts
+
+    def sample(self) -> BatchSample:
+        with self._lock:
+            if len(self.buffer) < self.batch_size:
+                raise ValueError(
+                    f"버퍼 크기({len(self.buffer)})가 배치 크기({self.batch_size})보다 작습니다"
+                )
+
+            ratios = self._normalized_ratios()
+            tag_indices: Dict[str, List[int]] = {}
+            for idx, tag in enumerate(self.tags):
+                tag_indices.setdefault(tag, []).append(idx)
+
+            available = {tag: len(idxs) for tag, idxs in tag_indices.items()}
+            counts = self._allocate_counts(ratios, available)
+
+            selected_indices: List[int] = []
+            remaining_pool: List[int] = []
+            for tag, idxs in tag_indices.items():
+                count = min(counts.get(tag, 0), len(idxs))
+                if count > 0:
+                    selected_indices.extend(random.sample(idxs, count))
+                remaining_pool.extend([i for i in idxs if i not in selected_indices])
+
+            if len(selected_indices) < self.batch_size and remaining_pool:
+                fill_count = min(self.batch_size - len(selected_indices), len(remaining_pool))
+                selected_indices.extend(random.sample(remaining_pool, fill_count))
+
+            batch = [self.buffer[i] for i in selected_indices]
+
+        return self._batch_to_arrays(batch)
+
+    def sample_all(self) -> BatchSample:
+        with self._lock:
+            batch = list(self.buffer)
+        return self._batch_to_arrays(batch)
+
+    @property
+    def stats(self) -> dict:
+        base = super().stats
+        with self._lock:
+            tag_counts: Dict[str, int] = {}
+            for tag in self.tags:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        base["tag_counts"] = tag_counts
+        return base
+
+
 # 팩토리 함수
 def create_replay_buffer(
-    prioritized: bool = False, 
+    prioritized: bool = False,
     multi_action: bool = False,
+    tagged: bool = False,
     **kwargs
 ) -> ReplayBuffer:
     """
@@ -369,6 +469,8 @@ def create_replay_buffer(
     """
     if multi_action:
         return IntegratedReplayBuffer(**kwargs)
+    if tagged:
+        return TaggedReplayBuffer(**kwargs)
     if prioritized:
         return PrioritizedReplayBuffer(**kwargs)
     return ReplayBuffer(**kwargs)

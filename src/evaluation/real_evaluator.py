@@ -48,12 +48,16 @@ class RealEvaluator:
             complexity_score=complexity_score
         )
         
-        # Override exposure_ratio from engine (accurate mean)
-        # Note: metrics (WindowMetrics) has .equity.exposure_ratio
-        # Dataclasses are frozen, so we would need a new instance or use compute_sample_metrics argument
-        # Re-running with exposure_mask=None but we can set it if we had the positions series.
-        # DeterministicBacktestEngine doesn't return the full positions series in BacktestResult currently.
-        # We can just trust bt_result.exposure for now.
+        # Override exposure ratio from engine (accurate mean).
+        metrics.equity.exposure_ratio = float(bt_result.exposure)
+        metrics.equity.percent_in_market = float(bt_result.exposure)
+
+        # Signal degeneracy metrics.
+        metrics.trades.entry_signal_rate = float(bt_result.trade_count / max(1, len(df)))
+        if bt_result.trades:
+            metrics.trades.avg_holding_bars = float(np.mean([t.get("bars", 0) for t in bt_result.trades]))
+        else:
+            metrics.trades.avg_holding_bars = 0.0
         
         return metrics, bt_result
 

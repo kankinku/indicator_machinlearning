@@ -119,6 +119,7 @@ class FeatureFactory:
             result = instance.compute(df, **params)
             
             if result is not None and not result.empty:
+                result = self._align_outputs(feature_id, result)
                 # [Crucial] Prefix columns with feature_id to prevent naming collisions (e.g., LightGBM duplicates)
                 result.columns = [f"{feature_id}__{c}" for c in result.columns]
                 
@@ -127,6 +128,24 @@ class FeatureFactory:
             import traceback
             logger.error(f"Execution Error for {feature_id}: {e}\n{traceback.format_exc()}")
             raise e
+
+    def _align_outputs(self, feature_id: str, result: pd.DataFrame) -> pd.DataFrame:
+        meta = self.registry.get(feature_id)
+        if not meta or result is None or result.empty:
+            return result
+
+        expected_suffix = None
+        if meta.outputs:
+            expected_suffix = meta.outputs.get("value")
+
+        if expected_suffix == "value" and "value" not in result.columns:
+            result = result.copy()
+            if result.shape[1] == 1:
+                result.columns = ["value"]
+            else:
+                result["value"] = result.iloc[:, 0]
+
+        return result
 
     def generate_single_feature(self, df: pd.DataFrame, meta: Any, params: Dict[str, Any]) -> Optional[pd.DataFrame]:
         """

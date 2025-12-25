@@ -95,20 +95,24 @@ class MetaAgent:
         """현재 시장 데이터를 설정합니다 (D3QN 상태 인코딩용)."""
         self._current_df = df
         
-    def adjust_policy(self, diagnostic_status: str) -> None:
+    def adjust_policy(self, diagnostic_status: object) -> None:
         """
         [V15] Self-Healing Feedback Loop (SSOT EpsilonManager)
         """
-        if "RIGID" in diagnostic_status:
+        status = diagnostic_status
+        if isinstance(diagnostic_status, dict):
+            status = diagnostic_status.get("status", "")
+
+        if "RIGID" in status:
             self.eps_manager.request_reheat("RIGID_DIAGNOSTIC", strength=0.7)
             
-        elif "COLLAPSED" in diagnostic_status:
+        elif "COLLAPSED" in status:
             self.eps_manager.request_reheat("COLLAPSED_DIAGNOSTIC", strength=0.5)
                 
-        elif "STAGNANT" in diagnostic_status:
+        elif "STAGNANT" in status:
             self.eps_manager.request_reheat("STAGNANT_DIAGNOSTIC", strength=0.4)
 
-        elif "SOFT" in diagnostic_status:
+        elif "SOFT" in status:
             # Maybe slow down decay or just log
             logger.info(f"[MetaAgent] 🛡 Self-Healing: SOFT state. Exploitation favored.")
 

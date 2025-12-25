@@ -1,5 +1,6 @@
 
 import os
+import importlib
 import importlib.util
 import sys
 from typing import Dict, Type
@@ -24,6 +25,7 @@ class CustomFeatureLoader:
             self.custom_dir = Path(custom_dir)
             
         self.loaded_features: Dict[str, Type[CustomFeatureBase]] = {}
+        self.loaded_instances: Dict[str, CustomFeatureBase] = {}
 
     def load_all(self):
         """Scan directory and load all valid custom features."""
@@ -36,27 +38,32 @@ class CustomFeatureLoader:
             self._load_module(file_path)
             
     def _load_module(self, file_path: Path):
-        module_name = f"custom_feature_{file_path.stem}"
+        module_name = f"src.features.custom.{file_path.stem}"
         
         try:
-            spec = importlib.util.spec_from_file_location(module_name, file_path)
-            if spec and spec.loader:
+            try:
+                module = importlib.import_module(module_name)
+            except Exception:
+                spec = importlib.util.spec_from_file_location(module_name, file_path)
+                if not spec or not spec.loader:
+                    raise ImportError(f"Could not load module from {file_path}")
                 module = importlib.util.module_from_spec(spec)
                 sys.modules[module_name] = module
                 spec.loader.exec_module(module)
                 
-                # Scan for subclasses of CustomFeatureBase
-                for attr_name in dir(module):
-                    attr = getattr(module, attr_name)
-                    if (isinstance(attr, type) and 
-                        issubclass(attr, CustomFeatureBase) and 
-                        attr is not CustomFeatureBase):
-                        
-                        # Instantiate to get metadata
-                        instance = attr()
-                        self._register_feature(instance)
-                        self.loaded_features[instance.id] = attr
-                        logger.debug(f"Loaded Custom Feature: {instance.id} ({instance.name})")
+            # Scan for subclasses of CustomFeatureBase
+            for attr_name in dir(module):
+                attr = getattr(module, attr_name)
+                if (isinstance(attr, type) and
+                    issubclass(attr, CustomFeatureBase) and
+                    attr is not CustomFeatureBase):
+
+                    # Instantiate to get metadata
+                    instance = attr()
+                    self._register_feature(instance)
+                    self.loaded_features[instance.id] = attr
+                    self.loaded_instances[instance.id] = instance
+                    logger.debug(f"Loaded Custom Feature: {instance.id} ({instance.name})")
 
         except Exception as e:
             logger.error(f"Failed to load custom feature from {file_path.name}: {e}")
@@ -87,6 +94,41 @@ class CustomFeatureLoader:
         
         # Register to Global Universe
         INDICATOR_UNIVERSE[instance.id] = definition
+
+    def register_into_registry(self, registry, overwrite: bool = False) -> None:
+        """
+        Register custom features into FeatureRegistry at runtime (no disk writes).
+        """
+        self.load_all()
+
+        from src.contracts import FeatureMetadata, TunableParamSpec
+
+        for feature_id, feature_cls in self.loaded_features.items():
+            instance = self.loaded_instances.get(feature_id) or feature_cls()
+            params = []
+            for p in instance.params:
+                params.append(TunableParamSpec(
+                    name=p.name,
+                    param_type=p.param_type,
+                    min=p.min,
+                    max=p.max,
+                    step=p.step,
+                    choices=p.choices,
+                    default=p.default
+                ))
+
+            metadata = FeatureMetadata(
+                feature_id=instance.id,
+                name=instance.name,
+                category=str(instance.category).upper(),
+                description=instance.description,
+                params=params,
+                code_snippet="",
+                handler_func=feature_cls.__name__,
+                source="custom",
+                outputs={"value": "value"}
+            )
+            registry.register_runtime(metadata, feature_cls, overwrite=overwrite)
 
 # Global Loader Instance
 loader = CustomFeatureLoader()

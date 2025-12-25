@@ -24,6 +24,7 @@ from src.l1_judge.evaluator import (
     sample_risk_params,
     stable_hash,
     validate_sample,
+    collect_validation_failures,
 )
 from src.evaluation.real_evaluator import RealEvaluator
 from src.evaluation.fast_filter import FastFilter
@@ -420,10 +421,16 @@ def _evaluate_policy_windows(
 
                 # [vNext] Validation (Hard Gate)
                 passed, reason = validate_sample(metrics)
+                failure_codes = [f.code for f in collect_validation_failures(metrics)]
                 
                 # [V14] Track rejection for QA
                 from dataclasses import replace
-                metrics = replace(metrics, is_rejected=(not passed), rejection_reason=reason)
+                metrics = replace(
+                    metrics,
+                    is_rejected=(not passed),
+                    rejection_reason=reason,
+                    failure_codes=failure_codes,
+                )
 
                 if not passed:
                     sample_score = float(config.EVAL_SCORE_MIN)
@@ -589,9 +596,9 @@ def evaluate_stage(
     regime_id: str,
     n_jobs: int,
     feature_map: Optional[Dict[str, pd.DataFrame]] = None, # [V12-O] Optional map
-) -> Tuple[List[EvaluationResult], str]:
+) -> Tuple[List[EvaluationResult], dict]:
     if not policies:
-        return []
+        return [], {"status": "EMPTY"}
 
     if stage == "fast":
         sample_count = config.EVAL_RISK_SAMPLES_FAST
@@ -700,13 +707,13 @@ def evaluate_v12_batch(
     df: pd.DataFrame,
     regime_id: str,
     n_jobs: int,
-) -> Tuple[List[EvaluationResult], str]:
+) -> Tuple[List[EvaluationResult], dict]:
     """
     V12-BT Batch Evaluation Orchestrator
     [V14-O] Optimized with chunking, pool reuse, and reduced data transfer.
     """
     if not policies:
-        return []
+        return [], {"status": "EMPTY"}
 
     # 0. Prepare Data for Workers (numpy-only to avoid massive serialization)
     df_values = df.values
@@ -758,12 +765,31 @@ def evaluate_v12_batch(
     
     # Selection (Mixed Strategy: Elites + Explorers)
     top_n = getattr(config, "V12_ELITE_TOP_N", 5)
+    curr_stage = getattr(config, "CURRICULUM_CURRENT_STAGE", 1)
+    stage_cfg = config.CURRICULUM_STAGES.get(curr_stage, {})
+    exploration_slot = float(getattr(stage_cfg, "exploration_slot", 0.2))
     
     from src.evaluation.dual_stage import DualStageEvaluator
     ds_eval = DualStageEvaluator()
-    promoted_policies = ds_eval.select_mixed_candidates(scored_policies, elite_n=top_n)
+    promote_total = max(top_n, int(round(len(scored_policies) * config.EVAL_FAST_TOP_PCT)))
+    promote_total = min(promote_total, len(scored_policies))
+    explorer_n = int(round(promote_total * exploration_slot)) if promote_total > 0 else 0
+    if exploration_slot > 0 and promote_total > 1 and explorer_n == 0:
+        explorer_n = 1
+    elite_n = max(1, promote_total - explorer_n) if promote_total > 0 else 0
+    promoted_policies = ds_eval.select_mixed_candidates(
+        scored_policies,
+        elite_n=elite_n,
+        explorer_n=explorer_n
+    )
     promoted_templates = {p.template_id for p in promoted_policies}
     
+    cold_ratio = explorer_n / max(1, promote_total) if promote_total > 0 else 0.0
+    if hasattr(inst, "record_exploration"):
+        inst.record_exploration(cold_ratio)
+    logger.info(
+        f">>> [V12-BT] Promotion Mix: Elite {elite_n} | Cold-start {explorer_n} ({cold_ratio:.1%})"
+    )
     logger.info(f">>> [V12-BT] Stage 2: Detailed Evaluation for {len(promoted_policies)} promoted candidates...")
     
     # 2. Stage 2: Detailed Evaluation (Promoted only)

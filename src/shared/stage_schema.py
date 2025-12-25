@@ -27,6 +27,10 @@ class StageSpec:
     
     # 4. Exploration Control
     exploration_slot: float = 0.2 # Ratio of samples dedicated to pure exploration in this stage
+
+    # 4.1 Rejection & Signal Degeneracy Control
+    reject_base_penalty: float = -30.0
+    signal_degeneracy_mode: str = "soft" # "soft" (penalty) or "hard" (rejection)
     
     # 5. Diagnostic Rules
     rejection_rate_range: Tuple[float, float] = (0.3, 0.9)

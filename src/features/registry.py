@@ -118,6 +118,18 @@ class FeatureRegistry:
             
             self._load_from_disk()
             self._loaded = True
+        self._register_custom_features()
+
+    def _register_custom_features(self) -> None:
+        """
+        Loads custom features at runtime without persisting them to disk.
+        Keeps registry as SSOT while allowing local extensions.
+        """
+        try:
+            from src.features.custom.loader import loader as custom_loader
+            custom_loader.register_into_registry(self)
+        except Exception as e:
+            logger.warning(f"Custom feature registration skipped: {e}")
 
     def register(self, metadata: FeatureMetadata, overwrite: bool = False):
         """
@@ -130,6 +142,19 @@ class FeatureRegistry:
             self._features[metadata.feature_id] = metadata
             self._save_to_disk()
             logger.info(f"Registered feature: {metadata.feature_id} ({metadata.name})")
+
+    def register_runtime(self, metadata: FeatureMetadata, handler_cls: Type, overwrite: bool = False) -> None:
+        """
+        Registers a feature only for this process (no disk write).
+        Intended for dynamic custom features.
+        """
+        with self._lock:
+            if not overwrite and metadata.feature_id in self._features:
+                return
+
+            self._features[metadata.feature_id] = metadata
+            self._handler_cache[metadata.feature_id] = handler_cls
+            logger.info(f"Registered runtime feature: {metadata.feature_id} ({metadata.name})")
 
     def get(self, feature_id: str) -> Optional[FeatureMetadata]:
         if not self._loaded:

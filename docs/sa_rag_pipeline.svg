@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1200" height="700" fill="#ffffff"/>
+  
+  <rect x="40" y="160" width="820" height="430" fill="none" stroke="#555" stroke-width="2" stroke-dasharray="8,6"/>
+  <text x="60" y="150" font-size="14" font-family="Arial" fill="#333">Ontology / KG Zone</text>
+
+  
+  <rect x="60" y="60" width="180" height="70" rx="8" fill="#f5f5f5" stroke="#333" stroke-width="2"/>
+  <text x="150.0" y="95.0" text-anchor="middle" dominant-baseline="middle" font-size="16" font-family="Arial">Query</text>
+
+  <rect x="300" y="60" width="240" height="70" rx="8" fill="#f5f5f5" stroke="#333" stroke-width="2"/>
+  <text x="420.0" y="95.0" text-anchor="middle" dominant-baseline="middle" font-size="16" font-family="Arial">Seed Entities</text>
+
+  <rect x="600" y="60" width="240" height="70" rx="8" fill="#f5f5f5" stroke="#333" stroke-width="2"/>
+  <text x="720.0" y="95.0" text-anchor="middle" dominant-baseline="middle" font-size="16" font-family="Arial">Subgraph Fetch</text>
+
+  <rect x="900" y="60" width="240" height="70" rx="8" fill="#f5f5f5" stroke="#333" stroke-width="2"/>
+  <text x="1020.0" y="95.0" text-anchor="middle" dominant-baseline="middle" font-size="16" font-family="Arial">Answer Gen</text>
+
+  <rect x="60" y="200" width="360" height="120" rx="8" fill="#f5f5f5" stroke="#333" stroke-width="2"/>
+  <text x="240.0" y="260.0" text-anchor="middle" dominant-baseline="middle" font-size="16" font-family="Arial">Phase 1: Indexing
+Chunks + Entities + Relations
+Embeddings + KG</text>
+
+  <rect x="480" y="200" width="360" height="120" rx="8" fill="#f5f5f5" stroke="#333" stroke-width="2"/>
+  <text x="660.0" y="260.0" text-anchor="middle" dominant-baseline="middle" font-size="16" font-family="Arial">Phase 2: Subgraph
+Top-k entity desc + n-hop</text>
+
+  <rect x="900" y="200" width="240" height="120" rx="8" fill="#f5f5f5" stroke="#333" stroke-width="2"/>
+  <text x="1020.0" y="260.0" text-anchor="middle" dominant-baseline="middle" font-size="16" font-family="Arial">Phase 4: LLM
+Activated nodes + docs</text>
+
+  <rect x="60" y="380" width="420" height="160" rx="8" fill="#f5f5f5" stroke="#333" stroke-width="2"/>
+  <text x="270.0" y="460.0" text-anchor="middle" dominant-baseline="middle" font-size="16" font-family="Arial">Phase 3: Spreading Activation
+Init a_i=1 for seeds
+Edge weights: cos sim
+Normalize w'=(w-c)/(1-c)
+Propagate + threshold</text>
+
+  
+  <line x1="240" y1="95" x2="300" y2="95" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <line x1="540" y1="95" x2="600" y2="95" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <line x1="840" y1="95" x2="900" y2="95" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <line x1="180" y1="130" x2="180" y2="200" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <line x1="660" y1="130" x2="660" y2="200" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <line x1="1020" y1="130" x2="1020" y2="200" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <line x1="420" y1="260" x2="480" y2="260" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <line x1="660" y1="320" x2="660" y2="380" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <line x1="900" y1="460" x2="900" y2="260" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+
+</svg>

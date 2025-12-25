@@ -14,6 +14,7 @@ import time
 import logging
 import multiprocessing
 import os
+import numpy as np
 from typing import Optional, List, Tuple
 from dataclasses import dataclass
 
@@ -32,6 +33,7 @@ from src.l3_meta.agent import MetaAgent
 from src.l3_meta.detectors.regime import RegimeDetector
 from src.l3_meta.curriculum_controller import get_curriculum_controller
 from src.l3_meta.epsilon_manager import get_epsilon_manager
+from src.l3_meta.reward_shaper import get_reward_shaper
 from src.orchestration.evaluation import evaluate_stage, evaluate_v12_batch, persist_best_samples, ModuleResult
 from src.data.loader import DataLoader
 from src.contracts import PolicySpec
@@ -364,6 +366,15 @@ def infinite_loop(
         batch_seed = 2025 + batch_idx
         instrumentation.start_batch(batch_idx, batch_seed, n_jobs)
 
+        # Defaults for batch-level reporting to avoid undefined vars
+        policies = []
+        results = []
+        valid_results = []
+        diverse_results = []
+        batch_rewards = []
+        diagnostic_status = {"status": "EMPTY"}
+        tuner = None
+
         # A. Detect Regime (Situation Awareness)
         regime = detector.detect(df)
 
@@ -504,7 +515,10 @@ def infinite_loop(
                     )
                     batch_rewards.append((res.score, res.policy_spec, m_dict))
             
-            diagnostic_status = "OK" # Placeholder for sequential
+            policies = [r.policy_spec for r in results]
+            valid_results = [r for r in results if r.score > config.EVAL_SCORE_MIN]
+            diverse_results = list(valid_results)
+            diagnostic_status = {"status": "OK"}
             logger.info(f"  >>> [Sequential] Batch Complete. {len(results)} experiments run.")
 
         # ==========================================================================================
@@ -524,7 +538,16 @@ def infinite_loop(
         # [V15] UNIFIED BATCH REPORT
         # ==========================================================================================
         batch_duration = time.time() - batch_start_time
-        c_info = curriculum.get_stage_info()
+        if curriculum:
+            c_info = curriculum.get_stage_info()
+        else:
+            c_info = {
+                "description": "CURRICULUM_DISABLED",
+                "current_stage": 0,
+                "stage_passes": 0,
+                "threshold_to_next": 0,
+                "target_return_pct": 0,
+            }
         e_snap = eps_manager.snapshot()
         cache_stats = get_feature_cache().stats
         

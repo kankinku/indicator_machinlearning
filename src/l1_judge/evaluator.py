@@ -36,6 +36,14 @@ class RiskSample:
     horizon: int
 
 
+@dataclass(frozen=True)
+class ValidationFailure:
+    code: str
+    detail: str
+    distance: float
+    is_hard: bool = True
+
+
 # [V16] SampleMetrics is now an alias for WindowMetrics from src.shared.metrics
 
 
@@ -211,49 +219,180 @@ def compute_sample_metrics(
     )
     return metrics
 
+def _ratio_below(value: float, minimum: float) -> float:
+    if minimum <= 0:
+        return 0.0
+    return max(0.0, (minimum - value) / minimum)
+
+
+def _ratio_above(value: float, maximum: float) -> float:
+    if maximum <= 0:
+        return 0.0
+    return max(0.0, (value - maximum) / maximum)
+
+
+def _collect_validation_failures_raw(
+    trades_per_year: float,
+    exposure_ratio: float,
+    excess_return: float,
+    win_rate: float,
+    max_drawdown_pct: float,
+    profit_factor: float,
+    top1_share: float,
+    trade_count: int,
+    entry_signal_rate: float,
+    percent_in_market: float,
+    stage_cfg: object,
+) -> List[ValidationFailure]:
+    failures: List[ValidationFailure] = []
+
+    # 1. Minimum Activity (Annualized)
+    min_tpy = getattr(stage_cfg, "min_trades_per_year", 2.0)
+    if trades_per_year < min_tpy:
+        failures.append(ValidationFailure(
+            code="FAIL_MIN_TRADES",
+            detail=f"{trades_per_year:.1f} < {min_tpy}",
+            distance=_ratio_below(trades_per_year, min_tpy),
+            is_hard=True,
+        ))
+
+    # 2. Exposure Gate
+    min_exp = getattr(stage_cfg, "min_exposure", config.VAL_MIN_EXPOSURE)
+    if exposure_ratio < min_exp:
+        failures.append(ValidationFailure(
+            code="FAIL_LOW_EXPOSURE",
+            detail=f"{exposure_ratio:.1%} < {min_exp:.1%}",
+            distance=_ratio_below(exposure_ratio, min_exp),
+            is_hard=True,
+        ))
+
+    # 3. Excess Return PA Gate (Stage Dependent)
+    min_excess = getattr(stage_cfg, "min_excess_return_pa", 0.0)
+    if excess_return < min_excess:
+        denom = max(1.0, abs(min_excess))
+        failures.append(ValidationFailure(
+            code="FAIL_LOW_RETURN",
+            detail=f"{excess_return:.1f}% < {min_excess}%",
+            distance=max(0.0, (min_excess - excess_return) / denom),
+            is_hard=True,
+        ))
+
+    # 4. Winrate Limits
+    if win_rate < config.VAL_WINRATE_MIN:
+        failures.append(ValidationFailure(
+            code="FAIL_WINRATE_LOW",
+            detail=f"{win_rate:.1%} < {config.VAL_WINRATE_MIN:.1%}",
+            distance=_ratio_below(win_rate, config.VAL_WINRATE_MIN),
+            is_hard=True,
+        ))
+    if win_rate > config.VAL_WINRATE_MAX:
+        failures.append(ValidationFailure(
+            code="FAIL_WINRATE_HIGH",
+            detail=f"{win_rate:.1%} > {config.VAL_WINRATE_MAX:.1%}",
+            distance=_ratio_above(win_rate, config.VAL_WINRATE_MAX),
+            is_hard=True,
+        ))
+
+    # 5. MDD Gate
+    max_mdd = getattr(stage_cfg, "max_mdd_pct", config.VAL_MAX_MDD_PCT)
+    if max_drawdown_pct > max_mdd:
+        failures.append(ValidationFailure(
+            code="FAIL_MDD_BREACH",
+            detail=f"{max_drawdown_pct:.1f}% > {max_mdd}%",
+            distance=_ratio_above(max_drawdown_pct, max_mdd),
+            is_hard=True,
+        ))
+
+    # 6. Profit Factor Gate
+    min_pf = getattr(stage_cfg, "min_profit_factor", 1.0)
+    if profit_factor < min_pf:
+        failures.append(ValidationFailure(
+            code="FAIL_PF",
+            detail=f"{profit_factor:.2f} < {min_pf}",
+            distance=_ratio_below(profit_factor, min_pf),
+            is_hard=True,
+        ))
+
+    # 7. Anti-Luck (Lucky Strike)
+    if top1_share > config.ANTILUCK_TOP1_SHARE_MAX:
+        failures.append(ValidationFailure(
+            code="FAIL_LUCKY_STRIKE",
+            detail=f"{top1_share:.2f} > {config.ANTILUCK_TOP1_SHARE_MAX}",
+            distance=_ratio_above(top1_share, config.ANTILUCK_TOP1_SHARE_MAX),
+            is_hard=True,
+        ))
+
+    # 8. Signal Degeneracy (soft in early stages)
+    deg_min_trades = getattr(config, "SIGNAL_DEGENERATE_MIN_TRADES", 5)
+    deg_min_rate = getattr(config, "SIGNAL_DEGENERATE_MIN_ENTRY_RATE", 0.002)
+    deg_min_pct = getattr(config, "SIGNAL_DEGENERATE_MIN_PCT_IN_MARKET", 0.01)
+    deg_dist = max(
+        _ratio_below(float(trade_count), float(deg_min_trades)),
+        _ratio_below(entry_signal_rate, deg_min_rate),
+        _ratio_below(percent_in_market, deg_min_pct),
+    )
+    if deg_dist > 0.0:
+        mode = getattr(stage_cfg, "signal_degeneracy_mode", "soft")
+        failures.append(ValidationFailure(
+            code="FAIL_SIGNAL_DEGENERATE",
+            detail=f"rate={entry_signal_rate:.4f}, in_mkt={percent_in_market:.2%}, trades={trade_count}",
+            distance=deg_dist,
+            is_hard=(mode == "hard"),
+        ))
+
+    return failures
+
+
+def collect_validation_failures(metrics: SampleMetrics) -> List[ValidationFailure]:
+    curr_stage = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
+    stage_cfg = config.CURRICULUM_STAGES.get(curr_stage, {})
+    return _collect_validation_failures_raw(
+        trades_per_year=metrics.trades.trades_per_year,
+        exposure_ratio=metrics.equity.exposure_ratio,
+        excess_return=metrics.equity.excess_return,
+        win_rate=metrics.trades.win_rate,
+        max_drawdown_pct=metrics.equity.max_drawdown_pct,
+        profit_factor=metrics.trades.profit_factor,
+        top1_share=metrics.trades.top1_share,
+        trade_count=metrics.trades.trade_count,
+        entry_signal_rate=metrics.trades.entry_signal_rate,
+        percent_in_market=metrics.equity.percent_in_market,
+        stage_cfg=stage_cfg,
+    )
+
+
+def collect_validation_failures_from_dict(metrics: Dict[str, float]) -> List[ValidationFailure]:
+    curr_stage = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
+    stage_cfg = config.CURRICULUM_STAGES.get(curr_stage, {})
+    trade_count = int(metrics.get("n_trades", metrics.get("trade_count", 0)))
+    oos_bars = int(metrics.get("oos_bars", 252))
+    entry_rate = metrics.get("entry_signal_rate", trade_count / max(1, oos_bars))
+    percent_in_market = metrics.get("percent_in_market", metrics.get("exposure_ratio", 0.0))
+    return _collect_validation_failures_raw(
+        trades_per_year=float(metrics.get("trades_per_year", 0.0)),
+        exposure_ratio=float(metrics.get("exposure_ratio", percent_in_market)),
+        excess_return=float(metrics.get("excess_return", 0.0)),
+        win_rate=float(metrics.get("win_rate", 0.0)),
+        max_drawdown_pct=float(metrics.get("mdd_pct", 0.0)),
+        profit_factor=float(metrics.get("profit_factor", 1.0)),
+        top1_share=float(metrics.get("top1_share", 0.0)),
+        trade_count=trade_count,
+        entry_signal_rate=float(entry_rate),
+        percent_in_market=float(percent_in_market),
+        stage_cfg=stage_cfg,
+    )
+
+
 def validate_sample(metrics: SampleMetrics) -> Tuple[bool, str]:
     """
     [V14] Validation Layer (Standardized Failure Codes)
     Uses period-normalized metrics (trades_per_year) and annualized excess return gates.
     """
-    curr_stage = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
-    stage_cfg = config.CURRICULUM_STAGES.get(curr_stage, {})
-    
-    # 1. Minimum Activity (Annualized)
-    min_tpy = getattr(stage_cfg, "min_trades_per_year", 2.0)
-    if metrics.trades.trades_per_year < min_tpy:
-        return False, f"FAIL_MIN_TRADES ({metrics.trades.trades_per_year:.1f} < {min_tpy})"
-
-    # 2. Exposure Gate
-    min_exp = getattr(stage_cfg, "min_exposure", 0.05)
-    if metrics.equity.exposure_ratio < min_exp:
-        return False, f"FAIL_LOW_EXPOSURE ({metrics.equity.exposure_ratio:.1%} < {min_exp:.1%})"
-
-    # 3. Excess Return PA Gate (Stage Dependent)
-    min_excess = getattr(stage_cfg, "min_excess_return_pa", 0.0)
-    if metrics.equity.excess_return < min_excess:
-        return False, f"FAIL_LOW_RETURN ({metrics.equity.excess_return:.1f}% < {min_excess}%)"
-
-    # 4. Winrate Limits
-    if metrics.trades.win_rate < config.VAL_WINRATE_MIN:
-        return False, f"FAIL_WINRATE_LOW ({metrics.trades.win_rate:.1%} < {config.VAL_WINRATE_MIN:.1%})"
-    if metrics.trades.win_rate > config.VAL_WINRATE_MAX:
-        return False, f"FAIL_WINRATE_HIGH ({metrics.trades.win_rate:.1%} < {config.VAL_WINRATE_MAX:.1%})"
-
-    # 5. MDD Gate
-    max_mdd = getattr(stage_cfg, "max_mdd_pct", config.VAL_MAX_MDD_PCT)
-    if metrics.equity.max_drawdown_pct > max_mdd:
-        return False, f"FAIL_MDD_BREACH ({metrics.equity.max_drawdown_pct:.1f}% > {max_mdd}%)"
-
-    # 6. Profit Factor Gate
-    min_pf = getattr(stage_cfg, "min_profit_factor", 1.0)
-    if metrics.trades.profit_factor < min_pf:
-        return False, f"FAIL_PF ({metrics.trades.profit_factor:.2f} < {min_pf})"
-
-    # 7. Anti-Luck (Lucky Strike)
-    if metrics.trades.top1_share > config.ANTILUCK_TOP1_SHARE_MAX:
-        return False, f"FAIL_LUCKY_STRIKE (T1: {metrics.trades.top1_share:.2f} > {config.ANTILUCK_TOP1_SHARE_MAX})"
-        
+    failures = collect_validation_failures(metrics)
+    hard_failures = [f for f in failures if f.is_hard]
+    if hard_failures:
+        primary = hard_failures[0]
+        return False, f"{primary.code} ({primary.detail})"
     return True, "PASS"
 
 

@@ -110,6 +110,7 @@ class D3QNAgent:
         # 경험 재현 버퍼
         self.replay_buffer = create_replay_buffer(
             prioritized=False,  # 기본은 Uniform
+            tagged=getattr(config, "REPLAY_TAGGED_ENABLED", False),
             capacity=config.D3QN_BUFFER_SIZE,
             batch_size=config.D3QN_BATCH_SIZE,
         )
@@ -239,10 +240,12 @@ class D3QNAgent:
         
         # 보상 재계산 (metrics 있으면)
         is_rejected = False
+        replay_tag = "PASS"
         if metrics is not None:
             reward_breakdown = self.reward_shaper.compute_breakdown(metrics)
             reward = reward_breakdown.total
             is_rejected = reward_breakdown.is_rejected
+            replay_tag = getattr(reward_breakdown, "replay_tag", "PASS")
             
             # 성과 추적 (정체 감지용)
             self.reward_history.append(float(reward))
@@ -264,7 +267,10 @@ class D3QNAgent:
             next_state=next_state,
             done=False,
         )
-        self.replay_buffer.push(experience)
+        try:
+            self.replay_buffer.push(experience, tag=replay_tag)
+        except TypeError:
+            self.replay_buffer.push(experience)
         
         self.step_count += 1
         
@@ -296,6 +302,26 @@ class D3QNAgent:
         # 주기적 저장
         if self.step_count % 100 == 0:
             self.save()
+
+        if self.step_count % 50 == 0:
+            recent_rewards = self.reward_history[-200:] if self.reward_history else []
+            if recent_rewards:
+                reward_std = float(np.std(recent_rewards))
+                logger.info(f"    [D3QN] Reward Std(200): {reward_std:.4f}")
+            try:
+                stats = self.replay_buffer.stats
+                tag_counts = stats.get("tag_counts", {})
+                if tag_counts:
+                    total = sum(tag_counts.values()) or 1
+                    hard_ratio = tag_counts.get("HARD_FAIL", 0) / total
+                    near_ratio = tag_counts.get("NEAR_PASS", 0) / total
+                    pass_ratio = tag_counts.get("PASS", 0) / total
+                    logger.info(
+                        "    [D3QN] Replay Mix: PASS %.2f | NEAR %.2f | HARD %.2f"
+                        % (pass_ratio, near_ratio, hard_ratio)
+                    )
+            except Exception:
+                pass
         
         logger.info(
             f"    [D3QN] 보상: {reward:.3f} | 버퍼: {len(self.replay_buffer)} | "

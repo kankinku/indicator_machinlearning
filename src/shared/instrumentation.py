@@ -38,6 +38,9 @@ class BatchMetrics:
     # Diversity
     diversity_mean_jaccard: float = 0.0
     duplicate_ratio: float = 0.0
+
+    # Exploration
+    cold_start_ratio: float = 0.0
     
     # Stability
     exceptions: Dict[str, int] = field(default_factory=dict)
@@ -105,6 +108,10 @@ class BatchInstrumentation:
         if self.current_metrics:
             self.current_metrics.diversity_mean_jaccard = mean_jaccard
             self.current_metrics.duplicate_ratio = duplicate_ratio
+
+    def record_exploration(self, cold_start_ratio: float):
+        if self.current_metrics:
+            self.current_metrics.cold_start_ratio = cold_start_ratio
 
     def record_exception(self, exc_type: str):
         if self.current_metrics:

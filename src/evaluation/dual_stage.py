@@ -27,10 +27,28 @@ class DualStageEvaluator:
         # 1. Take Elites
         elites = [p for s, p in sorted_policies[:elite_n]]
         
-        # 2. Take Explorers (the rest, up to explorer_n)
+        # 2. Take Explorers (diversity-aware among the rest)
         rest = sorted_policies[elite_n:]
         import random
         explorer_count = min(len(rest), explorer_n)
-        explorers = [p for s, p in random.sample(rest, explorer_count)] if rest else []
+        if explorer_count <= 0:
+            return elites
+
+        if elites and rest:
+            try:
+                from src.l1_judge.diversity import calculate_genome_similarity
+                scored = []
+                for _, cand in rest:
+                    max_sim = max(
+                        calculate_genome_similarity(cand, elite) for elite in elites
+                    )
+                    diversity_score = 1.0 - max_sim
+                    scored.append((diversity_score, cand))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                explorers = [p for _, p in scored[:explorer_count]]
+            except Exception:
+                explorers = [p for s, p in random.sample(rest, explorer_count)] if rest else []
+        else:
+            explorers = [p for s, p in random.sample(rest, explorer_count)] if rest else []
         
         return elites + explorers

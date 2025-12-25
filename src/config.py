@@ -64,6 +64,18 @@ class BaseConfig:
         "XLK": "XLK",
         "XLE": "XLE"
     })
+
+    # ----------------------------------------
+    # SA-RAG (Ontology Zone)
+    # ----------------------------------------
+    SA_CHUNK_SIZE_WORDS: int = field(default_factory=lambda: int(os.getenv("SA_CHUNK_SIZE_WORDS", "500")))
+    SA_CHUNK_OVERLAP_WORDS: int = field(default_factory=lambda: int(os.getenv("SA_CHUNK_OVERLAP_WORDS", "200")))
+    SA_TOP_K: int = field(default_factory=lambda: int(os.getenv("SA_TOP_K", "5")))
+    SA_N_HOP: int = field(default_factory=lambda: int(os.getenv("SA_N_HOP", "2")))
+    SA_NORMALIZATION_C: float = field(default_factory=lambda: float(os.getenv("SA_NORMALIZATION_C", "0.4")))
+    SA_THRESHOLD: float = field(default_factory=lambda: float(os.getenv("SA_THRESHOLD", "0.5")))
+    SA_MAX_ENTITIES_PER_CHUNK: int = field(default_factory=lambda: int(os.getenv("SA_MAX_ENTITIES_PER_CHUNK", "6")))
+    SA_MAX_CONTEXT_CHUNKS: int = field(default_factory=lambda: int(os.getenv("SA_MAX_CONTEXT_CHUNKS", "6")))
     
     # ----------------------------------------
     # Execution Settings
@@ -163,6 +175,48 @@ class BaseConfig:
     # [V11] 상위 트레이드 기여도 목표
     REWARD_TOP_TRADE_PCT: float = 0.2          # 상위 20%
     REWARD_TOP_TRADE_CONTRIB_TARGET: float = 0.6  # 60% 이상 기여하면 보너스
+
+    # ----------------------------------------
+    # Rejection Scoring (Decomposed Penalty Vector)
+    # ----------------------------------------
+    REJECT_BASE_PENALTY_BY_STAGE: dict = field(default_factory=lambda: {
+        1: -15.0,
+        2: -30.0,
+        3: -50.0,
+    })
+    REJECT_REASON_PENALTIES: dict = field(default_factory=lambda: {
+        "FAIL_MIN_TRADES": -10.0,
+        "FAIL_LOW_EXPOSURE": -8.0,
+        "FAIL_LOW_RETURN": -12.0,
+        "FAIL_WINRATE_LOW": -8.0,
+        "FAIL_WINRATE_HIGH": -10.0,
+        "FAIL_MDD_BREACH": -20.0,
+        "FAIL_PF": -10.0,
+        "FAIL_LUCKY_STRIKE": -15.0,
+        "FAIL_SIGNAL_DEGENERATE": -8.0,
+    })
+    REJECT_DISTANCE_PENALTY_WEIGHTS: dict = field(default_factory=lambda: {
+        "FAIL_MIN_TRADES": -12.0,
+        "FAIL_LOW_EXPOSURE": -10.0,
+        "FAIL_LOW_RETURN": -12.0,
+        "FAIL_WINRATE_LOW": -8.0,
+        "FAIL_WINRATE_HIGH": -8.0,
+        "FAIL_MDD_BREACH": -20.0,
+        "FAIL_PF": -8.0,
+        "FAIL_LUCKY_STRIKE": -12.0,
+        "FAIL_SIGNAL_DEGENERATE": -10.0,
+    })
+    REJECT_SCORE_FLOOR: float = -100.0
+    REJECT_SOFT_PENALTY_SCALE: float = 0.5
+    REJECT_NEAR_PASS_MAX_FAILURES: int = 2
+    REJECT_NEAR_PASS_MAX_DISTANCE: float = 0.35
+
+    # ----------------------------------------
+    # Signal Degeneracy Thresholds
+    # ----------------------------------------
+    SIGNAL_DEGENERATE_MIN_TRADES: int = 5
+    SIGNAL_DEGENERATE_MIN_ENTRY_RATE: float = 0.002
+    SIGNAL_DEGENERATE_MIN_PCT_IN_MARKET: float = 0.01
 
     # ----------------------------------------
     # Genome Evolution Settings
@@ -335,7 +389,9 @@ class BaseConfig:
             quantile_bias="center",
             wf_splits=3,
             wf_gate_mode="soft",
-            exploration_slot=0.4
+            exploration_slot=0.4,
+            reject_base_penalty=-15.0,
+            signal_degeneracy_mode="soft"
         ),
         2: StageSpec(
             stage_id=2,
@@ -349,7 +405,9 @@ class BaseConfig:
             quantile_bias="spread",
             wf_splits=3,
             wf_gate_mode="soft",
-            exploration_slot=0.2
+            exploration_slot=0.2,
+            reject_base_penalty=-30.0,
+            signal_degeneracy_mode="soft"
         ),
         3: StageSpec(
             stage_id=3,
@@ -363,7 +421,9 @@ class BaseConfig:
             quantile_bias="tail",
             wf_splits=5,
             wf_gate_mode="hard",
-            exploration_slot=0.1
+            exploration_slot=0.1,
+            reject_base_penalty=-50.0,
+            signal_degeneracy_mode="hard"
         )
     })
     CURRICULUM_CURRENT_STAGE: int = 1
@@ -372,7 +432,7 @@ class BaseConfig:
     # [V14] Failure Taxonomy Tree
     # Categories: SIGNAL, EDGE, RISK, COMPLEXITY, DATA
     FAILURE_TAXONOMY: dict = field(default_factory=lambda: {
-        "SIGNAL_ISSUE": ["FAIL_MIN_TRADES", "FAIL_LOW_EXPOSURE", "FAIL_ZERO_EXPOSURE", "FAIL_OVER_EXPOSURE"],
+        "SIGNAL_ISSUE": ["FAIL_MIN_TRADES", "FAIL_LOW_EXPOSURE", "FAIL_ZERO_EXPOSURE", "FAIL_OVER_EXPOSURE", "FAIL_SIGNAL_DEGENERATE"],
         "EDGE_ISSUE": ["FAIL_LOW_RETURN", "FAIL_NEG_ALPHA", "FAIL_PF", "FAIL_WINRATE_LOW", "FAIL_WINRATE_HIGH"],
         "RISK_ISSUE": ["FAIL_MDD_BREACH", "FAIL_LUCKY_STRIKE", "FAIL_WORST_WINDOW"],
         "COMPLEXITY_ISSUE": ["FAIL_COMPLEXITY_HIGH", "FAIL_AST_DEPTH"],
@@ -441,6 +501,16 @@ class BaseConfig:
     # ----------------------------------------
     ANTILUCK_TOP1_SHARE_MAX: float = 0.60
     ANTILUCK_TOP3_SHARE_MAX: float = 0.85
+
+    # ----------------------------------------
+    # Replay Buffer Tagging
+    # ----------------------------------------
+    REPLAY_TAGGED_ENABLED: bool = True
+    REPLAY_TAG_SAMPLE_RATIOS: dict = field(default_factory=lambda: {
+        "PASS": 0.5,
+        "NEAR_PASS": 0.3,
+        "HARD_FAIL": 0.2,
+    })
     
     # ----------------------------------------
     # 4. Walk-forward Consistency Gate
