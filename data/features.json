@@ -3,8 +3,8 @@
         "feature_id": "VOLATILITY_ATR_V1",
         "name": "Average True Range",
         "category": "VOLATILITY",
-        "description": "Standard ATR and Normalized ATR.",
-        "code_snippet": "\nimport pandas as pd\nimport ta\n\nclass ATRIndicator:\n    def compute(self, df: pd.DataFrame, window: int = 14) -> pd.DataFrame:\n        atr = ta.volatility.AverageTrueRange(df[\"high\"], df[\"low\"], df[\"close\"], window=window)\n        vals = atr.average_true_range()\n        atr_norm = vals / df[\"close\"] * 100\n        return pd.DataFrame({\"atr\": vals, \"atr_norm\": atr_norm}, index=df.index)\n",
+        "description": "ATR with Velocity and Low-Vol Persistence (Alpha-Power V1).",
+        "code_snippet": "\nimport pandas as pd\nimport ta\nimport numpy as np\n\nclass ATRIndicator:\n    def compute(self, df: pd.DataFrame, window: int = 14) -> pd.DataFrame:\n        atr_obj = ta.volatility.AverageTrueRange(df[\"high\"], df[\"low\"], df[\"close\"], window=window)\n        vals = atr_obj.average_true_range()\n        atr_norm = vals / df[\"close\"] * 100\n        \n        # [Alpha-Power V1] Flow Features\n        velocity = vals.diff(5) # 5-bar change\n        \n        # Persistence of 'Very Low' volatility (Squeeze candidate)\n        vol_low = (atr_norm < atr_norm.rolling(100).quantile(0.2)).astype(int)\n        persist_low = vol_low.groupby((vol_low != vol_low.shift()).cumsum()).cumsum() * vol_low\n        \n        return pd.DataFrame({\n            \"atr\": vals, \n            \"atr_norm\": atr_norm,\n            \"velocity\": velocity,\n            \"persist_low\": persist_low\n        }, index=df.index)\n",
         "handler_func": "ATRIndicator",
         "params": [
             {
@@ -18,21 +18,26 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "Market Volatilty Level & Energy state",
+        "transition_logic": "Velocity of ATR change indicates volatility expansion/contraction",
+        "memory_window": 20,
+        "causality_link": "Low volatility (SSS) leads to explosive breakout due to energy accumulation.",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
         "usage_count": 0,
         "outputs": {
             "value": "atr",
-            "norm": "atr_norm"
+            "velocity": "velocity",
+            "persist_low": "persist_low"
         }
     },
     {
         "feature_id": "VOLATILITY_BB_V1",
         "name": "Bollinger Bands",
         "category": "VOLATILITY",
-        "description": "Bollinger Bands Upper/Lower/Width.",
-        "code_snippet": "\nimport pandas as pd\nimport ta\n\nclass BBIndicator:\n    def compute(self, df: pd.DataFrame, window: int = 20, std_dev: float = 2.0) -> pd.DataFrame:\n        bb = ta.volatility.BollingerBands(df[\"close\"], window=window, window_dev=std_dev)\n        return pd.DataFrame({\n            \"upper\": bb.bollinger_hband(),\n            \"lower\": bb.bollinger_lband(),\n            \"width\": bb.bollinger_wband()\n        }, index=df.index)\n",
+        "description": "Bollinger Bands with Squeeze Percentile (Alpha-Power V1).",
+        "code_snippet": "\nimport pandas as pd\nimport ta\nimport numpy as np\n\nclass BBIndicator:\n    def compute(self, df: pd.DataFrame, window: int = 20, std_dev: float = 2.0) -> pd.DataFrame:\n        bb = ta.volatility.BollingerBands(df[\"close\"], window=window, window_dev=std_dev)\n        width = bb.bollinger_wband()\n        \n        # [Alpha-Power V1] Squeeze (Width Percentile)\n        squeeze = width.rolling(100).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False)\n        \n        return pd.DataFrame({\n            \"upper\": bb.bollinger_hband(),\n            \"lower\": bb.bollinger_lband(),\n            \"width\": width,\n            \"squeeze\": squeeze\n        }, index=df.index)\n",
         "handler_func": "BBIndicator",
         "params": [
             {
@@ -47,7 +52,7 @@
             {
                 "name": "std_dev",
                 "param_type": "float",
-                "min": 1.5,
+                "min": 1.0,
                 "max": 3.0,
                 "step": 0.1,
                 "choices": null,
@@ -55,6 +60,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "Price distribution relative to volatility-adjusted normal range",
+        "transition_logic": "Band crossing indicates statistical outlier performance",
+        "memory_window": 10,
+        "causality_link": "Mean reversion occurs as internal price pressure hits volatility limits.",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -63,7 +72,7 @@
             "upper": "upper",
             "lower": "lower",
             "width": "width",
-            "value": "width"
+            "squeeze": "squeeze"
         }
     },
     {
@@ -94,6 +103,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -132,6 +145,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -146,8 +163,8 @@
         "feature_id": "MOMENTUM_RSI_V1",
         "name": "Relative Strength Index",
         "category": "MOMENTUM",
-        "description": "RSI with Overbought/Oversold signals.",
-        "code_snippet": "\nimport pandas as pd\nimport ta\n\nclass RSIIndicator:\n    def compute(self, df: pd.DataFrame, window: int = 14, threshold_low: int = 30, threshold_high: int = 70) -> pd.DataFrame:\n        rsi = ta.momentum.RSIIndicator(df[\"close\"], window=window).rsi()\n        return pd.DataFrame({\n            \"rsi\": rsi,\n            \"signal\": rsi.apply(lambda x: 1 if x < threshold_low else (-1 if x > threshold_high else 0))\n        }, index=df.index)\n",
+        "description": "RSI with Velocity and Persistence (Alpha-Power V1).",
+        "code_snippet": "\nimport pandas as pd\nimport ta\nimport numpy as np\n\nclass RSIIndicator:\n    def compute(self, df: pd.DataFrame, window: int = 14) -> pd.DataFrame:\n        rsi = ta.momentum.RSIIndicator(df[\"close\"], window=window).rsi()\n        \n        # [Alpha-Power V1] Flow Features\n        # 1. Velocity (Change rate)\n        velocity = rsi.diff(3) # 3-bar change\n        \n        # 2. Persistence (Time spent in extreme zones)\n        # Count consecutive bars where rsi < 30 or rsi > 70\n        oversold = (rsi < 30).astype(int)\n        overbought = (rsi > 70).astype(int)\n        \n        def count_persistence(series):\n            return series.groupby((series != series.shift()).cumsum()).cumsum()\n            \n        persist_os = count_persistence(oversold) * oversold\n        persist_ob = count_persistence(overbought) * overbought\n        \n        return pd.DataFrame({\n            \"rsi\": rsi,\n            \"velocity\": velocity,\n            \"persist_os\": persist_os,\n            \"persist_ob\": persist_ob\n        }, index=df.index)\n",
         "handler_func": "RSIIndicator",
         "params": [
             {
@@ -158,34 +175,22 @@
                 "step": null,
                 "choices": null,
                 "default": 14
-            },
-            {
-                "name": "threshold_low",
-                "param_type": "int",
-                "min": 20,
-                "max": 40,
-                "step": null,
-                "choices": null,
-                "default": 30
-            },
-            {
-                "name": "threshold_high",
-                "param_type": "int",
-                "min": 60,
-                "max": 80,
-                "step": null,
-                "choices": null,
-                "default": 70
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "Internal relative strength of up moves vs down moves (Exhaustion state)",
+        "transition_logic": "Entering OB/OS zones marks potential climax or start of impulse",
+        "memory_window": 14,
+        "causality_link": "Human emotion reaches extremes in OB/OS, leading to mean-reversion order flow.",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
         "usage_count": 0,
         "outputs": {
             "value": "rsi",
-            "signal": "signal"
+            "velocity": "velocity",
+            "persist_os": "persist_os",
+            "persist_ob": "persist_ob"
         }
     },
     {
@@ -225,6 +230,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -272,6 +281,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -309,6 +322,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -336,6 +353,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -363,6 +384,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -390,6 +415,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -417,6 +446,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -453,6 +486,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -480,6 +517,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -509,6 +550,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -554,6 +599,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -594,6 +643,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -613,6 +666,10 @@
         "handler_func": "OBVIndicator",
         "params": [],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -640,6 +697,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -667,6 +728,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -694,6 +759,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -730,6 +799,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -759,6 +832,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -797,6 +874,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -833,6 +914,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -887,6 +972,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -915,6 +1004,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -953,6 +1046,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -981,6 +1078,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1008,6 +1109,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1035,6 +1140,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1071,6 +1180,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1108,6 +1221,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1135,6 +1252,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1171,6 +1292,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1200,6 +1325,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1227,6 +1356,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1244,6 +1377,10 @@
         "handler_func": "ADLIndicator",
         "params": [],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1280,6 +1417,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1297,6 +1438,10 @@
         "handler_func": "PVTIndicator",
         "params": [],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1324,6 +1469,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1351,6 +1500,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1387,6 +1540,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1414,6 +1571,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1441,6 +1602,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1468,6 +1633,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1498,6 +1667,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1526,6 +1699,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1555,6 +1732,10 @@
             }
         ],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1573,6 +1754,10 @@
         "handler_func": "HeikinAshiIndicator",
         "params": [],
         "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
         "source": "builtin",
         "tags": [],
         "fitness_score": 0.0,
@@ -1583,6 +1768,287 @@
             "open": "HA_Open",
             "high": "HA_High",
             "low": "HA_Low"
+        }
+    },
+    {
+        "feature_id": "VMA",
+        "name": "Variable Moving Average",
+        "category": "TREND",
+        "description": "Moving average that automatically adjusts its smoothing sensitivity based on volatility.",
+        "code_snippet": "",
+        "handler_func": "VariableMovingAverage",
+        "params": [
+            {
+                "name": "window",
+                "param_type": "int",
+                "min": 5,
+                "max": 50,
+                "step": null,
+                "choices": null,
+                "default": 10
+            },
+            {
+                "name": "vi_window",
+                "param_type": "int",
+                "min": 5,
+                "max": 30,
+                "step": null,
+                "choices": null,
+                "default": 10
+            }
+        ],
+        "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
+        "source": "custom",
+        "tags": [],
+        "fitness_score": 0.0,
+        "usage_count": 0,
+        "outputs": {
+            "value": "value"
+        }
+    },
+    {
+        "feature_id": "PA_FAKE_OUT_V1",
+        "name": "Trend Fakeout",
+        "category": "PRICE_ACTION",
+        "description": "Detects failed breakouts/breakdowns (Alpha-Power V1).",
+        "code_snippet": "\nimport pandas as pd\nimport numpy as np\n\nclass FakeoutIndicator:\n    def compute(self, df: pd.DataFrame, window: int = 20, lookback: int = 5) -> pd.DataFrame:\n        # 1. Detect Breakout of N-bar High/Low\n        prev_high = df['high'].rolling(window).max().shift(1)\n        prev_low = df['low'].rolling(window).min().shift(1)\n        \n        break_high = (df['high'] > prev_high).astype(int)\n        break_low = (df['low'] < prev_low).astype(int)\n        \n        # 2. Return into range within 'lookback' bars\n        returned_high = ((df['close'] < prev_high) & (break_high.rolling(lookback).max() > 0)).astype(int)\n        returned_low = ((df['close'] > prev_low) & (break_low.rolling(lookback).max() > 0)).astype(int)\n        \n        # Signal: 1 for Bullish Fakeout (failed breakdown), -1 for Bearish Fakeout (failed breakout)\n        signal = returned_low - returned_high\n        \n        return pd.DataFrame({\n            \"signal\": signal,\n            \"bull_fake\": returned_low,\n            \"bear_fake\": returned_high\n        }, index=df.index)\n",
+        "handler_func": "FakeoutIndicator",
+        "params": [
+            {
+                "name": "window",
+                "param_type": "int",
+                "min": 10,
+                "max": 100,
+                "step": null,
+                "choices": null,
+                "default": 20
+            },
+            {
+                "name": "lookback",
+                "param_type": "int",
+                "min": 2,
+                "max": 10,
+                "step": null,
+                "choices": null,
+                "default": 5
+            }
+        ],
+        "complexity_score": 1.0,
+        "state_logic": "Structural range breakout failure (Price Trap state)",
+        "transition_logic": "Breakout of N-day high/low followed by immediate return to range",
+        "memory_window": 5,
+        "causality_link": "Liquidity hunting or trend exhaustion creates sharp reversals at key levels.",
+        "source": "builtin",
+        "tags": [],
+        "fitness_score": 0.0,
+        "usage_count": 0,
+        "outputs": {
+            "value": "signal",
+            "bull": "bull_fake",
+            "bear": "bear_fake"
+        }
+    },
+    {
+        "feature_id": "MACRO_VIX",
+        "name": "Macro VIX",
+        "category": "MACRO",
+        "description": "Macro Economic Data: VIX",
+        "code_snippet": "\nclass MacroVIXHandler:\n    def compute(self, df, **kwargs):\n        # DF columns are lowercased in factory\n        # Look for partial matches or specific mapped names\n        target = \"vix_close\".lower()\n        if target in df.columns:\n            return df[[target]]\n        # Fallback scan\n        for c in df.columns:\n            if \"vix\" in c:\n                return df[[c]]\n        return None\n",
+        "handler_func": "MacroVIXHandler",
+        "params": [],
+        "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
+        "source": "builtin",
+        "tags": [],
+        "fitness_score": 0.0,
+        "usage_count": 0,
+        "outputs": {
+            "value": "value"
+        }
+    },
+    {
+        "feature_id": "MACRO_US10Y",
+        "name": "Macro US10Y",
+        "category": "MACRO",
+        "description": "Macro Economic Data: US10Y",
+        "code_snippet": "\nclass MacroUS10YHandler:\n    def compute(self, df, **kwargs):\n        # DF columns are lowercased in factory\n        # Look for partial matches or specific mapped names\n        target = \"^tnx_close\".lower()\n        if target in df.columns:\n            return df[[target]]\n        # Fallback scan\n        for c in df.columns:\n            if \"us10y\" in c:\n                return df[[c]]\n        return None\n",
+        "handler_func": "MacroUS10YHandler",
+        "params": [],
+        "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
+        "source": "builtin",
+        "tags": [],
+        "fitness_score": 0.0,
+        "usage_count": 0,
+        "outputs": {
+            "value": "value"
+        }
+    },
+    {
+        "feature_id": "MACRO_DX",
+        "name": "Macro DX",
+        "category": "MACRO",
+        "description": "Macro Economic Data: DX",
+        "code_snippet": "\nclass MacroDXHandler:\n    def compute(self, df, **kwargs):\n        # DF columns are lowercased in factory\n        # Look for partial matches or specific mapped names\n        target = \"dx-y.nyb_close\".lower()\n        if target in df.columns:\n            return df[[target]]\n        # Fallback scan\n        for c in df.columns:\n            if \"dx\" in c:\n                return df[[c]]\n        return None\n",
+        "handler_func": "MacroDXHandler",
+        "params": [],
+        "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
+        "source": "builtin",
+        "tags": [],
+        "fitness_score": 0.0,
+        "usage_count": 0,
+        "outputs": {
+            "value": "value"
+        }
+    },
+    {
+        "feature_id": "MACRO_BTC",
+        "name": "Macro BTC",
+        "category": "MACRO",
+        "description": "Macro Economic Data: BTC",
+        "code_snippet": "\nclass MacroBTCHandler:\n    def compute(self, df, **kwargs):\n        # DF columns are lowercased in factory\n        # Look for partial matches or specific mapped names\n        target = \"btc-usd_close\".lower()\n        if target in df.columns:\n            return df[[target]]\n        # Fallback scan\n        for c in df.columns:\n            if \"btc\" in c:\n                return df[[c]]\n        return None\n",
+        "handler_func": "MacroBTCHandler",
+        "params": [],
+        "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
+        "source": "builtin",
+        "tags": [],
+        "fitness_score": 0.0,
+        "usage_count": 0,
+        "outputs": {
+            "value": "value"
+        }
+    },
+    {
+        "feature_id": "MACRO_USO",
+        "name": "Macro USO",
+        "category": "MACRO",
+        "description": "Macro Economic Data: USO",
+        "code_snippet": "\nclass MacroUSOHandler:\n    def compute(self, df, **kwargs):\n        # DF columns are lowercased in factory\n        # Look for partial matches or specific mapped names\n        target = \"uso_close\".lower()\n        if target in df.columns:\n            return df[[target]]\n        # Fallback scan\n        for c in df.columns:\n            if \"uso\" in c:\n                return df[[c]]\n        return None\n",
+        "handler_func": "MacroUSOHandler",
+        "params": [],
+        "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
+        "source": "builtin",
+        "tags": [],
+        "fitness_score": 0.0,
+        "usage_count": 0,
+        "outputs": {
+            "value": "value"
+        }
+    },
+    {
+        "feature_id": "MACRO_HYG",
+        "name": "Macro HYG",
+        "category": "MACRO",
+        "description": "Macro Economic Data: HYG",
+        "code_snippet": "\nclass MacroHYGHandler:\n    def compute(self, df, **kwargs):\n        # DF columns are lowercased in factory\n        # Look for partial matches or specific mapped names\n        target = \"hyg_close\".lower()\n        if target in df.columns:\n            return df[[target]]\n        # Fallback scan\n        for c in df.columns:\n            if \"hyg\" in c:\n                return df[[c]]\n        return None\n",
+        "handler_func": "MacroHYGHandler",
+        "params": [],
+        "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
+        "source": "builtin",
+        "tags": [],
+        "fitness_score": 0.0,
+        "usage_count": 0,
+        "outputs": {
+            "value": "value"
+        }
+    },
+    {
+        "feature_id": "CONTEXT_TIME",
+        "name": "Cyclical Time",
+        "category": "CONTEXT",
+        "description": "Cyclical Time Features (Seasonality)",
+        "code_snippet": "\nclass ContextTimeHandler:\n    def compute(self, df, **kwargs):\n        from src.features.context_engineering import add_time_features\n        res = add_time_features(df)\n        cols = [c for c in res.columns if 'time_' in c]\n        return res[cols]\n",
+        "handler_func": "ContextTimeHandler",
+        "params": [],
+        "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
+        "source": "builtin",
+        "tags": [],
+        "fitness_score": 0.0,
+        "usage_count": 0,
+        "outputs": {
+            "value": "value"
+        }
+    },
+    {
+        "feature_id": "CONTEXT_STAT",
+        "name": "Statistical Moments",
+        "category": "CONTEXT",
+        "description": "Statistical Moments (Skew/Kurtosis)",
+        "code_snippet": "\nclass ContextStatHandler:\n    def compute(self, df, **kwargs):\n        from src.features.context_engineering import add_statistical_features\n        window = kwargs.get('window', 20)\n        res = add_statistical_features(df, 'close', windows=[window])\n        cols = [c for c in res.columns if 'stat_' in c]\n        return res[cols]\n",
+        "handler_func": "ContextStatHandler",
+        "params": [
+            {
+                "name": "window",
+                "param_type": "int",
+                "min": 10,
+                "max": 60,
+                "step": 10,
+                "choices": 20,
+                "default": null
+            }
+        ],
+        "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
+        "source": "builtin",
+        "tags": [],
+        "fitness_score": 0.0,
+        "usage_count": 0,
+        "outputs": {
+            "value": "value"
+        }
+    },
+    {
+        "feature_id": "REL_SPY",
+        "name": "Relative Strength SPY",
+        "category": "CONTEXT",
+        "description": "Relative Strength vs SPY",
+        "code_snippet": "\nclass ContextRelSpyHandler:\n    def compute(self, df, **kwargs):\n        from src.features.context_engineering import add_relative_features\n        # Look for SPY\n        ctx = [c for c in df.columns if 'spy' in c]\n        if not ctx: return None\n        res = add_relative_features(df, 'close', context_cols=ctx)\n        cols = [c for c in res.columns if 'rel_' in c]\n        return res[cols]\n",
+        "handler_func": "ContextRelSpyHandler",
+        "params": [],
+        "complexity_score": 1.0,
+        "state_logic": "undefined",
+        "transition_logic": "undefined",
+        "memory_window": 20,
+        "causality_link": "undefined",
+        "source": "builtin",
+        "tags": [],
+        "fitness_score": 0.0,
+        "usage_count": 0,
+        "outputs": {
+            "value": "value"
         }
     }
 ]

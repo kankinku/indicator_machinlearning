@@ -18,6 +18,9 @@ from src.shared.stage_schema import StageSpec
 
 load_dotenv()
 
+# [V20 Blackwell Support] Enable CUDA DSA for sm_120 architecture
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
+
 
 @dataclass
 class BaseConfig:

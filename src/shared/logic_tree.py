@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional, Union
 import numpy as np
 import pandas as pd
 import json
+from src.contracts import ColumnRef
 
 @dataclass
 class LogicNode:

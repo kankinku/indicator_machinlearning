@@ -18,10 +18,11 @@ logger = get_logger("l3.replay_buffer")
 
 class Experience(NamedTuple):
     state: np.ndarray
-    actions: List[int] # Single action = [idx], Multi action = [h0, h1, ...]
+    actions: List[int]
     reward: float
     next_state: np.ndarray
     done: bool
+    stability_weight: float = 1.0  # [Genome v2] Stability-based loss weighting
 
 @dataclass
 class UnifiedBatch:
@@ -65,9 +66,9 @@ class ReplayBuffer:
                 self.tags.append(tag)
             self._total_pushed += 1
 
-    def push_transition(self, state, action_or_list, reward, next_state, done=False, tag="PASS"):
+    def push_transition(self, state, action_or_list, reward, next_state, done=False, tag="PASS", weight=1.0):
         actions = action_or_list if isinstance(action_or_list, list) else [action_or_list]
-        exp = Experience(state, actions, float(reward), next_state, done)
+        exp = Experience(state, actions, float(reward), next_state, done, float(weight))
         self.push(exp, tag=tag)
 
     def sample(self) -> UnifiedBatch:
@@ -152,13 +153,13 @@ class ReplayBuffer:
 
     def _batch_to_arrays(self, batch: List[Experience]) -> UnifiedBatch:
         states = np.array([e.state for e in batch], dtype=np.float32)
-        # Structure actions as (batch, n_heads)
         actions = np.array([e.actions for e in batch], dtype=np.int64)
         rewards = np.array([e.reward for e in batch], dtype=np.float32)
         next_states = np.array([e.next_state for e in batch], dtype=np.float32)
         dones = np.array([e.done for e in batch], dtype=np.float32)
+        weights = np.array([e.stability_weight for e in batch], dtype=np.float32)
         
-        return UnifiedBatch(states, actions, rewards, next_states, dones)
+        return UnifiedBatch(states, actions, rewards, next_states, dones, weights=weights)
 
     def can_sample(self, min_size: int = None) -> bool:
         min_required = min_size or config.D3QN_MIN_BUFFER_SIZE

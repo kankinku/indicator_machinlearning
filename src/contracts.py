@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+import time
+
 
 
 class ValidationError(Exception):
@@ -131,26 +133,20 @@ class Verdict:
 class LedgerRecord:
     exp_id: str
     timestamp: float
-    
     policy_spec: PolicySpec
-    
     data_hash: str
     feature_hash: str
     label_hash: str
-    
     model_artifact_ref: str
-    
     cpcv_metrics: Dict[str, Any]
     pbo: float
     risk_report: Dict[str, Any]
-    
     reason_codes: List[str]
     is_rejected: bool = False
     rejection_reason: Optional[str] = None
     fix_suggestion: Optional[FixSuggestion] = None
-    
-    # [New] Store the Verdict directly or parts of it for easy query
     verdict_dump: Optional[Dict[str, Any]] = None
+
 
 # Alias for compatibility with scripts
 FeatureParam = TunableParamSpec
@@ -184,6 +180,12 @@ class FeatureMetadata:
     params: List[TunableParamSpec]
     complexity_score: float = 1.0  # 1.0 = Standard, Higher = More complex/expensive
     
+    # [V2 Genome] Semantic & Causal Attributes
+    state_logic: str = "undefined"      # What market state does this observe? (e.g. "Overextended momentum")
+    transition_logic: str = "undefined"   # What triggers a change in this state? (e.g. "Price cross above MA")
+    memory_window: int = 20               # How long is this state logically valid? (bars)
+    causality_link: str = "undefined"     # Hypothesis: Why does this produce alpha?
+    
     # Evolution Metadata
     source: str = "builtin"  # e.g., "builtin", "github_crawler", "mutation"
     tags: List[str] = field(default_factory=list)  # e.g., ["regime_bull", "short_term"]
@@ -197,4 +199,23 @@ class FeatureMetadata:
     # The actual column name will be f"{feature_id}__{suffix}"
     # Default: {"value": "value"}
     outputs: Dict[str, str] = field(default_factory=lambda: {"value": "value"})
+
+# Alias/Forward Reference for EvaluationResult (Moved here for SSOT across layers)
+@dataclass
+class EvaluationResult:
+    policy_spec: PolicySpec
+    module_key: str
+    score: float
+    window_results: List[Any] # Avoiding circular import with WindowResult if possible or using Any
+    best_sample: Optional[Any]
+    stage: str
+    reward_breakdown: Optional[Dict[str, float]] = None
+    fingerprint: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    # [vAlpha+] Economic Alpha Tags
+    aos_score: float = 0.0
+    is_economically_viable: bool = True
+    viability_reason: str = ""
+
 

@@ -18,6 +18,7 @@ import numpy as np
 import ta
 
 from src.contracts import FeatureMetadata, TunableParamSpec, ValidationError
+from src.config import config
 from src.shared.logger import get_logger
 
 if TYPE_CHECKING:
@@ -134,7 +135,22 @@ class FeatureRegistry:
     def register(self, metadata: FeatureMetadata, overwrite: bool = False):
         """
         Registers a new feature into the ecosystem.
+        [V2 Genome] Enforces semantic validation.
         """
+        # 1. Semantic Validation
+        undefined_fields = [
+            f for f in ["state_logic", "transition_logic", "causality_link"]
+            if getattr(metadata, f, "undefined") == "undefined"
+        ]
+        
+        if undefined_fields:
+            msg = f"[Genome v2] Feature '{metadata.feature_id}' has undefined semantics: {undefined_fields}"
+            if config.STRICT_MODE:
+                logger.error(f"  REJECTED: {msg}. Define State/Transition/Causality before registration.")
+                raise ValueError(msg)
+            else:
+                logger.warning(f"  LACKING_DNA: {msg}. This feature may be retired in future phases.")
+
         with self._lock:
             if not overwrite and metadata.feature_id in self._features:
                 raise ValueError(f"Feature {metadata.feature_id} already exists.")

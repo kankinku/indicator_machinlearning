@@ -455,25 +455,76 @@ class MetaAgent:
                         "exit": parent.logic_trees.get("exit", asdict(ConditionNode(feature_key="FALSE", op="==", value=1.0)))
                     }
 
-        # Fallback to Template-based dynamic tree generation
-        # (This replaces _construct_genome_from_action + _construct_rules_from_genome)
-        profile_map = {
-            "TREND_ALPHA":      (["TREND", "ADAPTIVE"], 2, "tail"),
-            "TREND_STABLE":     (["TREND"], 3, "center"),
-            "MOMENTUM_TAIL":    (["MOMENTUM", "PRICE_ACTION"], 2, "tail"),
-            "MOMENTUM_CENTER":  (["MOMENTUM"], 2, "center"),
-            "VOLATILITY_SNIPER":(["VOLATILITY"], 2, "tail"),
-            "PATTERN_COMPLEX":  (["TREND", "MOMENTUM", "VOLATILITY"], 3, "spread"),
-            "DEFENSIVE_CORE":   (["TREND", "ADAPTIVE"], 2, "center"),
-            "SCALPING_FAST":    (["MOMENTUM", "VOLATILITY"], 1, "spread")
+        # [Genome v2] Profile to Market Question Mapping
+        # Phase 3: Map high-level RL actions to specific structural questions.
+        PROFILE_TO_QUESTIONS = {
+            "TREND_ALPHA":      ["TREND_CONFIRMATION", "VOLATILITY_EXPANSION"],
+            "TREND_STABLE":     ["TREND_CONFIRMATION"],
+            "MOMENTUM_TAIL":    ["OVERHEATED", "EXTREME_REVERSAL"],
+            "MOMENTUM_CENTER":  ["OVERHEATED"],
+            "VOLATILITY_SNIPER": ["STRUCTURAL_ENERGY", "VOLATILITY_EXPANSION"],
+            "PATTERN_COMPLEX":  ["STRUCTURAL_ENERGY", "TREND_CONFIRMATION", "OVERHEATED"],
+            "DEFENSIVE_CORE":   ["STRUCTURAL_ENERGY"],
+            "SCALPING_FAST":    ["OVERHEATED", "VOLATILITY_EXPANSION"]
         }
         
-        cats, subset_size, q_bias = profile_map.get(action_name, (["TREND"], 1, "center"))
-        target_candidates = []
-        for cat in cats: target_candidates.extend(self.registry.list_by_category(cat))
+        profile_info = {
+            "TREND_ALPHA":      (2, "tail"),
+            "TREND_STABLE":     (3, "center"),
+            "MOMENTUM_TAIL":    (2, "tail"),
+            "MOMENTUM_CENTER":  (2, "center"),
+            "VOLATILITY_SNIPER": (2, "tail"),
+            "PATTERN_COMPLEX":  (3, "spread"),
+            "DEFENSIVE_CORE":   (2, "center"),
+            "SCALPING_FAST":    (1, "spread")
+        }
         
-        if not target_candidates: target_candidates = self.registry.list_all()
-        selected_features = random.sample(target_candidates, min(len(target_candidates), subset_size)) if target_candidates else []
+        subset_size, q_bias = profile_info.get(action_name, (2, "center"))
+        target_questions = PROFILE_TO_QUESTIONS.get(action_name, ["TREND_CONFIRMATION"])
+        
+        # [Genome v2] Combinator Mode: Pick features that answer the questions
+        from src.features.ontology import get_feature_ontology
+        ontology = get_feature_ontology()
+        
+        # 1. Collect candidate features from relevant Market Questions
+        potential_fids = set()
+        for q in target_questions:
+            potential_fids.update(ontology.MARKET_QUESTIONS.get(q, []))
+        
+        # 2. Fetch Metadata for these IDs
+        candidates = [self.registry.get(fid) for fid in potential_fids if self.registry.get(fid)]
+        
+        if not candidates:
+            # Fallback to general category if questions yield nothing
+            logger.warning(f"  [Genome v2] No features found for questions {target_questions}, falling back to registry.")
+            candidates = self.registry.list_all()
+            
+        selected_features = []
+        if candidates:
+            # Pick a seed from the primary question
+            seed = random.choice(candidates)
+            selected_features.append(seed)
+            
+            # 3. Add complementary features while respecting conflicts
+            relation = ontology.get_relation(seed.feature_id)
+            for _ in range(subset_size - 1):
+                # Score remaining candidates based on synergy and lack of conflict
+                scored_candidates = []
+                for cand in candidates:
+                    if cand in selected_features: continue
+                    
+                    # Compatibility score with currently selected set
+                    comp_score = ontology.check_compatibility([f.feature_id for f in selected_features] + [cand.feature_id])
+                    
+                    if comp_score > -0.5: # Allow slight overlap but reject hard conflicts
+                        scored_candidates.append((cand, comp_score))
+                
+                if scored_candidates:
+                    # Sort by compatibility + small randomness
+                    scored_candidates.sort(key=lambda x: x[1] + random.uniform(-0.1, 0.1), reverse=True)
+                    selected_features.append(scored_candidates[0][0])
+                else:
+                    break
         
         # [V18] Build Entry Tree (Flat AND for now) with ColumnRef
         from src.contracts import ColumnRef

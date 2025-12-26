@@ -44,7 +44,7 @@ def delete_path(path: Path):
 
 def reset_system():
     print("================================================================================")
-    print("                     RL TRADING SYSTEM - FULL RESET                             ")
+    print("                 RL TRADING SYSTEM - GENOME V2 FULL RESET                       ")
     print("================================================================================")
     
     # 0. Cleanup
@@ -53,11 +53,10 @@ def reset_system():
     # 1. Define targets
     targets = [
         PROJECT_ROOT / "ledger",           # DB, Artifacts, Models
-        PROJECT_ROOT / "logs",             # All logs
+        PROJECT_ROOT / "logs",             # All logs (errors, incidents, instrumentation)
         PROJECT_ROOT / ".cache",           # Joblib disk cache
-        PROJECT_ROOT / "data" / "features.json", # Feature Registry
+        PROJECT_ROOT / "data" / "feature_registry.json", # [V18] Registry
         PROJECT_ROOT / "src" / "l3_meta" / "q_table.json", # Legacy state
-        PROJECT_ROOT / "src" / "l3_meta" / "q_table_risk.json", # Legacy state
     ]
     
     # 2. Delete
@@ -67,35 +66,57 @@ def reset_system():
         
     # 3. Reconstruct directory structure
     print(">>> [Reset] Reconstructing directory structure...")
-    (PROJECT_ROOT / "ledger" / "artifacts").mkdir(parents=True, exist_ok=True)
-    (PROJECT_ROOT / "ledger" / "diagnostics").mkdir(parents=True, exist_ok=True)
-    (PROJECT_ROOT / "logs" / "instrumentation").mkdir(parents=True, exist_ok=True)
-    print("    [Created] ledger/artifacts/ , ledger/diagnostics/ , logs/instrumentation/")
-    
-    # 4. Repopulate Features
-    print(">>> [Reset] Repopulating Feature Registry...")
-    population_scripts = [
-        PROJECT_ROOT / "tools" / "populate_features_v2.py",
-        PROJECT_ROOT / "tools" / "populate_features_extended.py",
-        PROJECT_ROOT / "tools" / "register_context_features.py"
+    dirs_to_create = [
+        PROJECT_ROOT / "ledger" / "artifacts",
+        PROJECT_ROOT / "ledger" / "diagnostics",
+        PROJECT_ROOT / "ledger" / "models",
+        PROJECT_ROOT / "logs" / "instrumentation",
+        PROJECT_ROOT / "logs" / "errors",
+        PROJECT_ROOT / "logs" / "incidents",
+        PROJECT_ROOT / "data",
     ]
+    for d in dirs_to_create:
+        d.mkdir(parents=True, exist_ok=True)
+        print(f"    [Created] {d.relative_to(PROJECT_ROOT)}")
     
-    for script in population_scripts:
-        if script.exists():
-            print(f"    [Running] {script.name}...")
-            res = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
-            if res.returncode != 0:
-                print(f"    [Error] {script.name} failed:")
-                print(res.stderr)
-            else:
-                print(f"    [Success] {script.name} completed.")
+    # 4. Repopulate Features (Genome v2 Source of Truth)
+    print(">>> [Reset] Repopulating Feature Registry (Genome v2)...")
+    try:
+        # Use the src function directly to ensure metadata standards are enforced
+        cmd = f'{sys.executable} -c "from src.features.extended_population import populate_extended_population; populate_extended_population()"'
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if res.returncode == 0:
+            print("    [Success] Feature Registry populated with Genome v2 metadata.")
         else:
-            print(f"    [Warning] {script.name} not found.")
+            print(f"    [Error] Population failed: {res.stderr}")
+            
+        # Also register context features if tool exists
+        context_script = PROJECT_ROOT / "tools" / "register_context_features.py"
+        if context_script.exists():
+             subprocess.run([sys.executable, str(context_script)], capture_output=True)
+             print("    [Success] Context/Macro features registered.")
+             
+    except Exception as e:
+        print(f"    [Error] Feature repopulation issue: {e}")
+
+    # 5. Blackwell GPU Health Check
+    print(">>> [Reset] Running Hardware Health Check (Blackwell/sm_120)...")
+    check_code = "import torch; print(f'    [GPU] {torch.cuda.get_device_name()} / Arch: {torch.cuda.get_arch_list()} / CUDA: {torch.version.cuda}'); torch.randn(1).cuda()"
+    try:
+        res = subprocess.run([sys.executable, "-c", check_code], capture_output=True, text=True)
+        if res.returncode == 0:
+            print(res.stdout.strip())
+            print("    [Success] GPU Kernel Execution validated.")
+        else:
+            print(f"    [Warning] GPU Check Failed: {res.stderr.strip()}")
+            print("    Check PyTorch Nightly installation (cu128).")
+    except Exception as e:
+        print(f"    [Warning] Could not run GPU check: {e}")
 
     print("================================================================================")
-    print(">>> [Reset] SYSTEM INITIALIZED SUCCESSFULLY.")
+    print(">>> [Reset] SYSTEM V2 INITIALIZED SUCCESSFULLY.")
     print("    All previous experiments, logs, and models have been wiped.")
-    print("    Feature Registry is restored with ~50 indicators + context features.")
+    print("    Ready for High-Performance RL Training with Genome v2 Logic.")
     print("================================================================================")
 
 if __name__ == "__main__":

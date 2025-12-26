@@ -15,11 +15,23 @@ class DiversitySampler:
         self.jaccard_threshold = jaccard_threshold
 
     def filter_diverse(self, candidates: List[PolicySpec], existing: List[PolicySpec]) -> List[PolicySpec]:
-        """Filters out candidates that are too similar to existing or each other."""
+        """Filters out candidates that are too similar or structurally incompatible."""
+        from src.features.ontology import get_feature_ontology
+        ontology = get_feature_ontology()
+        
         selected = []
         pool = existing + selected
         
         for cand in candidates:
+            # 1. Structural Compatibility Check (Genome v2)
+            feature_ids = list(cand.feature_genome.keys())
+            compatibility = ontology.check_compatibility(feature_ids)
+            
+            if compatibility < -0.3: # Strong conflict threshold
+                logger.debug(f"  [Ontology] REJECTED {cand.spec_id[:8]}: Conflict score {compatibility:.2f}")
+                continue
+                
+            # 2. Diversity Check (Jaccard)
             is_redundant = False
             for target in pool:
                 sim = calculate_genome_similarity(cand, target)
