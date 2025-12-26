@@ -528,7 +528,8 @@ def infinite_loop(
                         )
                         status_change = curriculum.record_result(passed, metrics)
                         if status_change.get("promoted"):
-                            logger.info(f"  >>> [Curriculum] PROMOTED to Stage {status_change['stage_after']}!")
+                            logger.info(f"  >>> [Curriculum] PROMOTED to Stage {status_change['stage_after']}! Triggering Exploration Reset.")
+                            eps_manager.reset(force_val=0.7) # [V12.3] Reignite learning upon stage up
 
             # C-1 Complete
             logger.info(f"  >>> [Parallel] Batch Complete. {len(batch_rewards)} diverse strategies selected.")

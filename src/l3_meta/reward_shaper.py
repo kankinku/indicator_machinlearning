@@ -153,12 +153,16 @@ class RewardShaper:
         # Alpha (excess_return) 가 있으면 사용, 없으면 직접 계산 자제 (SSOT 원칙)
         alpha = metrics.get("excess_return", 0.0)
         if "excess_return" not in metrics and "total_return_pct" in metrics:
-            # Fallback for legacy (but should avoid)
             days = metrics.get("oos_bars", 252)
             cagr = ((1 + total_return_pct/100) ** (252/max(1, days)) - 1) * 100
             bench_cagr = getattr(config, 'REWARD_BENCHMARK_RETURN', 15.0)
             alpha = cagr - bench_cagr
-        
+
+        # [V12.3] Auto-adjust Return Weight by Stage
+        if current_stage == 1: self.w_return = 1.0
+        elif current_stage == 2: self.w_return = 2.0
+        else: self.w_return = 3.0
+
         # [2] Validation Failures (Decomposed)
         # ================================================
         from src.l1_judge.evaluator import collect_validation_failures_from_dict
@@ -207,12 +211,13 @@ class RewardShaper:
                 distance_score=distance_score,
                 replay_tag=replay_tag,
             )
+
         # [4] 보상 계산 (살아남은 전략들만 - Scoring)
         # ================================================
         
-        # A. Alpha Return (CAGR 기준)
-        return_scale = self.return_scale # SSOT: config
-        r_return = self._clip(alpha / return_scale, min_val=-2.0, max_val=2.0)
+        # A. Alpha Return (Tanh Saturation) - [V12.3] Smoother gradient
+        return_scale = self.return_scale 
+        r_return = np.tanh(alpha / max(1.0, return_scale)) * 3.0
         
         # B. 손익비(R:R) 보상
         if reward_risk >= self.excellent_rr:
@@ -245,7 +250,14 @@ class RewardShaper:
         if n_trades >= self.target_trades:
             r_trades = 1.0
         else:
-            r_trades = n_trades / max(1.0, float(self.target_trades))
+            # [V12.3] Stage 1 Oxygen Supply: Stronger reward for initial trades
+            if current_stage == 1:
+                 # Concave function to reward first few trades heavily
+                 # x / (x + k) form? Or simple sqrt?
+                 # Let's use sqrt scaling for Stage 1
+                 r_trades = np.sqrt(n_trades / max(1.0, float(self.target_trades)))
+            else:
+                 r_trades = n_trades / max(1.0, float(self.target_trades))
         r_trades = self._clip(r_trades, 0.0, 1.0)
 
         # 2. Regime Alignment (Trend Following) - Quality
@@ -281,6 +293,16 @@ class RewardShaper:
             genome = metrics.get("genome", {})
             n_features = len([k for k in genome.keys() if not k.startswith("__")])
             r_complexity = -self._clip(n_features * 0.05, 0, 0.3)
+
+        # [V12.3] G. Anti-Luck Penalty (Soft Mode)
+        # Hard mode is handled in Gates. Soft mode reduces reward here.
+        r_antiluck = 0.0
+        if getattr(config, "ANTILUCK_MODE", "soft") == "soft":
+            top1 = metrics.get("top1_share", 0.0)
+            if top1 > config.ANTILUCK_TOP1_SHARE_MAX: # e.g. 0.6
+                 excess = top1 - config.ANTILUCK_TOP1_SHARE_MAX
+                 r_antiluck = -self._clip(excess * 5.0) # Strong penalty for luck
+
         
         # [V16] AutoTuner Dynamic Weights
         from src.l3_meta.auto_tuner import get_auto_tuner
@@ -302,6 +324,7 @@ class RewardShaper:
             + w_mdd * r_mdd
             + r_winrate_penalty
             + r_complexity
+            + r_antiluck
         )
 
         if failures:

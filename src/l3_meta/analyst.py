@@ -34,6 +34,7 @@ class IndicatorPriorController:
         self.alpha = 0.1  # EMA alpha (0.05~0.2 recommended)
         self.min_weight = 0.05
         self.max_weight = 0.40
+        self.calibration_score = 0.5 # [V12.3] Track how well priors match reality
         
         self._load()
 
@@ -96,18 +97,37 @@ class IndicatorPriorController:
         for cat in cat_importance:
             cat_importance[cat] /= total_imp
 
-        # 2. Update EMA Prior
+        # 2. Update EMA Prior & [V12.3] Calibration Score
         if regime_str not in self.priors:
             self.priors[regime_str] = {cat: 1.0 / len(self.categories) for cat in self.categories}
 
+        # Calculate alignment (simple dot product as vectors sum to 1)
+        alignment_dot = 0.0
+        norm_prior = 0.0
+        norm_new = 0.0
+        
         for cat in self.categories:
             current_p = self.priors[regime_str].get(cat, 1.0 / len(self.categories))
-            new_p = (1 - self.alpha) * current_p + self.alpha * cat_importance[cat]
+            new_imp = cat_importance[cat]
+            
+            # Dot prod
+            alignment_dot += current_p * new_imp
+            norm_prior += current_p ** 2
+            norm_new += new_imp ** 2
+
+            # EMA Update
+            new_p = (1 - self.alpha) * current_p + self.alpha * new_imp
             
             # Clamp to prevent monopoly or extinction
             new_p = max(self.min_weight, min(self.max_weight, new_p))
             self.priors[regime_str][cat] = new_p
 
+        # Cosine Similarity
+        if norm_prior > 0 and norm_new > 0:
+            cosine_sim = alignment_dot / ((norm_prior**0.5) * (norm_new**0.5))
+            # Update calibration score (EMA)
+            self.calibration_score = (1 - self.alpha) * self.calibration_score + self.alpha * cosine_sim
+            
         # 3. Final re-normalization to ensure total = 1.0 after clamping
         s = sum(self.priors[regime_str].values())
         if s > 0:
@@ -121,6 +141,11 @@ class IndicatorPriorController:
         if regime_str not in self.priors:
             return {cat: 1.0 / len(self.categories) for cat in self.categories}
         return self.priors[regime_str]
+        
+    def get_calibration_score(self) -> float:
+        """Returns the current calibration score (0.0 ~ 1.0)."""
+        return self.calibration_score
 
 def get_indicator_analyst(storage_path: Path) -> IndicatorPriorController:
     return IndicatorPriorController(storage_path)
+

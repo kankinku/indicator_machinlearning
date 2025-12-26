@@ -76,6 +76,11 @@ class BaseConfig:
     SA_THRESHOLD: float = field(default_factory=lambda: float(os.getenv("SA_THRESHOLD", "0.5")))
     SA_MAX_ENTITIES_PER_CHUNK: int = field(default_factory=lambda: int(os.getenv("SA_MAX_ENTITIES_PER_CHUNK", "6")))
     SA_MAX_CONTEXT_CHUNKS: int = field(default_factory=lambda: int(os.getenv("SA_MAX_CONTEXT_CHUNKS", "6")))
+
+    # [V12.3] Ontology Calibration
+    ONTOLOGY_CALIB_THRESHOLD: float = 0.07  # Minimum calibration score to trust ontology
+    ONTOLOGY_MIX_MIN: float = 0.0          # Min mixing ratio if uncalibrated
+    ONTOLOGY_MIX_MAX: float = 0.4          # Max mixing ratio if calibrated
     
     # ----------------------------------------
     # Execution Settings
@@ -210,7 +215,7 @@ class BaseConfig:
         "FAIL_LUCKY_STRIKE": -12.0,
         "FAIL_SIGNAL_DEGENERATE": -10.0,
     })
-    REJECT_SCORE_FLOOR: float = -100.0
+    REJECT_SCORE_FLOOR: float = -30.0  # [V12.3] Softened floor (-100 -> -30) to prevent death spirals
     REJECT_SOFT_PENALTY_SCALE: float = 0.5
     REJECT_NEAR_PASS_MAX_FAILURES: int = 2
     REJECT_NEAR_PASS_MAX_DISTANCE: float = 0.35
@@ -466,17 +471,17 @@ class BaseConfig:
         1: StageSpec(
             stage_id=1,
             name="Discovery",
-            target_return_pct=15.0,     # Annualized base target
-            alpha_floor=-5.0,          # Allow negative alpha during discovery
-            min_trades_per_year=6.0,
-            max_mdd_pct=40.0,
-            min_profit_factor=1.0,
+            target_return_pct=10.0,     # [V12.3] Lowered target (15 -> 10) to focus on structural integrity
+            alpha_floor=-10.0,          # [V12.3] Very soft alpha floor
+            min_trades_per_year=4.0,    # [V12.3] Lowered (6 -> 4) to allow emerging signals
+            max_mdd_pct=50.0,           # [V12.3] Relaxed MDD (40 -> 50)
+            min_profit_factor=0.9,      # [V12.3] Relaxed PF (1.0 -> 0.9)
             and_terms_range=(1, 2),
             quantile_bias="center",
             wf_splits=3,
             wf_gate_mode="soft",
-            exploration_slot=0.4,
-            reject_base_penalty=-15.0,
+            exploration_slot=0.5,       # [V12.3] High exploration
+            reject_base_penalty=-10.0,  # [V12.3] Low penalty to encourage trying
             signal_degeneracy_mode="soft"
         ),
         2: StageSpec(
@@ -570,9 +575,57 @@ class BaseConfig:
     
     # ----------------------------------------
     # 1. Warm-start Pool (Baseline)
+
+    # [V14] Stage Health Diagnostic Rules
+    # (min_pass_rate, target_rejection_rate, target_annual_trades)
+    STAGE_HEALTH_RULES: dict = field(default_factory=lambda: {
+        1: { # Discovery
+            "rejection_rate_range": (0.3, 0.8),
+            "median_tpy_range": (10, 50),
+            "min_pass_rate": 0.2,
+            "min_median_excess_pa": -10.0 # [V12.3]
+        },
+        2: { # Survival
+            "rejection_rate_range": (0.6, 0.95),
+            "median_tpy_range": (8, 30),
+            "min_pass_rate": 0.05,
+            "min_median_excess_pa": -1.0
+        },
+        3: { # Deployment
+            "rejection_rate_range": (0.8, 0.99),
+            "min_pass_rate": 0.01,
+            "min_oos_pass_rate": 0.01,
+            "min_median_excess_pa": 5.0 # [V12.3]
+        }
+    })
+
+    # [V14] Stagnation Detection
+    STAGNATION_BATCH_WINDOW: int = 5
+    STAGNATION_MIN_PROGRESS: float = 0.01 # Reward improvement floor
+    
+    # =========================================================
+    # [V18] LogicTree Strict Mode - Feature Matching Control
+    # =========================================================
+    # 학습 모드에서는 침묵 실패(silent failure)를 금지하고,
+    # 미매칭/모호성 발생 시 명시적으로 REJECT 처리
+    LOGICTREE_STRICT: bool = True  # True = 학습 모드 (엄격), False = 운영 모드 (관대)
+    LOGICTREE_FUZZY_MATCH: bool = True  # prefix 기반 fuzzy matching 허용 여부
+    
+    # 모호성 처리 정책: "error" | "warn_pick_first" | "warn_pick_value"
+    # - error: 학습 모드에서 즉시 reject
+    # - warn_pick_first: 경고 후 첫 번째 컬럼 선택 (운영 모드용)
+    # - warn_pick_value: 경고 후 __value 또는 알파벳 순 선택
+    LOGICTREE_AMBIGUOUS_POLICY: str = "error"
+    
+    # =========================================================
+    # [V11.3] New Features: Stability & Diversity
+    # =========================================================
+    
     # ----------------------------------------
-    WARM_START_N1: int = 100         # Gen 1~N1: baseline 50%
-    WARM_START_N2: int = 300         # Gen N1~N2: baseline 30%
+    # 1. Warm-start Pool (Baseline)
+    # ----------------------------------------
+    WARM_START_N1: int = 200         # Gen 1~N1: baseline 50%
+    WARM_START_N2: int = 500         # Gen N1~N2: baseline 30%
     WARM_START_BASE_DIR: Path = field(default_factory=lambda: Path("data/baselines"))
     
     # ----------------------------------------
@@ -587,6 +640,7 @@ class BaseConfig:
     # ----------------------------------------
     ANTILUCK_TOP1_SHARE_MAX: float = 0.60
     ANTILUCK_TOP3_SHARE_MAX: float = 0.85
+    ANTILUCK_MODE: str = "soft"  # [V12.3] "soft" | "hard". Stage-dependent override.
 
     # ----------------------------------------
     # Replay Buffer Tagging

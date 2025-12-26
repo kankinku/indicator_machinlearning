@@ -258,7 +258,7 @@ class MetaAgent:
         if not policy_spec or not policy_spec.rl_meta:
             # D3QN 모드
             if config.D3QN_ENABLED:
-                self.integrated_rl.update(reward, next_regime, next_df=self._current_df)
+                self.integrated_rl.update(reward, next_regime, next_df=self._current_df, metrics=metrics)
             else:
                 self.strategy_rl.update(reward, next_regime)
                 self.risk_rl.update(reward, next_regime)
@@ -270,7 +270,7 @@ class MetaAgent:
 
         # [V11.4] Integrated D3QN 모드
         if config.D3QN_ENABLED:
-            self.integrated_rl.update(reward, next_regime, next_df=self._current_df)
+            self.integrated_rl.update(reward, next_regime, next_df=self._current_df, metrics=metrics)
             
             # [V11.4] Update Indicator Priors from feedback
             if metrics:
@@ -340,9 +340,32 @@ class MetaAgent:
             if not valid_target_cats:
                 selected_features = random.sample(target_candidates, min(len(target_candidates), subset_size))
             else:
-                cat_weights = [priors.get(cat, 0.1) for cat in valid_target_cats]
-                sum_w = sum(cat_weights)
-                cat_weights = [w/sum_w for w in cat_weights]
+                # [V12.3] Auto-calibration of Ontology Influence
+                # If calibration is low, flatten weights towards uniform to reduce bias
+                calib_score = self.analyst.get_calibration_score()
+                calib_threshold = getattr(config, 'ONTOLOGY_CALIB_THRESHOLD', 0.07)
+                
+                # Trust Factor: 0.0 (Untrusted) ~ 1.0 (Fully Trusted)
+                # sigmoid-like or linear scaling
+                if calib_score < calib_threshold:
+                    trust_factor = 0.0
+                else:
+                    trust_factor = min(1.0, (calib_score - calib_threshold) * 5.0) # Scale up quickly
+                
+                # Use raw priors
+                cat_weights_prior = [priors.get(cat, 0.1) for cat in valid_target_cats]
+                sum_w = sum(cat_weights_prior)
+                cat_weights_prior = [w/sum_w for w in cat_weights_prior]
+                
+                # Uniform weights
+                n_cats = len(valid_target_cats)
+                cat_weights_uniform = [1.0/n_cats] * n_cats
+                
+                # Blend: Trust * Prior + (1-Trust) * Uniform
+                cat_weights = []
+                for i in range(n_cats):
+                    w = trust_factor * cat_weights_prior[i] + (1.0 - trust_factor) * cat_weights_uniform[i]
+                    cat_weights.append(w)
                 
                 selected_features = []
                 for _ in range(subset_size):

@@ -13,19 +13,23 @@ D3QN Agent - Dueling Double DQN 에이전트
 from __future__ import annotations
 
 import random
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
+import pandas as pd
 
 from src.config import config
 from src.shared.logger import get_logger
 from src.l3_meta.state import RegimeState
 from src.l3_meta.state_encoder import StateEncoder, get_state_encoder
-from src.l3_meta.replay_buffer import ReplayBuffer, Experience, create_replay_buffer
+from src.l3_meta.replay_buffer import ReplayBuffer, Experience, create_replay_buffer, MultiActionExperience
 from src.l3_meta.reward_shaper import RewardShaper, get_reward_shaper
 from src.l3_meta.d3qn import (
     TORCH_AVAILABLE,
     get_device,
+    create_dqn_pair,
+    soft_update
 )
 from src.l3_meta.epsilon_manager import get_epsilon_manager
 from src.shared.event_bus import record_event
@@ -122,6 +126,10 @@ class D3QNAgent:
         # 하이퍼파라미터
         self.gamma = config.D3QN_GAMMA
         self.tau = config.D3QN_TAU
+        self.update_freq = getattr(config, "D3QN_UPDATE_FREQ", 4)
+        self.target_update_freq = getattr(config, "D3QN_TARGET_UPDATE_FREQ", 100)
+        self.reheat_period = getattr(config, "RL_EPSILON_REHEAT_PERIOD", 100)
+        
         # Epsilon management is now handled by get_epsilon_manager()
         self.eps_manager = get_epsilon_manager()
         
@@ -136,6 +144,8 @@ class D3QNAgent:
         self.reward_history: List[float] = []
         self.best_reward_rolling: float = -999.0
         
+        self.epsilon = config.D3QN_EPSILON # Fallback
+        
         # 모델 로드 시도
         self.load()
         
@@ -144,26 +154,16 @@ class D3QNAgent:
     def get_action(
         self,
         regime: RegimeState,
-        df=None,  # pd.DataFrame, 선택적
+        df: Optional[pd.DataFrame] = None,
     ) -> Tuple[str, int]:
         """
         현재 상태에서 행동을 선택합니다 (epsilon-greedy).
-        
-        기존 QLearner와 동일한 시그니처를 유지합니다.
-        
-        Args:
-            regime: 현재 시장 상태
-            df: 원시 데이터프레임 (선택적, 더 정확한 상태 인코딩용)
-        
-        Returns:
-            (action_name, action_idx) 튜플
         """
         # 상태 인코딩
         if df is not None:
             encoded = self.state_encoder.encode(df)
             state = encoded.vector
         else:
-            # DataFrame 없으면 RegimeState에서 추출
             state = self.state_encoder.encode_from_regime(regime)
         
         # Epsilon-greedy 행동 선택
@@ -199,30 +199,20 @@ class D3QNAgent:
                 q_values = self.online_net(state_tensor)
                 return q_values.argmax(dim=-1).item()
         else:
-            q_values = self.online_net(state)
-            return int(np.argmax(q_values))
+            # Simple fallback for mocked linear online_net
+            return int(np.argmax(self.online_net(state)))
     
     def update(
         self,
         reward: float,
         next_regime: RegimeState,
-        state_key: Optional[str] = None,  # 호환성용, 사용 안 함
-        action_idx: Optional[int] = None,  # 호환성용
-        df=None,  # pd.DataFrame, 선택적
-        metrics: Optional[Dict] = None,  # CPCV 지표 (보상 재계산용)
+        state_key: Optional[str] = None,
+        action_idx: Optional[int] = None,
+        df: Optional[pd.DataFrame] = None,
+        metrics: Optional[Dict] = None,
     ):
         """
         경험을 저장하고 신경망을 학습합니다.
-        
-        기존 QLearner와 동일한 시그니처를 유지합니다.
-        
-        Args:
-            reward: 보상 (또는 metrics에서 계산)
-            next_regime: 다음 시장 상태
-            state_key: 사용 안 함 (호환성)
-            action_idx: 행동 인덱스 (None이면 last_action_idx 사용)
-            df: 다음 상태 인코딩용 데이터프레임
-            metrics: CPCV 지표 (보상 재계산용)
         """
         if self.last_state is None:
             logger.warning("이전 상태가 없어 학습을 건너뜁니다")
@@ -248,12 +238,7 @@ class D3QNAgent:
             is_rejected = reward_breakdown.is_rejected
             replay_tag = getattr(reward_breakdown, "replay_tag", "PASS")
             
-            # 성과 추적 (정체 감지용)
-            self.reward_history.append(float(reward))
-            if len(self.reward_history) > self.reheat_period * 3:
-                self.reward_history.pop(0)
-        else:
-            self.reward_history.append(float(reward))
+        self.reward_history.append(float(reward))
         
         # [V11.2] 탈락(Rejection) 처리 - 학습을 스킵하고 싶은 경우
         if is_rejected and getattr(config, 'RL_SKIP_LEARNING_ON_REJECTION', False):
@@ -290,61 +275,49 @@ class D3QNAgent:
                     soft_update(self.online_net, self.target_net, self.tau)
                     logger.debug(f"    [D3QN] Target 네트워크 업데이트됨")
         
-        # Epsilon 감소
-        # self.epsilon decay logic removed (handled by EpsilonManager externally)
-        
-        # [V11.2] Stagnation check remains but delegates reheat to manager
-        if self.step_count > 0 and self.step_count % config.RL_EPSILON_REHEAT_PERIOD == 0:
+        # Stagnation check
+        if self.step_count > 0 and self.step_count % self.reheat_period == 0:
             if self._is_stagnated():
                 self.eps_manager.request_reheat("STAGNATION")
-            else:
-                logger.info(f"    [D3QN] Performance improving (Top 10% Alpha), skipping reheat.")
         
         # 주기적 저장
         if self.step_count % 100 == 0:
             self.save()
 
         if self.step_count % 50 == 0:
-            recent_rewards = self.reward_history[-config.REWARD_STD_WINDOW:] if self.reward_history else []
-            if recent_rewards:
-                reward_std = float(np.std(recent_rewards))
-                logger.info(
-                    f"    [D3QN] Reward Std({config.REWARD_STD_WINDOW}): {reward_std:.4f}"
-                )
-                if reward_std < config.REWARD_STD_MIN:
-                    logger.warning(
-                        f"    [D3QN] Reward variance low: {reward_std:.6f} (<{config.REWARD_STD_MIN})"
-                    )
-                    record_event(
-                        "REWARD_VARIANCE_LOW",
-                        payload={"reward_std": reward_std, "window": len(recent_rewards)},
-                    )
-            try:
-                stats = self.replay_buffer.stats
-                tag_counts = stats.get("tag_counts", {})
-                if tag_counts:
-                    total = sum(tag_counts.values()) or 1
-                    hard_ratio = tag_counts.get("HARD_FAIL", 0) / total
-                    near_ratio = tag_counts.get("NEAR_PASS", 0) / total
-                    pass_ratio = tag_counts.get("PASS", 0) / total
-                    logger.info(
-                        "    [D3QN] Replay Mix: PASS %.2f | NEAR %.2f | HARD %.2f"
-                        % (pass_ratio, near_ratio, hard_ratio)
-                    )
-            except Exception:
-                pass
+            self._log_stats()
         
         logger.info(
             f"    [D3QN] 보상: {reward:.3f} | 버퍼: {len(self.replay_buffer)} | "
             f"ε: {self.eps_manager.get_epsilon():.3f} | 학습: {self.learn_count}"
         )
-    
+        
+    def _log_stats(self):
+        recent_rewards = self.reward_history[-config.REWARD_STD_WINDOW:] if self.reward_history else []
+        if recent_rewards:
+            reward_std = float(np.std(recent_rewards))
+            logger.info(f"    [D3QN] Reward Std({config.REWARD_STD_WINDOW}): {reward_std:.4f}")
+            if reward_std < config.REWARD_STD_MIN:
+                logger.warning(f"    [D3QN] Reward variance low: {reward_std:.6f}")
+                record_event("REWARD_VARIANCE_LOW", payload={"reward_std": reward_std})
+        
+        try:
+            stats = self.replay_buffer.stats
+            tag_counts = stats.get("tag_counts", {})
+            if tag_counts:
+                total = sum(tag_counts.values()) or 1
+                hard_ratio = tag_counts.get("HARD_FAIL", 0) / total
+                near_ratio = tag_counts.get("NEAR_PASS", 0) / total
+                pass_ratio = tag_counts.get("PASS", 0) / total
+                logger.info("    [D3QN] Replay Mix: PASS %.2f | NEAR %.2f | HARD %.2f" % (pass_ratio, near_ratio, hard_ratio))
+        except Exception:
+            pass
+
     def _is_stagnated(self) -> bool:
         """최근 성과가 이전 기간 대비 개선되지 않았는지 확인합니다."""
         if len(self.reward_history) < self.reheat_period * 2:
             return False
             
-        # 최근 window vs 이전 window 상위 10% 성과 비교
         window = self.reheat_period
         recent_rewards = self.reward_history[-window:]
         prev_rewards = self.reward_history[-2*window:-window]
@@ -352,144 +325,63 @@ class D3QNAgent:
         recent_top_10 = np.percentile(recent_rewards, 90)
         prev_top_10 = np.percentile(prev_rewards, 90)
         
-        # 이전보다 상위권 점수가 낮거나 거의 차이가 없으면(0.05 미만) 정체로 판단
         return recent_top_10 <= prev_top_10 + 0.05
 
     def _learn(self) -> Optional[float]:
-        """
-        경험 재현 버퍼에서 샘플링하여 학습합니다.
-        
-        Double DQN Loss:
-        - action_select = argmax(Q_online(s'))
-        - Q_target = r + gamma * Q_target(s', action_select)
-        - Loss = MSE(Q_online(s, a), Q_target)
-        
-        Returns:
-            손실값 (float) 또는 None
-        """
-        if not TORCH_AVAILABLE:
-            # NumPy 버전 - 간단한 업데이트
-            return self._learn_numpy()
+        if not TORCH_AVAILABLE: return None
         
         batch = self.replay_buffer.sample()
         
-        # 텐서 변환
         states = torch.FloatTensor(batch.states).to(self.device)
         actions = torch.LongTensor(batch.actions).to(self.device)
         rewards = torch.FloatTensor(batch.rewards).to(self.device)
         next_states = torch.FloatTensor(batch.next_states).to(self.device)
         dones = torch.FloatTensor(batch.dones).to(self.device)
         
-        # Double DQN: Online으로 행동 선택, Target으로 가치 평가
         with torch.no_grad():
-            # Online 네트워크로 최적 행동 선택
             next_actions = self.online_net(next_states).argmax(dim=-1)
-            # Target 네트워크로 해당 행동의 Q값 평가
-            next_q_values = self.target_net(next_states).gather(
-                1, next_actions.unsqueeze(-1)
-            ).squeeze(-1)
-            # 타겟 계산
+            next_q_values = self.target_net(next_states).gather(1, next_actions.unsqueeze(-1)).squeeze(-1)
             target_q = rewards + self.gamma * next_q_values * (1 - dones)
         
-        # 현재 Q값
-        current_q = self.online_net(states).gather(
-            1, actions.unsqueeze(-1)
-        ).squeeze(-1)
-        
-        # 손실 계산 및 역전파
+        current_q = self.online_net(states).gather(1, actions.unsqueeze(-1)).squeeze(-1)
         loss = F.mse_loss(current_q, target_q)
         
         self.optimizer.zero_grad()
         loss.backward()
-        
-        # 그래디언트 클리핑
         torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), 1.0)
-        
         self.optimizer.step()
         
         return loss.item()
     
-    def _learn_numpy(self) -> float:
-        """NumPy 기반 간단한 학습 (폴백)."""
-        batch = self.replay_buffer.sample()
-        
-        # 간단한 Q-learning 업데이트
-        lr = config.D3QN_LEARNING_RATE
-        
-        total_loss = 0.0
-        for i in range(len(batch.states)):
-            state = batch.states[i]
-            action = batch.actions[i]
-            reward = batch.rewards[i]
-            next_state = batch.next_states[i]
-            done = batch.dones[i]
-            
-            # 현재 Q값
-            current_q = self.online_net(state)[0, action]
-            
-            # 타겟 Q값
-            if done:
-                target_q = reward
-            else:
-                next_q = self.target_net(next_state).max()
-                target_q = reward + self.gamma * next_q
-            
-            # 업데이트
-            td_error = target_q - current_q
-            self.online_net.W[:, action] += lr * td_error * state
-            self.online_net.b[action] += lr * td_error
-            
-            total_loss += td_error ** 2
-        
-        return total_loss / len(batch.states)
-    
     def save(self) -> None:
-        """모델과 상태를 저장합니다."""
         try:
             self.storage_path.mkdir(parents=True, exist_ok=True)
-            
             if TORCH_AVAILABLE:
                 torch.save({
                     'online_state_dict': self.online_net.state_dict(),
                     'target_state_dict': self.target_net.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
-                    'epsilon': self.epsilon,
+                    'epsilon': self.eps_manager.get_epsilon(),
                     'step_count': self.step_count,
                     'learn_count': self.learn_count,
                     'actions': self.actions,
                 }, self.model_path)
-            else:
-                np.savez(
-                    self.model_path.with_suffix('.npz'),
-                    online_W=self.online_net.W,
-                    online_b=self.online_net.b,
-                    epsilon=self.epsilon,
-                    step_count=self.step_count,
-                )
-            
             logger.debug(f"D3QN 모델 저장됨: {self.model_path}")
         except Exception as e:
             logger.error(f"모델 저장 실패: {e}")
 
     def load(self) -> None:
-        """저장된 모델을 로드합니다."""
         if self.model_path.exists():
             try:
                 if TORCH_AVAILABLE:
                     checkpoint = torch.load(self.model_path, map_location=self.device)
                     self.online_net.load_state_dict(checkpoint['online_state_dict'])
                     self.target_net.load_state_dict(checkpoint['target_state_dict'])
-                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    self.epsilon = checkpoint.get('epsilon', self.epsilon)
+                    if 'optimizer_state_dict' in checkpoint:
+                        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                     self.step_count = checkpoint.get('step_count', 0)
                     self.learn_count = checkpoint.get('learn_count', 0)
-                else:
-                    data = np.load(self.model_path.with_suffix('.npz'))
-                    self.online_net.W = data['online_W']
-                    self.online_net.b = data['online_b']
-                    self.epsilon = float(data['epsilon'])
-                    self.step_count = int(data['step_count'])
-                logger.info(f"D3QN 모델 로드됨: {self.model_path} (ε={self.epsilon:.3f})")
+                logger.info(f"D3QN 모델 로드됨: {self.model_path}")
             except Exception as e:
                 logger.error(f"모델 로드 실패: {e}")
 
@@ -528,7 +420,12 @@ class IntegratedD3QNAgent(D3QNAgent):
         self.target_net.eval()
         
         self.optimizer = torch.optim.Adam(self.online_net.parameters(), lr=config.D3QN_LEARNING_RATE)
-        self.replay_buffer = create_replay_buffer(multi_action=True)
+        self.replay_buffer = create_replay_buffer(
+            multi_action=True,
+            tagged=getattr(config, "REPLAY_TAGGED_ENABLED", False),
+            capacity=config.D3QN_BUFFER_SIZE,
+            batch_size=config.D3QN_BATCH_SIZE,
+        )
         self.reward_shaper = get_reward_shaper()
         
         # RL Hyperparams
@@ -536,6 +433,7 @@ class IntegratedD3QNAgent(D3QNAgent):
         self.epsilon = config.D3QN_EPSILON
         self.gamma = config.D3QN_GAMMA
         self.tau = config.D3QN_TAU
+        self.update_freq = getattr(config, "D3QN_UPDATE_FREQ", 4)
         
         # Monitoring
         self.step_count = 0
@@ -546,7 +444,6 @@ class IntegratedD3QNAgent(D3QNAgent):
 
         # Stagnation
         self.reheat_period = getattr(config, "D3QN_REHEAT_PERIOD", 100)
-        self.reheat_value = getattr(config, "D3QN_REHEAT_EPSILON", 0.3)
         
         self.load()
 
@@ -574,11 +471,16 @@ class IntegratedD3QNAgent(D3QNAgent):
         self.last_experience = (state, [s_idx, r_idx])
         return self.strategy_actions[s_idx], s_idx, self.risk_actions[r_idx], r_idx
 
-    def update(self, reward: float, next_regime: RegimeState, next_df: Optional[pd.DataFrame] = None):
+    def update(
+        self, 
+        reward: float, 
+        next_regime: RegimeState, 
+        next_df: Optional[pd.DataFrame] = None,
+        metrics: Optional[Dict] = None,
+    ):
         if self.last_experience is None: return
         
         state, actions = self.last_experience
-        self.reward_history.append(reward)
         self.step_count += 1
         
         if next_df is not None:
@@ -586,32 +488,41 @@ class IntegratedD3QNAgent(D3QNAgent):
         else:
             next_state = self.state_encoder.encode_from_regime(next_regime)
             
-        self.replay_buffer.push_transition(state, actions, reward, next_state)
+        # [V12.3] Unified Reward & Tagging
+        is_rejected = False
+        tag = "PASS"
+        if metrics is not None:
+            bd = self.reward_shaper.compute_breakdown(metrics)
+            reward = bd.total
+            is_rejected = bd.is_rejected
+            tag = getattr(bd, "replay_tag", "PASS")
+            
+        self.reward_history.append(float(reward))
+        
+        if is_rejected and getattr(config, 'RL_SKIP_LEARNING_ON_REJECTION', False):
+            self.last_experience = None
+            return
+
+        self.replay_buffer.push_transition(state, actions, float(reward), next_state, tag=tag)
         self.last_experience = None
 
-        if self.replay_buffer.can_sample():
+        if (
+            self.step_count % self.update_freq == 0 
+            and self.replay_buffer.can_sample()
+        ):
             loss = self._learn()
             if loss is not None:
                 self.learn_count += 1
                 if self.learn_count % 10 == 0:
                     soft_update(self.online_net, self.target_net, self.tau)
 
-        # Decay epsilon
-        # Epsilon decay handled by manager
-        
         # Reheat logic
         if self.step_count > 0 and self.step_count % self.reheat_period == 0:
             if self._is_stagnated():
-                self.reheat_exploration()
-
-    def reheat_exploration(self, target_epsilon: float = 0.3):
-        """Delegates reheat to EpsilonManager."""
-        self.eps_manager.request_reheat("INTEGRATED_D3QN_MANUAL", strength=target_epsilon)
-
+                self.eps_manager.request_reheat("STAGNATION")
+        
         if self.step_count % 100 == 0:
             self.save()
-            
-        self.step_count += 1
 
     def _learn(self) -> Optional[float]:
         batch = self.replay_buffer.sample()
@@ -624,7 +535,6 @@ class IntegratedD3QNAgent(D3QNAgent):
         
         self.optimizer.zero_grad()
         
-        # Forward pass
         with torch.no_grad():
             next_q_heads_online = self.online_net(next_states)
             next_q_heads_target = self.target_net(next_states)
@@ -634,12 +544,10 @@ class IntegratedD3QNAgent(D3QNAgent):
         total_loss = 0
         for i in range(len(self.head_dims)):
             head_actions = torch.LongTensor(batch.actions_list[i]).to(self.device)
-            # Double DQN: argmax from online, value from target
             best_next_actions = next_q_heads_online[i].argmax(dim=-1)
             next_q = next_q_heads_target[i].gather(1, best_next_actions.unsqueeze(-1)).squeeze(-1)
             target_q = rewards + self.gamma * next_q * (1 - dones)
             
-            # Current Q
             curr_q = current_q_heads[i].gather(1, head_actions.unsqueeze(-1)).squeeze(-1)
             total_loss += F.mse_loss(curr_q, target_q)
             
@@ -667,10 +575,9 @@ class IntegratedD3QNAgent(D3QNAgent):
             try:
                 ckpt = torch.load(self.model_path, map_location=self.device)
                 self.online_net.load_state_dict(ckpt['online_state_dict'])
-                self.target_net.load_state_dict(ckpt['target_net_state_dict'] if 'target_net_state_dict' in ckpt else ckpt['target_state_dict'])
+                self.target_net.load_state_dict(ckpt.get('target_state_dict', ckpt.get('target_net_state_dict')))
                 if 'optimizer_state_dict' in ckpt:
                     self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                # self.epsilon = ckpt.get('epsilon', self.epsilon) -> Managed externally
                 self.step_count = ckpt.get('step_count', 0)
                 self.learn_count = ckpt.get('learn_count', 0)
                 logger.info(f"Integrated D3QN loaded: {self.model_path}")
@@ -683,32 +590,17 @@ def get_integrated_agent(
     strategy_actions: List[str],
     risk_actions: List[str]
 ) -> IntegratedD3QNAgent:
-    """Integrated 에이전트 팩토리 함수."""
     return IntegratedD3QNAgent(storage_path, strategy_actions, risk_actions)
 
 
-# QLearner와의 호환성을 위한 팩토리 함수
 def create_rl_agent(
     storage_path: Path,
     actions: Optional[List[str]] = None,
     use_deep_rl: bool = None,
 ) -> 'D3QNAgent':
-    """
-    RL 에이전트를 생성합니다.
-    
-    Args:
-        storage_path: 저장 경로
-        actions: 행동 공간
-        use_deep_rl: True면 D3QN, False면 기존 QLearner (기본: config.D3QN_ENABLED)
-    
-    Returns:
-        D3QNAgent 또는 QLearner 인스턴스
-    """
     use_deep = use_deep_rl if use_deep_rl is not None else config.D3QN_ENABLED
-    
     if use_deep:
         return D3QNAgent(storage_path, actions)
     else:
-        # 기존 QLearner 임포트 (순환 참조 방지)
         from src.l3_meta.q_learner import QLearner
         return QLearner(storage_path, actions)

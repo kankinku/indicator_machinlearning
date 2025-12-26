@@ -471,6 +471,48 @@ class TaggedReplayBuffer(ReplayBuffer):
         return base
 
 
+class IntegratedTaggedReplayBuffer(TaggedReplayBuffer):
+    """
+    [V12.3] Multi-head + Tagged Sampling Buffer.
+    Combines stratified sampling (PASS/FAIL) with multi-head action storage.
+    """
+    def push_transition(
+        self,
+        state: np.ndarray,
+        actions: List[int],
+        reward: float,
+        next_state: np.ndarray,
+        done: bool = False,
+        tag: str = "PASS",
+    ) -> None:
+        exp = MultiActionExperience(
+            state=state,
+            actions=actions,
+            reward=reward,
+            next_state=next_state,
+            done=done,
+        )
+        self.push(exp, tag=tag)
+
+    def _batch_to_arrays(self, batch: List[MultiActionExperience]) -> MultiActionBatchSample:
+        if not batch:
+            return None
+            
+        n_heads = len(batch[0].actions) if batch and isinstance(batch[0], MultiActionExperience) else 0
+        actions_list = []
+        if n_heads > 0:
+            for h in range(n_heads):
+                actions_list.append(np.array([e.actions[h] for e in batch], dtype=np.int64))
+
+        return MultiActionBatchSample(
+            states=np.array([e.state for e in batch], dtype=np.float32),
+            actions_list=actions_list,
+            rewards=np.array([e.reward for e in batch], dtype=np.float32),
+            next_states=np.array([e.next_state for e in batch], dtype=np.float32),
+            dones=np.array([e.done for e in batch], dtype=np.float32),
+        )
+
+
 # 팩토리 함수
 def create_replay_buffer(
     prioritized: bool = False,
@@ -489,6 +531,8 @@ def create_replay_buffer(
     Returns:
         ReplayBuffer 인스턴스
     """
+    if multi_action and tagged:
+        return IntegratedTaggedReplayBuffer(**kwargs)
     if multi_action:
         return IntegratedReplayBuffer(**kwargs)
     if tagged:
