@@ -84,6 +84,13 @@ class PolicySpec:
     tuned_params: Dict[str, Any] = field(default_factory=dict) # Legacy param slot
     data_window: Dict[str, Any] = field(default_factory=dict)
     rl_meta: Dict[str, Any] = field(default_factory=dict)
+    
+    # [vAlpha+] EAGL Metadata
+    aos_score: float = 0.0          # Alpha Opportunity Score [0, 1]
+    feasibility_tags: List[str] = field(default_factory=list)
+    failure_count: int = 0
+    status: str = "active"          # active, dormant, elite
+    created_at: float = field(default_factory=lambda: time.time())
 
     def validate_genome(self) -> None:
         # TODO: Validate against Universe

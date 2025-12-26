@@ -433,7 +433,7 @@ def _evaluate_policy_windows(
                 err_info = getattr(policy_spec, "_logictree_error", {}) or {}
                 return EvaluationResult(
                     policy_spec=policy_spec,
-                    module_key="FEATURE_MISSING",
+                    module_key=getattr(config, "LOGICTREE_FAIL_ACTION", "INVALID_SPEC"),
                     score=config.EVAL_SCORE_MIN,
                     window_results=[],
                     best_sample=None,

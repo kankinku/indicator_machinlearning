@@ -74,8 +74,13 @@ def select_diverse_top_k(
     if not candidates:
         return [], {"collision_count": 0, "avg_jaccard": 0.0}
         
-    # 점수순 정렬
-    sorted_candidates = sorted(candidates, key=lambda x: x.score, reverse=True)
+    # [vAlpha+] Sort by Economic Quality (AOS) if available, otherwise raw score
+    # We use a blend to ensure we don't completely ignore high score strategies with low AOS (novelty)
+    def selection_sort_key(x):
+        aos = getattr(x, 'aos_score', 0.1) # Small default for novelty
+        return (x.score * (0.5 + 0.5 * aos))
+        
+    sorted_candidates = sorted(candidates, key=selection_sort_key, reverse=True)
     
     selected = []
     collision_count = 0

@@ -78,9 +78,11 @@ class BaseConfig:
     SA_MAX_CONTEXT_CHUNKS: int = field(default_factory=lambda: int(os.getenv("SA_MAX_CONTEXT_CHUNKS", "6")))
 
     # [V12.3] Ontology Calibration
-    ONTOLOGY_CALIB_THRESHOLD: float = 0.07  # Minimum calibration score to trust ontology
-    ONTOLOGY_MIX_MIN: float = 0.0          # Min mixing ratio if uncalibrated
-    ONTOLOGY_MIX_MAX: float = 0.4          # Max mixing ratio if calibrated
+    ONTOLOGY_CALIB_THRESHOLD: float = 0.08  # Threshold to start trusting ontology
+    ONTOLOGY_CALIB_HYSTERESIS: float = 0.03 # Hysteresis for stability
+    ONTOLOGY_CALIB_TEMP: float = 0.02       # Temperature for sigmoid blending (smaller = sharper)
+    ONTOLOGY_MIX_MIN: float = 0.1          # Min mixing ratio (base search)
+    ONTOLOGY_MIX_MAX: float = 0.6          # Max mixing ratio (when fully calibrated)
     
     # ----------------------------------------
     # Execution Settings
@@ -102,6 +104,12 @@ class BaseConfig:
     )
     PARALLEL_BACKEND: str = "loky"
     PARALLEL_TIMEOUT: int = 600
+    
+    # [V18] Device SSOT Policy
+    # mode: "auto" | "cpu" | "cuda" | "mps"
+    DEVICE_MODE: str = field(default_factory=lambda: os.getenv("DEVICE_MODE", "auto"))
+    DEVICE_CPU_ONLY: bool = field(default_factory=lambda: os.getenv("DEVICE_CPU_ONLY", "False").lower() == "true")
+    DEVICE_FORCE_FALLBACK: bool = False # Set to True if init fails during runtime
     
     RL_BATCH_LEARNING: bool = True
     
@@ -609,13 +617,11 @@ class BaseConfig:
     # 학습 모드에서는 침묵 실패(silent failure)를 금지하고,
     # 미매칭/모호성 발생 시 명시적으로 REJECT 처리
     LOGICTREE_STRICT: bool = True  # True = 학습 모드 (엄격), False = 운영 모드 (관대)
-    LOGICTREE_FUZZY_MATCH: bool = True  # prefix 기반 fuzzy matching 허용 여부
+    LOGICTREE_FUZZY_MATCH: bool = False # [V18] SSOT 우선: 추측 금지
     
     # 모호성 처리 정책: "error" | "warn_pick_first" | "warn_pick_value"
-    # - error: 학습 모드에서 즉시 reject
-    # - warn_pick_first: 경고 후 첫 번째 컬럼 선택 (운영 모드용)
-    # - warn_pick_value: 경고 후 __value 또는 알파벳 순 선택
     LOGICTREE_AMBIGUOUS_POLICY: str = "error"
+    LOGICTREE_FAIL_ACTION: str = "INVALID_SPEC" # REJECTED보다 높은 단계의 시스템 오류로 처리
     
     # =========================================================
     # [V11.3] New Features: Stability & Diversity
@@ -693,6 +699,24 @@ class BaseConfig:
     # Data Window
     # ----------------------------------------
     DEFAULT_LOOKBACK_BARS: int = 500
+    
+    # ----------------------------------------
+    # [vAlpha+] EAGL Constants (Economic Alpha Guidance Layer)
+    # ----------------------------------------
+    EAGL_ENABLED: bool = True
+    AOS_TAU: float = 0.1             # Softmax temperature for Exploration Budget
+    AOS_WEIGHT_RETURN_COST: float = 0.4
+    AOS_WEIGHT_FREQUENCY: float = 0.3
+    AOS_WEIGHT_CONSISTENCY: float = 0.3
+    
+    # Reward Components V2
+    REWARD_REPEATABILITY_W: float = 0.2
+    REWARD_COST_SURVIVAL_W: float = 0.3
+    REWARD_STABILITY_W: float = 0.2
+    
+    # CRM (Conditional Revival)
+    CRM_DORMANT_THRESHOLD: int = 5   # Failure count before dormancy
+    CRM_REVIVAL_MIN_ALPHA: float = 0.02
     
     def __post_init__(self):
         """디렉토리 생성"""

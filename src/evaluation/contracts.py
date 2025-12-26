@@ -29,6 +29,7 @@ class BestSample:
     X_features: Optional[pd.DataFrame] = None
     window_df: Optional[pd.DataFrame] = None
 
+# [V16] Alias/Upgrade for the new flow
 @dataclass
 class ModuleResult:
     policy_spec: PolicySpec
@@ -42,5 +43,9 @@ class ModuleResult:
     fingerprint: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     
-# [V16] Alias/Upgrade for the new flow
+    # [vAlpha+] Economic Alpha Tags
+    aos_score: float = 0.0
+    is_economically_viable: bool = True
+    viability_reason: str = ""
+
 EvaluationResult = ModuleResult

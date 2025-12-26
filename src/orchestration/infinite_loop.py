@@ -456,11 +456,26 @@ def infinite_loop(
             
             # 4. [V16] One-Pass Persistence (Save all results for 'Include Rejected')
             try:
+                from src.l3_meta.eagl import get_eagl_engine
+                eagl = get_eagl_engine()
+                for res in results:
+                    aos = eagl.calculate_aos(res)
+                    res.aos_score = aos
+                    res.policy_spec.aos_score = aos # Sync back to spec
+                    
+                    viable, reason = eagl.evaluate_viability(res)
+                    res.is_economically_viable = viable
+                    res.viability_reason = reason
+                    
+                    # Update CRM
+                    eagl.update_policy_status(res.policy_spec, success=(res.score > config.EVAL_SCORE_MIN))
+                
                 saved = persist_best_samples(repo, results, df, existing_ids=existing_ids)
                 counter += saved
             except Exception as e:
+                import traceback
+                logger.error(f"Failed to persist or EAGL update: {e}\n{traceback.format_exc()}")
                 instrumentation.record_exception(type(e).__name__)
-                logger.warning(f"Failed to persist: {e}")
             batch_rewards = [] # Initialize batch_rewards for curriculum and reporting
             diverse_ids = {r.policy_spec.spec_id for r in diverse_results} # Get IDs of diverse results
             for res in results: # Iterate over all results, not just diverse ones
@@ -480,9 +495,29 @@ def infinite_loop(
                     m_dict["is_rejected"] = res.score <= config.EVAL_SCORE_MIN
                     t1_share = m_dict.get('top1_share', 0.0)
                     
-                    # Only learn from diverse winners
-                    if res.policy_spec.spec_id in diverse_ids:
+                    # Only learn from diverse winners & NOT an error
+                    is_error = res.module_key in ("ERROR", "FEATURE_MISSING", "INVALID_SPEC")
+                    if res.policy_spec.spec_id in diverse_ids and not is_error:
                         batch_rewards.append((res.score, res.policy_spec, m_dict))
+                    
+                    if is_error:
+                        # [Step 7] Log systemic error to ledger
+                        error_type = res.module_key
+                        error_msg = res.metadata.get("error", "Unknown systemic error")
+                        logger.error(f"  [SYSTEM_ERROR] {error_type} for {res.policy_spec.template_id}: {error_msg}")
+                        # Record specifically for UI/Dashboard
+                        diag_file = Path(config.LEDGER_DIR) / "system_errors.jsonl"
+                        with open(diag_file, "a") as f:
+                            f.write(json.dumps({
+                                "timestamp": pd.Timestamp.now().isoformat(),
+                                "spec_id": res.policy_spec.spec_id,
+                                "type": error_type,
+                                "message": str(error_msg)
+                            }) + "\n")
+                elif res.module_key in ("ERROR", "FEATURE_MISSING", "INVALID_SPEC"):
+                     # Evaluation itself crashed hard or spec failed
+                     err_msg = res.metadata.get("error", "Hard crash")
+                     logger.error(f"  [SYSTEM_FAILURE] Batch element failed ({res.module_key}): {err_msg}")
                 
                 # [V18] Log detailed reward breakdown
                 status_icon = "OK" if res.score > config.EVAL_SCORE_MIN else "NO"
@@ -502,11 +537,12 @@ def infinite_loop(
                             f"Trd:{bd.trades_component:>.1f} "
                             f"Reg:{bd.regime_trade_component:>.1f}"
                         )
-                    except:
+                    except Exception as e:
+                        logger.error(f"  [ERROR] Breakdown computation failed: {e}")
                         breakdown_str = "Breakdown Error"
                 
                 logger.info(
-                    f"  [{results.index(res) + 1}] {status_icon} {res.policy_spec.template_id:<20} | Score: {res.score:>6.2f} | T1: {t1_share:.2f} | {breakdown_str}"
+                    f"  [{results.index(res) + 1}] {status_icon} {res.policy_spec.template_id:<20} | Score: {res.score:>6.2f} | AOS: {res.aos_score:.2f} | {breakdown_str}"
                 )
             
             # 5. [V11] 배치 학습 (Parallel Mode)

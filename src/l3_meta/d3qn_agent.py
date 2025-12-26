@@ -333,7 +333,8 @@ class D3QNAgent:
         batch = self.replay_buffer.sample()
         
         states = torch.FloatTensor(batch.states).to(self.device)
-        actions = torch.LongTensor(batch.actions).to(self.device)
+        # UnifiedBatch.actions is (batch, n_heads)
+        actions = torch.LongTensor(batch.actions[:, 0]).to(self.device) # Head 0 for single action
         rewards = torch.FloatTensor(batch.rewards).to(self.device)
         next_states = torch.FloatTensor(batch.next_states).to(self.device)
         dones = torch.FloatTensor(batch.dones).to(self.device)
@@ -354,33 +355,53 @@ class D3QNAgent:
         return loss.item()
     
     def save(self) -> None:
+        """[V18] Level-2 Persistence: Metadata JSON + Weights."""
         try:
             self.storage_path.mkdir(parents=True, exist_ok=True)
+            
+            # Level 1: Metadata JSON
+            meta = {
+                "agent_type": "D3QNAgent",
+                "epsilon": self.eps_manager.get_epsilon(),
+                "step_count": self.step_count,
+                "learn_count": self.learn_count,
+                "actions": self.actions,
+                "timestamp": pd.Timestamp.now().isoformat()
+            }
+            with open(self.model_path.with_suffix('.json'), 'w') as f:
+                json.dump(meta, f, indent=4)
+
+            # Level 2: Weights
             if TORCH_AVAILABLE:
                 torch.save({
                     'online_state_dict': self.online_net.state_dict(),
                     'target_state_dict': self.target_net.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
-                    'epsilon': self.eps_manager.get_epsilon(),
-                    'step_count': self.step_count,
-                    'learn_count': self.learn_count,
-                    'actions': self.actions,
                 }, self.model_path)
+            
             logger.debug(f"D3QN 모델 저장됨: {self.model_path}")
         except Exception as e:
             logger.error(f"모델 저장 실패: {e}")
 
     def load(self) -> None:
+        """[V18] Level-2 Loading."""
         if self.model_path.exists():
             try:
+                # Load Metadata first
+                meta_path = self.model_path.with_suffix('.json')
+                if meta_path.exists():
+                    with open(meta_path, 'r') as f:
+                        meta = json.load(f)
+                        self.step_count = meta.get('step_count', 0)
+                        self.learn_count = meta.get('learn_count', 0)
+                        # self.eps_manager is external SSOT, but we can log discrepancy
+                
                 if TORCH_AVAILABLE:
                     checkpoint = torch.load(self.model_path, map_location=self.device)
                     self.online_net.load_state_dict(checkpoint['online_state_dict'])
                     self.target_net.load_state_dict(checkpoint['target_state_dict'])
                     if 'optimizer_state_dict' in checkpoint:
                         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    self.step_count = checkpoint.get('step_count', 0)
-                    self.learn_count = checkpoint.get('learn_count', 0)
                 logger.info(f"D3QN 모델 로드됨: {self.model_path}")
             except Exception as e:
                 logger.error(f"모델 로드 실패: {e}")
@@ -525,6 +546,9 @@ class IntegratedD3QNAgent(D3QNAgent):
             self.save()
 
     def _learn(self) -> Optional[float]:
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("Torch required for IntegratedD3QNAgent")
+            
         batch = self.replay_buffer.sample()
         if batch is None: return None
         
@@ -543,7 +567,8 @@ class IntegratedD3QNAgent(D3QNAgent):
         
         total_loss = 0
         for i in range(len(self.head_dims)):
-            head_actions = torch.LongTensor(batch.actions_list[i]).to(self.device)
+            # batch.actions is (batch, n_heads)
+            head_actions = torch.LongTensor(batch.actions[:, i]).to(self.device)
             best_next_actions = next_q_heads_online[i].argmax(dim=-1)
             next_q = next_q_heads_target[i].gather(1, best_next_actions.unsqueeze(-1)).squeeze(-1)
             target_q = rewards + self.gamma * next_q * (1 - dones)
@@ -558,28 +583,47 @@ class IntegratedD3QNAgent(D3QNAgent):
         return total_loss.item()
 
     def save(self):
-        self.storage_path.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            'online_state_dict': self.online_net.state_dict(),
-            'target_state_dict': self.target_net.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'epsilon': self.eps_manager.get_epsilon(),
-            'step_count': self.step_count,
-            'learn_count': self.learn_count,
-            'strategy_actions': self.strategy_actions,
-            'risk_actions': self.risk_actions,
-        }, self.model_path)
+        """[V18] Integrated Save."""
+        try:
+            self.storage_path.mkdir(parents=True, exist_ok=True)
+            
+            meta = {
+                "agent_type": "IntegratedD3QNAgent",
+                "epsilon": self.eps_manager.get_epsilon(),
+                "step_count": self.step_count,
+                "learn_count": self.learn_count,
+                "strategy_actions": self.strategy_actions,
+                "risk_actions": self.risk_actions,
+                "timestamp": pd.Timestamp.now().isoformat()
+            }
+            with open(self.model_path.with_suffix('.json'), 'w') as f:
+                json.dump(meta, f, indent=4)
+
+            torch.save({
+                'online_state_dict': self.online_net.state_dict(),
+                'target_state_dict': self.target_net.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+            }, self.model_path)
+            logger.debug(f"Integrated 모델 저장됨: {self.model_path}")
+        except Exception as e:
+            logger.error(f"Integrated 모델 저장 실패: {e}")
 
     def load(self):
+        """[V18] Integrated Load."""
         if self.model_path.exists():
             try:
+                meta_path = self.model_path.with_suffix('.json')
+                if meta_path.exists():
+                    with open(meta_path, 'r') as f:
+                        meta = json.load(f)
+                        self.step_count = meta.get('step_count', 0)
+                        self.learn_count = meta.get('learn_count', 0)
+
                 ckpt = torch.load(self.model_path, map_location=self.device)
                 self.online_net.load_state_dict(ckpt['online_state_dict'])
                 self.target_net.load_state_dict(ckpt.get('target_state_dict', ckpt.get('target_net_state_dict')))
                 if 'optimizer_state_dict' in ckpt:
                     self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                self.step_count = ckpt.get('step_count', 0)
-                self.learn_count = ckpt.get('learn_count', 0)
                 logger.info(f"Integrated D3QN loaded: {self.model_path}")
             except Exception as e:
                 logger.error(f"Load failed: {e}")
@@ -599,7 +643,12 @@ def create_rl_agent(
     use_deep_rl: bool = None,
 ) -> 'D3QNAgent':
     use_deep = use_deep_rl if use_deep_rl is not None else config.D3QN_ENABLED
+    
     if use_deep:
+        if not TORCH_AVAILABLE:
+            logger.warning("[D3QN] Torch unavailable. Switching to QLearner mode (Manual Fallback).")
+            from src.l3_meta.q_learner import QLearner
+            return QLearner(storage_path, actions)
         return D3QNAgent(storage_path, actions)
     else:
         from src.l3_meta.q_learner import QLearner

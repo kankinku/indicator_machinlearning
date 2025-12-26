@@ -37,15 +37,30 @@ except ImportError:
 
 
 def get_device() -> str:
-    """사용 가능한 장치를 반환합니다."""
+    """[V18] SSOT Device Selection Policy."""
     if not TORCH_AVAILABLE:
         return "cpu"
-    # [V8.1] RTX 50-series (Blackwell) 호환성 문제로 CPU 강제 사용
-    # 추후 PyTorch에서 지원되면 아래 주석 해제
-    # if torch.cuda.is_available():
-    #     return "cuda"
-    # if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    #     return "mps"
+    
+    if config.DEVICE_CPU_ONLY or config.DEVICE_FORCE_FALLBACK:
+        return "cpu"
+
+    mode = config.DEVICE_MODE.lower()
+    
+    if mode == "cpu":
+        return "cpu"
+    
+    if mode == "cuda" and torch.cuda.is_available():
+        return "cuda"
+    
+    if mode == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+        
+    if mode == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+            
     return "cpu"
 
 

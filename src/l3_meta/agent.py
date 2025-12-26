@@ -60,6 +60,10 @@ class MetaAgent:
         self.risk_profiles = get_default_risk_profiles()
         self.risk_profile_map = {profile.profile_id: profile for profile in self.risk_profiles}
         
+        # [vAlpha+] EAGL Engine
+        from src.l3_meta.eagl import get_eagl_engine
+        self.eagl = get_eagl_engine()
+        
         # [V11.3] Warm-start Baselines
         self.baselines = self._load_baselines()
         
@@ -207,6 +211,11 @@ class MetaAgent:
             "exit": str(LogicTree.from_dict(logic_trees["exit"]).root) if logic_trees.get("exit") else "False"
         }
         spec.spec_id = generate_policy_id(spec)
+        
+        # [vAlpha+] CRM check: If policy is dormant, try to revive or propose another
+        if spec.status == "dormant" and not self.eagl.should_revive(spec, {}):
+             return self.propose_policy(regime, history)
+             
         return spec
 
     def propose_batch(self, regime: RegimeState, history: List[LedgerRecord], n: int, seed: Optional[int] = None) -> List[PolicySpec]:
@@ -227,14 +236,22 @@ class MetaAgent:
         # [V16] Use dynamic diversity pressure from tuner
         jaccard_th = levers.get("diversity_pressure", getattr(config, 'DIVERSITY_JACCARD_TH', 0.8))
         
+        # [vAlpha+] CRM: Filter or Revive dormant policies from history if needed
+        # In this implementation, we mostly use it to skip generating "already failed" profiles
+        
         # Iterative proposal to fill the batch with diverse candidates
-        return sample_with_diversity(
+        policies = sample_with_diversity(
             self.propose_policy, 
             n, 
             regime, 
             history, 
             jaccard_th=jaccard_th
         )
+        
+        # [vAlpha+] EBR: If AOS is available, we could prune or weight here.
+        # But AOS is usually populated AFTER evaluation. 
+        # For now, we ensure dormancy is respected in propose_policy.
+        return policies
 
 
     def learn(
@@ -340,17 +357,14 @@ class MetaAgent:
             if not valid_target_cats:
                 selected_features = random.sample(target_candidates, min(len(target_candidates), subset_size))
             else:
-                # [V12.3] Auto-calibration of Ontology Influence
-                # If calibration is low, flatten weights towards uniform to reduce bias
+                # [V12.3] Auto-calibration of Ontology Influence (Continuous/Smooth)
                 calib_score = self.analyst.get_calibration_score()
-                calib_threshold = getattr(config, 'ONTOLOGY_CALIB_THRESHOLD', 0.07)
+                t0 = getattr(config, 'ONTOLOGY_CALIB_THRESHOLD', 0.08)
+                temp = getattr(config, 'ONTOLOGY_CALIB_TEMP', 0.02)
                 
-                # Trust Factor: 0.0 (Untrusted) ~ 1.0 (Fully Trusted)
-                # sigmoid-like or linear scaling
-                if calib_score < calib_threshold:
-                    trust_factor = 0.0
-                else:
-                    trust_factor = min(1.0, (calib_score - calib_threshold) * 5.0) # Scale up quickly
+                # Sigmoid Trust Factor: 0.0 (Uniform) to 1.0 (Full Prior)
+                trust_factor = 1.0 / (1.0 + np.exp(-(calib_score - t0) / temp))
+                trust_factor = np.clip(trust_factor, 0.0, 1.0)
                 
                 # Use raw priors
                 cat_weights_prior = [priors.get(cat, 0.1) for cat in valid_target_cats]
@@ -362,9 +376,13 @@ class MetaAgent:
                 cat_weights_uniform = [1.0/n_cats] * n_cats
                 
                 # Blend: Trust * Prior + (1-Trust) * Uniform
+                mix_min = getattr(config, 'ONTOLOGY_MIX_MIN', 0.1)
+                mix_max = getattr(config, 'ONTOLOGY_MIX_MAX', 0.6)
+                actual_mix_strength = mix_min + (mix_max - mix_min) * trust_factor
+                
                 cat_weights = []
                 for i in range(n_cats):
-                    w = trust_factor * cat_weights_prior[i] + (1.0 - trust_factor) * cat_weights_uniform[i]
+                    w = actual_mix_strength * cat_weights_prior[i] + (1.0 - actual_mix_strength) * cat_weights_uniform[i]
                     cat_weights.append(w)
                 
                 selected_features = []
@@ -446,9 +464,18 @@ class MetaAgent:
         for feat in selected_features:
             q = random.choices(quantiles, weights=w, k=1)[0]
             op = ">" if random.random() > 0.5 else "<"
+            
+            # [V18] SSOT Resolution: Ensure output mapping exists
+            meta = self.registry.get(feat.feature_id)
+            if not meta: continue
+            
+            outputs = meta.outputs or {"value": "value"}
+            # Prefer 'value' key if exists, else first available
+            key = "value" if "value" in outputs else list(outputs.keys())[0]
+            
             entry_nodes.append(ConditionNode(
                 feature_key=feat.feature_id, 
-                column_ref=ColumnRef(feature_id=feat.feature_id, output_key="value"),
+                column_ref=ColumnRef(feature_id=feat.feature_id, output_key=key),
                 op=op, 
                 value=f"[q{q}]"
             ))
@@ -526,7 +553,17 @@ class MetaAgent:
         for fid in selected_fids:
             op = ">" if random.random() > 0.5 else "<"
             q = random.choices(quantiles, weights=weights, k=1)[0]
-            col_name = f"{fid}__" + fid.split('_')[1].lower() if '_' in fid else fid
+            
+            # [V18] SSOT Resolution: No more fid.split('_')
+            meta = self.registry.get(fid)
+            if meta:
+                outputs = meta.outputs or {"value": "value"}
+                key = "value" if "value" in outputs else list(outputs.keys())[0]
+                suffix = outputs[key]
+                col_name = f"{fid}__{suffix}"
+            else:
+                col_name = fid # Fallback
+                
             entry_parts.append(f"`{col_name}` {op} [q{q}]")
             
         entry_rule = " and ".join(entry_parts) if entry_parts else "True"

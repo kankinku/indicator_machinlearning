@@ -46,6 +46,11 @@ class RewardBreakdown:
     mdd_penalty: float               # MDD 패널티
     winrate_penalty: float           # 승률 과적합 패널티
     
+    # [vAlpha+] 경제적 알파 성분
+    repeatability_component: float = 0.0
+    cost_survival_component: float = 0.0
+    stability_component: float = 0.0
+    
     # 상태 정보
     # 상태 정보
     is_rejected: bool                # Hard Gate 통과 여부
@@ -303,6 +308,29 @@ class RewardShaper:
                  excess = top1 - config.ANTILUCK_TOP1_SHARE_MAX
                  r_antiluck = -self._clip(excess * 5.0) # Strong penalty for luck
 
+        # [vAlpha+] V2 Economic Components
+        # 1. Repeatability (Based on Alpha Variance across windows)
+        alphas = [w.avg_alpha for w in metrics.get("window_results", [])]
+        if len(alphas) > 1:
+            var_alpha = np.var(alphas)
+            r_repeat = 1.0 - self._clip(var_alpha / 10.0, 0, 1.0)
+        else:
+            r_repeat = 0.5 # Neutral for single window
+            
+        # 2. Cost SurvivalFactor
+        # (NetReturn / TotalCost)
+        cost_bps = config.DEFAULT_COST_BPS
+        est_cost = (n_trades * cost_bps * 0.01)
+        if est_cost > 0:
+            survival_ratio = total_return_pct / est_cost
+            r_cost_survival = np.tanh(survival_ratio / 3.0)
+        else:
+            r_cost_survival = 0.0
+            
+        # 3. Regime Stability
+        # Focused on how much it contributes in target regime vs noise
+        r_stability = r_regime # Reuse regime alignment for now as a proxy
+
         
         # [V16] AutoTuner Dynamic Weights
         from src.l3_meta.auto_tuner import get_auto_tuner
@@ -315,6 +343,11 @@ class RewardShaper:
         w_trades = levers.get("reward_w_trades", self.w_trades)
         w_mdd = levers.get("reward_w_mdd", self.w_mdd)
 
+        # [vAlpha+] EAGL Weights
+        w_repeat = getattr(config, "REWARD_REPEATABILITY_W", 0.2)
+        w_cost_surv = getattr(config, "REWARD_COST_SURVIVAL_W", 0.3)
+        w_stability = getattr(config, "REWARD_STABILITY_W", 0.2)
+
         # [합산]
         total = (
             w_return * r_return
@@ -325,6 +358,9 @@ class RewardShaper:
             + r_winrate_penalty
             + r_complexity
             + r_antiluck
+            + w_repeat * r_repeat
+            + w_cost_surv * r_cost_survival
+            + w_stability * r_stability
         )
 
         if failures:
@@ -351,6 +387,9 @@ class RewardShaper:
             failure_codes=failure_codes,
             distance_score=distance_score,
             replay_tag="PASS",
+            repeatability_component=float(r_repeat),
+            cost_survival_component=float(r_cost_survival),
+            stability_component=float(r_stability)
         )
     
     
