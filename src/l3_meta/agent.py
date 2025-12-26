@@ -120,6 +120,28 @@ class MetaAgent:
             # Maybe slow down decay or just log
             logger.info(f"[MetaAgent] 🛡 Self-Healing: SOFT state. Exploitation favored.")
 
+    def apply_market_context_modulation(self, regime: RegimeState):
+        """
+        [Alpha-Power V1] Apply EAGL guidance based on current market context.
+        Handles De-sync (Trust Discount) and High/Low Volatility.
+        """
+        # 1. De-sync (Correlation breakdown) detection
+        is_desync, trust_mult = self.eagl.should_discount_trust(regime)
+        if is_desync:
+            logger.warning(f"  [EAGL] ⚠️ DE-SYNC Detected (Corr: {regime.corr_score:.2f}). Discounting Knowledge Trust.")
+            # For now, we increase exploration as a way to "re-learn"
+            self.eps_manager.request_reheat("DE_SYNC_DISCOUNT", strength=0.3)
+            
+        # 2. Vol Squeeze / Explosion
+        if regime.vol_level < 0.7:
+             logger.info(f"  [EAGL] 💎 VOL_SQUEEZE (Vol: {regime.vol_level:.2f}). Boosting discovery budget.")
+             # Reheat slightly to explore new patterns before breakout
+             self.eps_manager.request_reheat("VOL_SQUEEZE", strength=0.2)
+        elif regime.vol_level > 2.0:
+             logger.info(f"  [EAGL] 🌋 VOL_EXPLOSION (Vol: {regime.vol_level:.2f}). Encouraging safety.")
+             # Maybe slow down epsilon decrease? Or just log.
+             pass
+
             
 
     def propose_policy(self, regime: RegimeState, history: List[LedgerRecord]) -> PolicySpec:

@@ -85,21 +85,53 @@ class EAGLEngine:
             
         return True, "VIABLE"
 
-    def reallocate_budget(self, policies: List[PolicySpec]) -> List[float]:
+    def reallocate_budget(self, policies: List[PolicySpec], regime: Optional[Any] = None) -> List[float]:
         """
-        Exploration Budget Reallocator (EBR)
-        AOS 기반으로 정책별 탐색 가중치(확률) 계산.
+        Exploration Budget Reallocator (EBR) [Alpha-Power V1]
+        AOS + Market Context(Session, Vol) 기반으로 탐색 가중치 계산.
         """
         if not policies:
             return []
             
         aos_scores = np.array([p.aos_score for p in policies])
         
-        # Softmax with temperature
+        # Softmax base
         exp_aos = np.exp(aos_scores / self.tau)
-        weights = exp_aos / np.sum(exp_aos)
+        base_weights = exp_aos / np.sum(exp_aos)
         
-        return weights.tolist()
+        # [Alpha-Power V1] Context Multipliers
+        final_weights = base_weights.copy()
+        if regime:
+            # 1. Session Multiplier (e.g. London/NY favored for exploration)
+            sess_mult = self._get_session_multiplier(regime.session_id)
+            # 2. Vol Squeeze Multiplier (Low vol -> High budget for discovery)
+            vol_mult = self._get_vol_multiplier(regime.vol_level)
+            
+            final_weights *= (sess_mult * vol_mult)
+            final_weights /= np.sum(final_weights) # Re-normalize
+            
+        return final_weights.tolist()
+
+    def _get_session_multiplier(self, session_id: int) -> float:
+        # NY(2), London(1) > Asia(0), Wrap(3)
+        mults = {0: 0.8, 1: 1.2, 2: 1.2, 3: 0.5}
+        return mults.get(session_id, 1.0)
+        
+    def _get_vol_multiplier(self, vol_level: float) -> float:
+        # Squeeze (Low Vol Relative) -> Higher discovery budget
+        if vol_level < 0.7: return 1.5
+        if vol_level > 2.0: return 0.5 # Extreme high vol -> Safety first, reduce exploration
+        return 1.0
+
+    def should_discount_trust(self, regime: Any) -> Tuple[bool, float]:
+        """
+        [Alpha-Power V1] De-sync Detection
+        Correlation (Close vs Volume) 붕괴 시 Trust Factor 할인.
+        """
+        if abs(regime.corr_score) < 0.2: # Correlation breakdown
+            return True, 0.5 # 50% discount on trust
+        return False, 1.0
+
 
     def update_policy_status(self, policy: PolicySpec, success: bool):
         """Conditional Revival Mechanism (CRM) 상태 업데이트"""

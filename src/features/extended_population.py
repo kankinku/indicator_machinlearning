@@ -26,43 +26,64 @@ def populate_extended_population():
     atr_code = """
 import pandas as pd
 import ta
+import numpy as np
 
 class ATRIndicator:
     def compute(self, df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
-        atr = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=window)
-        vals = atr.average_true_range()
+        atr_obj = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=window)
+        vals = atr_obj.average_true_range()
         atr_norm = vals / df["close"] * 100
-        return pd.DataFrame({"atr": vals, "atr_norm": atr_norm}, index=df.index)
+        
+        # [Alpha-Power V1] Flow Features
+        velocity = vals.diff(5) # 5-bar change
+        
+        # Persistence of 'Very Low' volatility (Squeeze candidate)
+        vol_low = (atr_norm < atr_norm.rolling(100).quantile(0.2)).astype(int)
+        persist_low = vol_low.groupby((vol_low != vol_low.shift()).cumsum()).cumsum() * vol_low
+        
+        return pd.DataFrame({
+            "atr": vals, 
+            "atr_norm": atr_norm,
+            "velocity": velocity,
+            "persist_low": persist_low
+        }, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLATILITY_ATR_V1", name="Average True Range", category="VOLATILITY",
-        description="Standard ATR and Normalized ATR.", code_snippet=atr_code, handler_func="ATRIndicator",
+        description="ATR with Velocity and Low-Vol Persistence (Alpha-Power V1).", code_snippet=atr_code, handler_func="ATRIndicator",
         params=[TunableParamSpec(name="window", param_type="int", min=5, max=50, default=14)], source="builtin",
-        outputs={"value": "atr", "norm": "atr_norm"}
+        outputs={"value": "atr", "norm": "atr_norm", "velocity": "velocity", "persist_low": "persist_low"}
     ))
 
     # Bollinger Bands
     bb_code = """
 import pandas as pd
 import ta
+import numpy as np
 
 class BBIndicator:
     def compute(self, df: pd.DataFrame, window: int = 20, std_dev: float = 2.0) -> pd.DataFrame:
         bb = ta.volatility.BollingerBands(df["close"], window=window, window_dev=std_dev)
+        width = bb.bollinger_wband()
+        
+        # [Alpha-Power V1] Squeeze (Width Percentile)
+        squeeze = width.rolling(100).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False)
+        
         return pd.DataFrame({
             "upper": bb.bollinger_hband(),
             "lower": bb.bollinger_lband(),
-            "width": bb.bollinger_wband()
+            "width": width,
+            "squeeze": squeeze
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="VOLATILITY_BB_V1", name="Bollinger Bands", category="VOLATILITY",
-        description="Bollinger Bands Upper/Lower/Width.", code_snippet=bb_code, handler_func="BBIndicator",
+        description="Bollinger Bands with Squeeze Percentile (Alpha-Power V1).", code_snippet=bb_code, handler_func="BBIndicator",
         params=[
             TunableParamSpec(name="window", param_type="int", min=10, max=50, default=20),
             TunableParamSpec(name="std_dev", param_type="float", min=1.5, max=3.0, default=2.0, step=0.1)
         ], source="builtin",
-        outputs={"upper": "upper", "lower": "lower", "width": "width", "value": "width"}
+        outputs={"upper": "upper", "lower": "lower", "width": "width", "squeeze": "squeeze", "value": "width"}
     ))
     
     # Keltner Channels
@@ -137,24 +158,39 @@ class DonchianIndicator:
     rsi_code = """
 import pandas as pd
 import ta
+import numpy as np
 
 class RSIIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 14, threshold_low: int = 30, threshold_high: int = 70) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
         rsi = ta.momentum.RSIIndicator(df["close"], window=window).rsi()
+        
+        # [Alpha-Power V1] Flow Features
+        # 1. Velocity (Change rate)
+        velocity = rsi.diff(3) # 3-bar change
+        
+        # 2. Persistence (Time spent in extreme zones)
+        # Count consecutive bars where rsi < 30 or rsi > 70
+        oversold = (rsi < 30).astype(int)
+        overbought = (rsi > 70).astype(int)
+        
+        def count_persistence(series):
+            return series.groupby((series != series.shift()).cumsum()).cumsum()
+            
+        persist_os = count_persistence(oversold) * oversold
+        persist_ob = count_persistence(overbought) * overbought
+        
         return pd.DataFrame({
             "rsi": rsi,
-            "signal": rsi.apply(lambda x: 1 if x < threshold_low else (-1 if x > threshold_high else 0))
+            "velocity": velocity,
+            "persist_os": persist_os,
+            "persist_ob": persist_ob
         }, index=df.index)
 """
     registry.register(FeatureMetadata(
         feature_id="MOMENTUM_RSI_V1", name="Relative Strength Index", category="MOMENTUM",
-        description="RSI with Overbought/Oversold signals.", code_snippet=rsi_code, handler_func="RSIIndicator",
-        params=[
-            TunableParamSpec(name="window", param_type="int", min=5, max=50, default=14),
-            TunableParamSpec(name="threshold_low", param_type="int", min=20, max=40, default=30),
-            TunableParamSpec(name="threshold_high", param_type="int", min=60, max=80, default=70)
-        ], source="builtin",
-        outputs={"value": "rsi", "signal": "signal"}
+        description="RSI with Velocity and Persistence (Alpha-Power V1).", code_snippet=rsi_code, handler_func="RSIIndicator",
+        params=[TunableParamSpec(name="window", param_type="int", min=5, max=50, default=14)], source="builtin",
+        outputs={"value": "rsi", "velocity": "velocity", "persist_os": "persist_os", "persist_ob": "persist_ob"}
     ))
 
     # MACD
@@ -1409,6 +1445,43 @@ class HeikinAshiIndicator:
         description="Heikin Ashi Smoothed OHLC.", code_snippet=ha_code, handler_func="HeikinAshiIndicator",
         params=[], source="builtin",
         outputs={"value": "HA_Close", "close": "HA_Close", "open": "HA_Open", "high": "HA_High", "low": "HA_Low"}
+    ))
+
+    # [Alpha-Power V1] Price Action: Trend Fakeout
+    fakeout_code = """
+import pandas as pd
+import numpy as np
+
+class FakeoutIndicator:
+    def compute(self, df: pd.DataFrame, window: int = 20, lookback: int = 5) -> pd.DataFrame:
+        # 1. Detect Breakout of N-bar High/Low
+        prev_high = df['high'].rolling(window).max().shift(1)
+        prev_low = df['low'].rolling(window).min().shift(1)
+        
+        break_high = (df['high'] > prev_high).astype(int)
+        break_low = (df['low'] < prev_low).astype(int)
+        
+        # 2. Return into range within 'lookback' bars
+        returned_high = ((df['close'] < prev_high) & (break_high.rolling(lookback).max() > 0)).astype(int)
+        returned_low = ((df['close'] > prev_low) & (break_low.rolling(lookback).max() > 0)).astype(int)
+        
+        # Signal: 1 for Bullish Fakeout (failed breakdown), -1 for Bearish Fakeout (failed breakout)
+        signal = returned_low - returned_high
+        
+        return pd.DataFrame({
+            "signal": signal,
+            "bull_fake": returned_low,
+            "bear_fake": returned_high
+        }, index=df.index)
+"""
+    registry.register(FeatureMetadata(
+        feature_id="PA_FAKE_OUT_V1", name="Trend Fakeout", category="PRICE_ACTION",
+        description="Detects failed breakouts/breakdowns (Alpha-Power V1).", code_snippet=fakeout_code, handler_func="FakeoutIndicator",
+        params=[
+            TunableParamSpec(name="window", param_type="int", min=10, max=100, default=20),
+            TunableParamSpec(name="lookback", param_type="int", min=2, max=10, default=5)
+        ], source="builtin",
+        outputs={"value": "signal", "bull": "bull_fake", "bear": "bear_fake"}
     ))
 
     print("Success! Extended population created.")

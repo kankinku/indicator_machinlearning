@@ -10,7 +10,9 @@ class RegimeState:
     vol_level: float
     corr_score: float
     shock_flag: bool
-    label: str = "NEUTRAL" # [New] Explicit discrete state for Q-Learning
+    label: str = "NEUTRAL"
+    hour: int = 0
+    session_id: int = 0 # 0: Asia, 1: London, 2: NY, 3: Wrap
 
 
 @dataclass

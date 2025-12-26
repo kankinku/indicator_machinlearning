@@ -379,6 +379,9 @@ def infinite_loop(
 
         # A. Detect Regime (Situation Awareness)
         regime = detector.detect(df)
+        
+        # [Alpha-Power V1] Market Context Modulation
+        agent.apply_market_context_modulation(regime)
 
         # B. Load History (Memory)
         history = repo.load_records()

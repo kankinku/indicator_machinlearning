@@ -123,12 +123,23 @@ class RegimeDetector:
         else:
             label = "SIDEWAYS"
             
+        # --- 5. Session Analysis (Alpha-Power V1) ---
+        dt = df.index[current_idx]
+        hour = dt.hour
+        # UTC Session Mapping (Rough)
+        if 0 <= hour < 8: sid = 0 # Asia
+        elif 8 <= hour < 14: sid = 1 # London
+        elif 14 <= hour < 22: sid = 2 # NY
+        else: sid = 3 # Wrap
+            
         return RegimeState(
             trend_score=float(final_trend_score),
             vol_level=float(vol_level),
             corr_score=float(corr_score),
             shock_flag=bool(shock_flag),
-            label=label
+            label=label,
+            hour=hour,
+            session_id=sid
         )
     def detect_series(self, df: pd.DataFrame) -> pd.Series:
         """
