@@ -33,9 +33,10 @@ from src.evaluation.contracts import WindowResult, BestSample, ModuleResult, Eva
 from src.evaluation.result_store import get_result_store, get_policy_sig
 from src.shared.logger import get_logger
 from src.shared.instrumentation import get_instrumentation
-from src.shared.hashing import generate_policy_id
+from src.shared.hashing import generate_policy_id, get_eval_config_signature, hash_dataframe, calculate_sha256
 from src.l3_meta.reward_shaper import get_reward_shaper
 from src.shared.event_bus import record_event
+from src.shared.caching import get_signal_cache, get_backtest_cache
 
 logger = get_logger("orchestration.evaluation")
 
@@ -315,12 +316,38 @@ def _build_sample_risk_budget(
     return risk_budget
 
 
+def _get_cached_signals(
+    policy_spec: PolicySpec,
+    features_df: pd.DataFrame,
+    policy_sig: str,
+    signal_cache: object,
+) -> Tuple[pd.Series, pd.Series, float]:
+    logic_sig = calculate_sha256({
+        "policy_sig": policy_sig,
+        "logic_trees": policy_spec.logic_trees,
+        "decision_rules": policy_spec.decision_rules,
+    })
+    cache_key = signal_cache.make_key(features_df, {"logic_sig": logic_sig})
+    cached = signal_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    from src.orchestration.policy_evaluator import RuleEvaluator
+    evaluator = RuleEvaluator()
+    entry_sig, exit_sig, complexity = evaluator.evaluate_signals(features_df, policy_spec)
+    signal_cache.set(cache_key, (entry_sig, exit_sig, complexity))
+    return entry_sig, exit_sig, complexity
+
+
 def _evaluate_policy_windows(
     policy_spec: PolicySpec,
     df: pd.DataFrame,
     stage: str,
     regime_id: str,
     sample_count: int,
+    window_sig: str,
+    eval_sig: str,
+    dataset_sig: str,
     pre_X: Optional[pd.DataFrame] = None, # [V12-O] Pre-calculated features
 ) -> EvaluationResult:
     try:
@@ -381,26 +408,50 @@ def _evaluate_policy_windows(
         windows = build_windows(df_local, stage)
         window_results: List[WindowResult] = []
         best_sample: Optional[BestSample] = None
+        policy_sig = get_policy_sig(policy_spec)
+        signal_cache = get_signal_cache()
+        backtest_cache = get_backtest_cache()
 
         for window_id, window_df in windows:
+            cache_key = f"{policy_sig}:{window_sig}:{window_id}"
+            cached_window = backtest_cache.get(cache_key)
+            if cached_window:
+                window_results.append(cached_window["window_result"])
+                cached_best = cached_window.get("best_sample")
+                if cached_best and (best_sample is None or cached_best.sample_score > best_sample.sample_score):
+                    best_sample = cached_best
+                continue
+
             X_window = X_full.loc[window_df.index]
+            entry_sig, exit_sig, complexity = _get_cached_signals(
+                policy_spec=policy_spec,
+                features_df=X_window,
+                policy_sig=policy_sig,
+                signal_cache=signal_cache,
+            )
+            if complexity < 0:
+                err_info = getattr(policy_spec, "_logictree_error", {}) or {}
+                return EvaluationResult(
+                    policy_spec=policy_spec,
+                    module_key="FEATURE_MISSING",
+                    score=config.EVAL_SCORE_MIN,
+                    window_results=[],
+                    best_sample=None,
+                    stage=stage,
+                    metadata={"error": err_info, "eval_sig": eval_sig, "dataset_sig": dataset_sig}
+                )
+
             seed = stable_hash(f"{module_key}|{window_id}")
             samples = sample_risk_params(tp_dist, sl_dist, h_dist, sample_count, seed)
 
             # [V12-O] Single-Train, Multi-Test Optimization
             # Train once per window using the base risk budget to get the "model signals"
-            core_base = _run_experiment_core(
-                policy_spec=policy_spec,
-                df=window_df,
-                X_features=X_window,
-                risk_budget=risk_budget, # base risk
-                include_trade_logic=False,
-            )
-            base_signals = core_base.get("results_df", pd.DataFrame()).get("pred", pd.Series(dtype=int))
+            base_signals = entry_sig
 
             sample_scores: List[float] = []
             violations: List[bool] = []
             alphas: List[float] = []
+            window_best_sample: Optional[BestSample] = None
 
             for sample in samples:
                 sample_risk = _build_sample_risk_budget(risk_budget, sample.tp_pct, sample.sl_pct, sample.horizon)
@@ -412,7 +463,7 @@ def _evaluate_policy_windows(
                     signals=base_signals,
                     risk_budget=sample_risk,
                     target_regime=regime_id,
-                    complexity_score=core_base.get("cpcv", {}).get("complexity_score", 0.0)
+                    complexity_score=complexity
                 )
 
                 # Alpha = Strat ROI - Bench ROI
@@ -445,12 +496,12 @@ def _evaluate_policy_windows(
                 # [V18] Event Recording
                 record_event("SAMPLE_EVALUATED", policy_id=policy_spec.spec_id, stage=stage, payload={"passed": not violation, "score": sample_score})
                 
-                if best_sample is None or sample_score > best_sample.sample_score:
+                if window_best_sample is None or sample_score > window_best_sample.sample_score:
                     # Capture core artifacts only for the best sample to save memory
                     core = _run_experiment_core(
                         policy_spec, window_df, X_window, sample_risk, include_trade_logic=False
                     )
-                    best_sample = BestSample(
+                    window_best_sample = BestSample(
                         sample_id=sample.sample_id,
                         window_id=window_id,
                         risk_budget=sample_risk,
@@ -464,18 +515,21 @@ def _evaluate_policy_windows(
             agg = aggregate_sample_scores(sample_scores, violations)
             avg_alpha = float(np.mean(alphas)) if alphas else 0.0
             
-            window_results.append(
-                WindowResult(
-                    window_id=window_id,
-                    raw_score=agg["score"],
-                    median_score=agg["median_score"],
-                    p10_score=agg["p10_score"],
-                    std_score=agg["std_score"],
-                    violation_rate=agg["violation_rate"],
-                    avg_alpha=avg_alpha,
-                    complexity_score=metrics.complexity_score
-                )
+            if window_best_sample and (best_sample is None or window_best_sample.sample_score > best_sample.sample_score):
+                best_sample = window_best_sample
+
+            window_result = WindowResult(
+                window_id=window_id,
+                raw_score=agg["score"],
+                median_score=agg["median_score"],
+                p10_score=agg["p10_score"],
+                std_score=agg["std_score"],
+                violation_rate=agg["violation_rate"],
+                avg_alpha=avg_alpha,
+                complexity_score=metrics.complexity_score
             )
+            window_results.append(window_result)
+            backtest_cache.set(cache_key, {"window_result": window_result, "best_sample": window_best_sample})
 
             # [V14-O] Early Exit: If this window failed hard gates significantly, skip remaining windows
             if agg["violation_rate"] > 0.8:
@@ -512,7 +566,8 @@ def _evaluate_policy_windows(
             best_sample=best_sample,
             stage=stage,
             reward_breakdown=reward_breakdown,
-            fingerprint=generate_policy_id(policy_spec)
+            fingerprint=generate_policy_id(policy_spec),
+            metadata={"eval_sig": eval_sig, "dataset_sig": dataset_sig}
         )
     except Exception as e:
         import traceback
@@ -615,13 +670,16 @@ def evaluate_stage(
 
     # [V15] Check ResultStore first
     store = get_result_store()
+    dataset_sig = hash_dataframe(df)
+    eval_sig = get_eval_config_signature()
+    window_sig = f"{stage}_{regime_id}_{dataset_sig}_{eval_sig}"
     remaining_policies = []
     final_results = [None] * len(policies)
     
     # Use any available window signature logic. Here we use 'stage' as part of sig.
     for i, p in enumerate(policies):
         p_sig = get_policy_sig(p)
-        w_sig = f"{stage}_{regime_id}"
+        w_sig = window_sig
         cached = store.get(p_sig, w_sig)
         if cached:
             # logger.debug(f"[ResultStore] Hit for {p.template_id}")
@@ -641,12 +699,14 @@ def evaluate_stage(
         chunk_size = getattr(config, "PARALLEL_CHUNK_SIZE", 10)
         
         # [V14-O] Chunking Stage 2
-        def process_chunk_s2(chunk_subset: List[PolicySpec], df_v, df_c, df_i, stage_name, r_id, samples):
+        def process_chunk_s2(chunk_subset: List[PolicySpec], df_v, df_c, df_i, stage_name, r_id, samples, w_sig, e_sig, d_sig):
             # Reconstruct DataFrame locally to avoid serialization of the object itself
-            df_local = pd.DataFrame(df_v, columns=df_c, index=df_i)
+            df_local = pd.DataFrame(df_v, columns=df_c, index=df_i).copy()
             results_chunk = []
             for p in chunk_subset:
-                res = _evaluate_policy_windows(p, df_local, stage_name, r_id, samples)
+                res = _evaluate_policy_windows(
+                    p, df_local, stage_name, r_id, samples, w_sig, e_sig, d_sig
+                )
                 results_chunk.append(res)
             return results_chunk
 
@@ -659,7 +719,7 @@ def evaluate_stage(
 
         s2_start = time.time()
         chunked_results = get_parallel_pool()(
-            delayed(process_chunk_s2)(c, df_v, df_c, df_i, stage, regime_id, sample_count)
+            delayed(process_chunk_s2)(c, df_v, df_c, df_i, stage, regime_id, sample_count, window_sig, eval_sig, dataset_sig)
             for c in chunks
         )
         s2_duration = time.time() - s2_start
@@ -673,7 +733,7 @@ def evaluate_stage(
         
         for i, res in zip(indices, subset_results):
             p_sig = get_policy_sig(policies[i])
-            w_sig = f"{stage}_{regime_id}"
+            w_sig = window_sig
             store.put(p_sig, w_sig, res)
             final_results[i] = res
 

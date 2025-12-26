@@ -366,6 +366,8 @@ class TaggedReplayBuffer(ReplayBuffer):
 
     def push(self, experience: Experience, tag: str = "PASS") -> None:
         with self._lock:
+            if self._should_drop(tag):
+                return
             self.buffer.append(experience)
             self.tags.append(tag)
             self._total_pushed += 1
@@ -376,6 +378,26 @@ class TaggedReplayBuffer(ReplayBuffer):
         if total <= 0:
             return {"PASS": 1.0}
         return {k: v / total for k, v in ratios.items()}
+
+    def _should_drop(self, tag: str) -> bool:
+        if tag != "HARD_FAIL":
+            return False
+        ratios = self._normalized_ratios()
+        hard_target = ratios.get("HARD_FAIL", 0.0)
+        if hard_target <= 0:
+            return True
+        min_total = min(self.capacity, getattr(config, "D3QN_MIN_BUFFER_SIZE", 0))
+        total = len(self.tags)
+        if total < min_total:
+            return False
+        hard_count = sum(1 for t in self.tags if t == "HARD_FAIL")
+        if total == 0:
+            return False
+        current_ratio = hard_count / total
+        if current_ratio <= hard_target:
+            return False
+        keep_prob = max(hard_target / current_ratio, 0.05)
+        return random.random() > keep_prob
 
     def _allocate_counts(self, ratios: Dict[str, float], available: Dict[str, int]) -> Dict[str, int]:
         counts = {tag: int(ratios.get(tag, 0.0) * self.batch_size) for tag in ratios}

@@ -58,6 +58,35 @@ class LogicTree:
     def to_json(self) -> str:
         return json.dumps(asdict(self))
     
+    def validate(self) -> bool:
+        """Validates the structure and content of the LogicTree."""
+        if not self.root:
+            return False
+            
+        def _validate_node(node: LogicNode) -> bool:
+            if not node:
+                return False
+                
+            if isinstance(node, ConditionNode):
+                valid_ops = {">", "<", ">=", "<=", "==", "!=", "cross_up", "cross_down"}
+                if node.op not in valid_ops:
+                    return False
+                # feature_key or column_ref could be empty during construction but strictly we might require them
+                # For basic schema validation, valid op is key.
+                return True
+                
+            if isinstance(node, LogicalOpNode):
+                if not node.children:
+                    return False
+                return all(_validate_node(c) for c in node.children)
+                
+            if isinstance(node, NotNode):
+                return _validate_node(node.child)
+                
+            return False
+            
+        return _validate_node(self.root)
+    
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> LogicTree:
         if not data: return None

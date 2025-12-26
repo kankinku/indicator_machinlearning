@@ -47,14 +47,18 @@ class RewardBreakdown:
     winrate_penalty: float           # 승률 과적합 패널티
     
     # 상태 정보
+    # 상태 정보
     is_rejected: bool                # Hard Gate 통과 여부
     rejection_reason: Optional[str]  # 통과 실패 사유
+    raw_metrics: Dict[str, float]    # 원본 지표
+
     failure_codes: List[str] = field(default_factory=list)
     distance_score: float = 0.0
     replay_tag: str = "PASS"
-    
-    raw_metrics: Dict[str, float]
     alpha: float = 0.0              # [V11.2] 초과 수익률 (연간화)
+
+
+
 
 
 class RewardShaper:
@@ -127,7 +131,14 @@ class RewardShaper:
         # [0] 커리큘럼 기반 Stage 정보 획득
         current_stage = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
         stages = getattr(config, 'CURRICULUM_STAGES', {})
-        stage_cfg = stages.get(current_stage, stages.get(1, {}))
+        # Ensure we get a StageSpec object, not a dict, to support getattr() downstream
+        stage_cfg = stages.get(current_stage)
+        if stage_cfg is None:
+            stage_cfg = stages.get(1)  # Fallback to Stage 1
+            if stage_cfg is None:
+                # Extreme fallback if config is broken
+                from src.shared.stage_schema import StageSpec
+                stage_cfg = StageSpec(1, "Fallback", 15.0, 0.0, 6.0, 40.0, 1.0)
         
         stage_benchmark = getattr(stage_cfg, "target_return_pct", 50.0)
         stage_min_trades = getattr(stage_cfg, "min_trades_per_year", 20.0)
@@ -196,12 +207,11 @@ class RewardShaper:
                 distance_score=distance_score,
                 replay_tag=replay_tag,
             )
-
         # [4] 보상 계산 (살아남은 전략들만 - Scoring)
         # ================================================
         
         # A. Alpha Return (CAGR 기준)
-        return_scale = 50.0 # 50% Alpha = 1.0 보상
+        return_scale = self.return_scale # SSOT: config
         r_return = self._clip(alpha / return_scale, min_val=-2.0, max_val=2.0)
         
         # B. 손익비(R:R) 보상
@@ -228,16 +238,27 @@ class RewardShaper:
             r_top_trades = 0.0
         r_top_trades = self._clip(r_top_trades)
         
-        # D. Regime Gating (보상이 아닌 활동성 필터)
-        regime_aligned_trades = metrics.get("regime_aligned_trades", None)
-        regime_ratio = 1.0
-        if regime_aligned_trades is not None and n_trades > 0:
+        # D. Regime & Activity (Separated)
+        
+        # 1. Activity (Trading Frequency) - Quantity
+        # Pure volume of trades relative to target
+        if n_trades >= self.target_trades:
+            r_trades = 1.0
+        else:
+            r_trades = n_trades / max(1.0, float(self.target_trades))
+        r_trades = self._clip(r_trades, 0.0, 1.0)
+
+        # 2. Regime Alignment (Trend Following) - Quality
+        # Percentage of trades executed in alignment with market regime
+        r_regime = 0.0
+        regime_aligned_trades = metrics.get("regime_aligned_trades", 0)
+        
+        if n_trades > 0:
             regime_ratio = regime_aligned_trades / n_trades
-            
-        # 레짐 불일치 거래는 활동성 점수를 깎음
-        r_regime = 0.0 # V11.2에서는 직접 보상 점수 0
-        r_trades = 0.5 * regime_ratio # 레짐 일치 시에만 활동 점수 부여
-        r_trades = self._clip(r_trades)
+            # [Design] Linear scaling: 100% aligned = 1.0, 0% = 0.0
+            r_regime = regime_ratio
+        
+        r_regime = self._clip(r_regime, 0.0, 1.0)
         
         # E. 리스크 패널티
         r_mdd = 0.0

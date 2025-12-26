@@ -3,6 +3,9 @@ import json
 import hashlib
 from typing import Any, Dict
 
+import pandas as pd
+from src.config import config
+
 def get_canonical_json(data: Any) -> str:
     """Returns a canonical JSON string (keys sorted, floats rounded)."""
     def _sanitize(obj):
@@ -38,3 +41,38 @@ def generate_policy_id(policy_spec: Any) -> str:
         "data_window": policy_spec.data_window,
     }
     return f"pol_{calculate_sha256(content)[:16]}"
+
+
+def hash_dataframe(df: pd.DataFrame) -> str:
+    """
+    Stable hash for DataFrame contents + index/columns.
+    """
+    try:
+        content_hash = pd.util.hash_pandas_object(df, index=True).sum()
+        col_hash = hash(tuple(df.columns.tolist()))
+        shape_hash = hash(df.shape)
+        payload = f"{content_hash}_{col_hash}_{shape_hash}"
+    except Exception:
+        payload = str(df.values.tobytes())
+    return calculate_sha256(payload)
+
+
+def get_eval_config_signature() -> str:
+    """
+    Hash of evaluation-relevant config to enforce deterministic caching.
+    """
+    eval_cfg = {
+        "EVAL_RISK_SAMPLES_FAST": config.EVAL_RISK_SAMPLES_FAST,
+        "EVAL_RISK_SAMPLES_REDUCED": config.EVAL_RISK_SAMPLES_REDUCED,
+        "EVAL_RISK_SAMPLES_FULL": config.EVAL_RISK_SAMPLES_FULL,
+        "EVAL_WINDOW_COUNT_FAST": config.EVAL_WINDOW_COUNT_FAST,
+        "EVAL_WINDOW_COUNT_REDUCED": config.EVAL_WINDOW_COUNT_REDUCED,
+        "EVAL_WINDOW_COUNT_FULL": config.EVAL_WINDOW_COUNT_FULL,
+        "EVAL_MIN_WINDOW_BARS": config.EVAL_MIN_WINDOW_BARS,
+        "WF_GATE_ENABLED": getattr(config, "WF_GATE_ENABLED", True),
+        "WF_SPLITS_STAGE1": getattr(config, "WF_SPLITS_STAGE1", 2),
+        "WF_SPLITS_STAGE2": getattr(config, "WF_SPLITS_STAGE2", 3),
+        "WF_SPLITS_STAGE3": getattr(config, "WF_SPLITS_STAGE3", 4),
+        "EVAL_SCORE_MIN": config.EVAL_SCORE_MIN,
+    }
+    return calculate_sha256(eval_cfg)[:16]

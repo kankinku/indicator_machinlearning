@@ -21,11 +21,13 @@ from dataclasses import dataclass
 # Prevent joblib WinError 2 by setting explicit CPU count
 os.environ["LOKY_MAX_CPU_COUNT"] = str(multiprocessing.cpu_count())
 
+# Prevent joblib WinError 2 by setting explicit CPU count
+os.environ["LOKY_MAX_CPU_COUNT"] = str(multiprocessing.cpu_count())
+
 from joblib import Parallel, delayed
 
 from src.config import config
 from src.shared.logger import get_logger
-from src.shared.caching import get_feature_cache, clear_all_caches
 from src.shared.caching import get_feature_cache, clear_all_caches
 from src.features.registry import get_registry, inject_registry
 from src.ledger.repo import LedgerRepo
@@ -399,8 +401,24 @@ def infinite_loop(
             results, diagnostic_status = evaluate_v12_batch(policies, df, regime.label, n_jobs)
             s2_duration = time.time() - s2_start
             
+            # [V19] Minimum Valid Strategy Safeguard
+            valid_count = len([r for r in results if r.score > config.EVAL_SCORE_MIN])
+            if valid_count < 1:
+                logger.warning("!!! [CRITICAL] No valid strategies found in batch. Action Space might be failing.")
+                # Emergency: Force high exploration next batch if complete failure
+                eps_manager.reset(force_val=1.0)
+            
+            # [V19] Reward Variance Watchdog (Learning Loop Disconnect Prevention)
+            # Check if all rewards are identical (e.g. all -50.0). This kills D3QN learning.
+            scores = [r.score for r in results]
+            if len(scores) > 5:
+                variance = np.var(scores)
+                if variance < 1e-4:
+                     logger.warning(f"!!! [WATCHDOG] Reward Variance too low ({variance:.5f}). Learning may stall. Check feature pipeline or gates.")
+                     diagnostic_status['status'] = "COLLAPSED"
+
             # Instrument Stage 2 (Detailed)
-            p_rate = len([r for r in results if r.score > config.EVAL_SCORE_MIN]) / len(results) if results else 0
+            p_rate = valid_count / len(results) if results else 0
             instrumentation.record_stage2(s2_duration, p_rate)
             
             # [V14] Self-Healing: 진단 결과에 따라 정책 조정 (Epsilon 재가열 등)
@@ -466,9 +484,29 @@ def infinite_loop(
                     if res.policy_spec.spec_id in diverse_ids:
                         batch_rewards.append((res.score, res.policy_spec, m_dict))
                 
-                # [V18] Log all results so user sees what happened in the batch
+                # [V18] Log detailed reward breakdown
+                status_icon = "OK" if res.score > config.EVAL_SCORE_MIN else "NO"
+                t1_share = 0.0
+                breakdown_str = ""
+                
+                # Calculate detailed breakdown
+                if m_dict:
+                    t1_share = m_dict.get('top1_share', 0.0)
+                    try:
+                        shaper = get_reward_shaper()
+                        bd = shaper.compute_breakdown(m_dict)
+                        # Format: [Ret: 1.2, RR: 0.5, Trd: 0.8, Reg: 1.0]
+                        breakdown_str = (
+                            f"Ret:{bd.return_component:>.1f} "
+                            f"RR:{bd.rr_component:>.1f} "
+                            f"Trd:{bd.trades_component:>.1f} "
+                            f"Reg:{bd.regime_trade_component:>.1f}"
+                        )
+                    except:
+                        breakdown_str = "Breakdown Error"
+                
                 logger.info(
-                    f"  [{results.index(res) + 1}] {status_icon} {res.policy_spec.template_id:<20} | Score: {res.score:>8.3f} | T1: {t1_share:.2f}"
+                    f"  [{results.index(res) + 1}] {status_icon} {res.policy_spec.template_id:<20} | Score: {res.score:>6.2f} | T1: {t1_share:.2f} | {breakdown_str}"
                 )
             
             # 5. [V11] 배치 학습 (Parallel Mode)

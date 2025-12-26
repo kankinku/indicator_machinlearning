@@ -12,7 +12,7 @@ Configuration Module - 계층형 Config 구조
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 from src.shared.stage_schema import StageSpec
 
@@ -141,6 +141,10 @@ class BaseConfig:
     # [V11.2] Gate Rejection Settings
     RL_REJECT_SCORE: float = -50.0          # Gate 실패 시 부여할 강력한 패널티 점수
     RL_SKIP_LEARNING_ON_REJECTION: bool = False  # True면 실패한 경험은 학습 데이터에서 제외 (비권장)
+
+    # Reward Variance Watchdog
+    REWARD_STD_WINDOW: int = field(default_factory=lambda: int(os.getenv("REWARD_STD_WINDOW", "200")))
+    REWARD_STD_MIN: float = field(default_factory=lambda: float(os.getenv("REWARD_STD_MIN", "0.001")))
     
     # =========================================================
     # [V11] Reward Shaping - 설계도 기반 전면 개선
@@ -316,6 +320,88 @@ class BaseConfig:
     EVAL_REDUCED_TOP_PCT: float = 0.3
     EVAL_FULL_TOP_K: int = 0
     EVAL_FULL_EVERY: int = 3
+
+    # ----------------------------------------
+    # Evaluation Cache Settings
+    # ----------------------------------------
+    SIGNAL_CACHE_MAXSIZE: int = field(default_factory=lambda: int(os.getenv("SIGNAL_CACHE_MAXSIZE", "256")))
+    BACKTEST_CACHE_MAXSIZE: int = field(default_factory=lambda: int(os.getenv("BACKTEST_CACHE_MAXSIZE", "128")))
+    BACKTEST_CACHE_TTL_SEC: int = field(default_factory=lambda: int(os.getenv("BACKTEST_CACHE_TTL_SEC", "3600")))
+
+    # ----------------------------------------
+    # TradingView Calibration (V12-BT Validation)
+    # ----------------------------------------
+    TV_CALIBRATION_DATA_DIR: str = field(default_factory=lambda: os.getenv("TV_CALIBRATION_DATA_DIR", "data/calibration"))
+    TV_CALIBRATION_REFERENCE_DIR: str = field(default_factory=lambda: os.getenv("TV_CALIBRATION_REFERENCE_DIR", "data/calibration"))
+    TV_CALIBRATION_EXECUTION: str = field(default_factory=lambda: os.getenv("TV_CALIBRATION_EXECUTION", "next_open"))
+    TV_CALIBRATION_TP_SL_PRIORITY: str = field(default_factory=lambda: os.getenv("TV_CALIBRATION_TP_SL_PRIORITY", "stop_first"))
+    TV_CALIBRATION_ALLOW_SAME_BAR_REENTRY: bool = field(default_factory=lambda: os.getenv("TV_CALIBRATION_ALLOW_SAME_BAR_REENTRY", "False").lower() == "true")
+    TV_CALIBRATION_PYRAMIDING: int = field(default_factory=lambda: int(os.getenv("TV_CALIBRATION_PYRAMIDING", "0")))
+    TV_CALIBRATION_POSITION_MODE: str = field(default_factory=lambda: os.getenv("TV_CALIBRATION_POSITION_MODE", "equity_pct"))
+    TV_CALIBRATION_POSITION_VALUE: float = field(default_factory=lambda: float(os.getenv("TV_CALIBRATION_POSITION_VALUE", "1.0")))
+    TV_CALIBRATION_COMMISSION_TYPE: str = field(default_factory=lambda: os.getenv("TV_CALIBRATION_COMMISSION_TYPE", "percent"))
+    TV_CALIBRATION_COMMISSION_VALUE: float = field(default_factory=lambda: float(os.getenv("TV_CALIBRATION_COMMISSION_VALUE", "0.0")))
+    TV_CALIBRATION_SLIPPAGE_MODE: str = field(default_factory=lambda: os.getenv("TV_CALIBRATION_SLIPPAGE_MODE", "ticks"))
+    TV_CALIBRATION_SLIPPAGE_VALUE: float = field(default_factory=lambda: float(os.getenv("TV_CALIBRATION_SLIPPAGE_VALUE", "0.0")))
+    TV_CALIBRATION_TICK_SIZE: float = field(default_factory=lambda: float(os.getenv("TV_CALIBRATION_TICK_SIZE", "0.01")))
+    TV_CALIBRATION_TP_PCT: float = field(default_factory=lambda: float(os.getenv("TV_CALIBRATION_TP_PCT", "0.002")))
+    TV_CALIBRATION_SL_PCT: float = field(default_factory=lambda: float(os.getenv("TV_CALIBRATION_SL_PCT", "0.002")))
+    TV_CALIBRATION_MAX_HOLD_BARS: int = field(default_factory=lambda: int(os.getenv("TV_CALIBRATION_MAX_HOLD_BARS", "30")))
+    TV_CALIBRATION_TOL_PRICE_PCT: float = field(default_factory=lambda: float(os.getenv("TV_CALIBRATION_TOL_PRICE_PCT", "0.0005")))
+    TV_CALIBRATION_TOL_FINAL_EQUITY_PCT: float = field(default_factory=lambda: float(os.getenv("TV_CALIBRATION_TOL_FINAL_EQUITY_PCT", "0.005")))
+    TV_CALIBRATION_TOL_MDD_PCT: float = field(default_factory=lambda: float(os.getenv("TV_CALIBRATION_TOL_MDD_PCT", "0.001")))
+    TV_CALIBRATION_CAUSE_MAP: Dict[str, List[str]] = field(default_factory=lambda: {
+        "TRADE_COUNT_MISMATCH": [
+            "signal_shift_mismatch",
+            "crossover_logic_mismatch",
+            "pyramiding_or_reentry_mismatch",
+        ],
+        "ENTRY_BAR_MISMATCH": [
+            "orders_at_close_mismatch",
+            "signal_shift_mismatch",
+            "entry_price_source_mismatch",
+        ],
+        "EXIT_BAR_MISMATCH": [
+            "orders_at_close_mismatch",
+            "signal_shift_mismatch",
+            "intrabar_exit_mismatch",
+        ],
+        "ENTRY_PRICE_MISMATCH": [
+            "execution_timing_mismatch",
+            "slippage_application_mismatch",
+            "price_source_mismatch",
+        ],
+        "EXIT_REASON_MISMATCH": [
+            "tp_sl_priority_mismatch",
+            "intrabar_path_mismatch",
+            "time_stop_definition_mismatch",
+        ],
+        "EXIT_PRICE_MISMATCH": [
+            "tp_sl_priority_mismatch",
+            "slippage_application_mismatch",
+            "orders_at_close_mismatch",
+        ],
+        "FEE_MISMATCH": [
+            "commission_unit_mismatch",
+            "commission_side_application_mismatch",
+            "position_sizing_mismatch",
+        ],
+        "SLIPPAGE_MISMATCH": [
+            "slippage_unit_mismatch",
+            "slippage_side_application_mismatch",
+            "tick_size_mismatch",
+        ],
+        "FINAL_EQUITY_MISMATCH": [
+            "position_sizing_mismatch",
+            "equity_update_timing_mismatch",
+            "fee_slippage_application_mismatch",
+        ],
+        "MDD_MISMATCH": [
+            "equity_curve_timing_mismatch",
+            "mark_to_market_mismatch",
+            "partial_fill_assumption_mismatch",
+        ],
+    })
 
     # =========================================================
     # [V10] Validation Layer (Hard Gates) - 절대 생존 기준 강화

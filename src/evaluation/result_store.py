@@ -14,7 +14,10 @@ def get_policy_sig(policy: PolicySpec) -> str:
         "genome": policy.feature_genome,
         "risk": policy.risk_budget,
         "rules": policy.decision_rules,
-        "tuned": policy.tuned_params
+        "logic_trees": getattr(policy, "logic_trees", {}),
+        "execution": policy.execution_assumption,
+        "data_window": policy.data_window,
+        "tuned": policy.tuned_params,
     }
     dump = json.dumps(data, sort_keys=True)
     return hashlib.md5(dump.encode()).hexdigest()

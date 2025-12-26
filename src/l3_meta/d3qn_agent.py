@@ -28,6 +28,7 @@ from src.l3_meta.d3qn import (
     get_device,
 )
 from src.l3_meta.epsilon_manager import get_epsilon_manager
+from src.shared.event_bus import record_event
 
 logger = get_logger("l3.d3qn_agent")
 
@@ -304,10 +305,20 @@ class D3QNAgent:
             self.save()
 
         if self.step_count % 50 == 0:
-            recent_rewards = self.reward_history[-200:] if self.reward_history else []
+            recent_rewards = self.reward_history[-config.REWARD_STD_WINDOW:] if self.reward_history else []
             if recent_rewards:
                 reward_std = float(np.std(recent_rewards))
-                logger.info(f"    [D3QN] Reward Std(200): {reward_std:.4f}")
+                logger.info(
+                    f"    [D3QN] Reward Std({config.REWARD_STD_WINDOW}): {reward_std:.4f}"
+                )
+                if reward_std < config.REWARD_STD_MIN:
+                    logger.warning(
+                        f"    [D3QN] Reward variance low: {reward_std:.6f} (<{config.REWARD_STD_MIN})"
+                    )
+                    record_event(
+                        "REWARD_VARIANCE_LOW",
+                        payload={"reward_std": reward_std, "window": len(recent_rewards)},
+                    )
             try:
                 stats = self.replay_buffer.stats
                 tag_counts = stats.get("tag_counts", {})

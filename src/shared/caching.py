@@ -13,6 +13,7 @@ Caching Module - 성능 최적화를 위한 캐싱 시스템
 import os
 import hashlib
 import json
+import time
 from functools import lru_cache, wraps
 from typing import Any, Callable, Dict, Optional, Tuple, TypeVar
 from collections import OrderedDict
@@ -135,9 +136,68 @@ class DataFrameCache:
         }
 
 
+class ObjectCache:
+    """
+    Generic LRU cache with optional TTL for non-DataFrame payloads.
+    """
+    def __init__(self, maxsize: int = 128, ttl_sec: Optional[int] = None):
+        self._cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
+        self._maxsize = maxsize
+        self._ttl_sec = ttl_sec
+        self._lock = Lock()
+        self._hits = 0
+        self._misses = 0
+
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            if key not in self._cache:
+                self._misses += 1
+                return None
+            value, ts = self._cache[key]
+            if self._ttl_sec and (time.time() - ts) > self._ttl_sec:
+                del self._cache[key]
+                self._misses += 1
+                return None
+            self._cache.move_to_end(key)
+            self._hits += 1
+            return value
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            else:
+                if len(self._cache) >= self._maxsize:
+                    self._cache.popitem(last=False)
+            self._cache[key] = (value, time.time())
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+            self._hits = 0
+            self._misses = 0
+
+    @property
+    def stats(self) -> Dict[str, int]:
+        total = self._hits + self._misses
+        hit_rate = (self._hits / total * 100) if total > 0 else 0
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "size": len(self._cache),
+            "maxsize": self._maxsize,
+            "hit_rate_pct": round(hit_rate, 2),
+        }
+
+
 # 전역 캐시 인스턴스
 _feature_cache = DataFrameCache(maxsize=256)
 _label_cache = DataFrameCache(maxsize=128)
+_signal_cache = DataFrameCache(maxsize=getattr(config, "SIGNAL_CACHE_MAXSIZE", 256))
+_backtest_cache = ObjectCache(
+    maxsize=getattr(config, "BACKTEST_CACHE_MAXSIZE", 128),
+    ttl_sec=getattr(config, "BACKTEST_CACHE_TTL_SEC", 3600),
+)
 
 
 def get_feature_cache() -> DataFrameCache:
@@ -148,6 +208,16 @@ def get_feature_cache() -> DataFrameCache:
 def get_label_cache() -> DataFrameCache:
     """라벨 캐시 인스턴스를 반환합니다."""
     return _label_cache
+
+
+def get_signal_cache() -> DataFrameCache:
+    """Signal cache for logic-tree evaluation results."""
+    return _signal_cache
+
+
+def get_backtest_cache() -> ObjectCache:
+    """Backtest result cache keyed by policy/window/config signatures."""
+    return _backtest_cache
 
 
 # ============================================
@@ -201,8 +271,12 @@ def clear_all_caches() -> Dict[str, Dict]:
     stats = {
         "feature_cache": _feature_cache.stats,
         "label_cache": _label_cache.stats,
+        "signal_cache": _signal_cache.stats,
+        "backtest_cache": _backtest_cache.stats,
     }
     _feature_cache.clear()
     _label_cache.clear()
+    _signal_cache.clear()
+    _backtest_cache.clear()
     return stats
 

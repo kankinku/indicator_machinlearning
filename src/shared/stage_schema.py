@@ -6,6 +6,10 @@ class StageSpec:
     """
     [V15] Curriculum Stage Specification (SSOT)
     Defines the hard gates, targets, and exploration parameters for a specific stage.
+    
+    Default Policy for Missing Stages:
+    - If a requested stage ID is not found in the configuration, the system MUST fallback to Stage 1.
+    - If Stage 1 is also missing (critical config failure), the system must use a hardcoded "Emergency Safe Mode" specification (see src/l3_meta/reward_shaper.py).
     """
     stage_id: int
     name: str
@@ -42,6 +46,9 @@ class StageSpec:
     @classmethod
     def from_dict(cls, data: Dict) -> 'StageSpec':
         # Remove keys not in dataclass to avoid errors
+        if not hasattr(cls, '__dataclass_fields__'):
+             return cls(**data) # Should not happen if dataclass is working
+             
         valid_keys = cls.__dataclass_fields__.keys()
         filtered_data = {k: v for k, v in data.items() if k in valid_keys}
         return cls(**filtered_data)
