@@ -37,6 +37,12 @@ class CurriculumState:
     stage_attempts: int = 0  # 현재 Stage 시도 횟수
     total_experiments: int = 0
     stage_history: List[Dict] = field(default_factory=list)
+    
+    # [V18] Performance Rolling Stats
+    rolling_alpha: float = -1.0
+    rolling_win_rate: float = 0.0
+    rolling_window: int = 20
+
 
 
 class CurriculumController:
@@ -82,6 +88,8 @@ class CurriculumController:
                     stage_attempts=data.get("stage_attempts", 0),
                     total_experiments=data.get("total_experiments", 0),
                     stage_history=data.get("stage_history", []),
+                    rolling_alpha=data.get("rolling_alpha", -1.0),
+                    rolling_win_rate=data.get("rolling_win_rate", 0.0),
                 )
             except Exception as e:
                 logger.warning(f"Failed to load curriculum state: {e}")
@@ -96,6 +104,8 @@ class CurriculumController:
                 "stage_attempts": self.state.stage_attempts,
                 "total_experiments": self.state.total_experiments,
                 "stage_history": self.state.stage_history,
+                "rolling_alpha": self.state.rolling_alpha,
+                "rolling_win_rate": self.state.rolling_win_rate,
             }
             with open(self.state_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -187,24 +197,50 @@ class CurriculumController:
         
         if passed:
             self.state.stage_passes += 1
-        
-        # 승급 조건: N개 이상 통과
+            
+        # [vLearn+] Update Rolling Performance
+        if metrics:
+            alpha = float(metrics.get("excess_return", -1.0))
+            wr = float(metrics.get("win_rate", 0.0))
+            
+            # Simple EMA Update (alpha=0.1)
+            eta = 0.1
+            if self.state.rolling_alpha <= -1.0: # Initial
+                 self.state.rolling_alpha = alpha
+                 self.state.rolling_win_rate = wr
+            else:
+                 self.state.rolling_alpha = (1 - eta) * self.state.rolling_alpha + eta * alpha
+                 self.state.rolling_win_rate = (1 - eta) * self.state.rolling_win_rate + eta * wr
+
+        # [vLearn+] Dynamic Promotion Logic
         threshold = config.CURRICULUM_STAGE_UP_THRESHOLD
+        min_alpha = getattr(config, "CURRICULUM_ALPHA_PROMOTION_THRESHOLD", 0.01)
         max_stage = max(self.stages.keys())
         
-        if self.state.stage_passes >= threshold and self.state.current_stage < max_stage:
+        # Promotion Condition: 
+        # (Pass count threshold reached) OR (Excellent Alpha Performance)
+        can_promote = (
+            (self.state.stage_passes >= threshold) or 
+            (self.state.rolling_alpha > min_alpha and self.state.stage_attempts >= 30)
+        )
+        
+        if can_promote and self.state.current_stage < max_stage:
             # 승급!
             old_stage = self.state.current_stage
             self.state.current_stage += 1
             self.state.stage_passes = 0
             self.state.stage_attempts = 0
+            # Reset rolling on new stage to re-prove
+            self.state.rolling_alpha = -1.0 
+            
             self.state.stage_history.append({
                 "stage": old_stage,
                 "experiments": self.state.total_experiments,
                 "action": "promoted",
+                "final_rolling_alpha": self.state.rolling_alpha
             })
             status_change["promoted"] = True
-            logger.info(f">>> [Curriculum] PROMOTED to Stage {self.state.current_stage}!")
+            logger.info(f">>> [Curriculum] PROMOTED to Stage {self.state.current_stage} (Alpha: {self.state.rolling_alpha:.3f})!")
         
         status_change["stage_after"] = self.state.current_stage
         status_change["pass_rate"] = (
