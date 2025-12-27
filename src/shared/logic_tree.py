@@ -303,8 +303,8 @@ def _evaluate_condition(node: ConditionNode, df: pd.DataFrame, resolver) -> pd.S
     diag = get_diagnostics()
     
     # Special Keys
-    if node.feature_key in ("TRUE", "False"):
-        return pd.Series(node.feature_key == "TRUE", index=df.index)
+    if node.feature_key.upper() in ("TRUE", "FALSE"):
+        return pd.Series(node.feature_key.upper() == "TRUE", index=df.index)
 
     # 1. Resolve Column Name
     try:

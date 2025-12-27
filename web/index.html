@@ -54,9 +54,40 @@
     <!-- Main Content -->
     <main class="main-content">
         <div class="container">
-            <header>
-                <h1>Dashboard</h1>
-                <p class="subtitle">Real-time Performance Overview</p>
+            <header class="dashboard-header">
+                <div>
+                    <h1>Dashboard</h1>
+                    <p class="subtitle">Real-time Performance Overview</p>
+                </div>
+                <div id="system-monitor-section" class="system-monitor" style="display:none;">
+                    <div class="sm-item">
+                        <span class="sm-label">CURRENT REGIME</span>
+                        <span id="sys-regime" class="status-badge">UNKNOWN</span>
+                    </div>
+                    <div class="sm-divider"></div>
+                    <div class="sm-item">
+                        <span class="sm-label">CURRICULUM</span>
+                        <div class="sm-val-group">
+                            <span id="sys-stage-id" class="sm-text">STAGE 0</span>
+                            <span id="sys-stage-name" class="sm-subtext">-</span>
+                        </div>
+                        <div class="sm-progress-container">
+                            <div class="sm-progress-text">Pass <span id="sys-stage-progress">0/0</span></div>
+                            <div class="sm-progress-bg">
+                                <div id="sys-stage-progress-bar" class="sm-progress-fill"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="sm-divider"></div>
+                    <div class="sm-item">
+                        <span class="sm-label">RL EXPLORER</span>
+                        <div class="sm-val-group">
+                            <span class="sm-text">EPS <span id="sys-epsilon">0.0000</span></span>
+                            <span class="sm-subtext">STEPS: <span id="sys-steps">0</span> | RH: <span
+                                    id="sys-reheat">None</span></span>
+                        </div>
+                    </div>
+                </div>
             </header>
 
             <!-- [V14] System Health Section -->

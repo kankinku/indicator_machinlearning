@@ -88,6 +88,7 @@ const app = {
     initDashboard: async function () {
         await this.fetchData();
         await this.initDiagnostics(); // [V14]
+        await this.initSystemStatus(); // [V21]
 
         const cb = document.getElementById('dash-include-rejected');
         if (cb) cb.checked = this.restoreState('dash-include-rejected');
@@ -95,6 +96,45 @@ const app = {
         this.renderKPIs();
         this.renderHallOfFame();
         this.renderDashTable();
+    },
+
+    initSystemStatus: async function () {
+        try {
+            const res = await fetch('/api/v1/system/status');
+            if (!res.ok) return;
+            const data = await res.json();
+            this.renderSystemStatus(data);
+        } catch (err) {
+            console.error("System Status Fetch Error:", err);
+        }
+    },
+
+    renderSystemStatus: function (data) {
+        const statusEl = document.getElementById('system-monitor-section');
+        if (!statusEl) return;
+        statusEl.style.display = 'block';
+
+        const c = data.curriculum;
+        const e = data.epsilon;
+
+        // Stage Info
+        document.getElementById('sys-stage-name').textContent = c.description || '-';
+        document.getElementById('sys-stage-id').textContent = `STAGE ${c.current_stage}`;
+        document.getElementById('sys-stage-progress').textContent = `${c.stage_passes}/${c.threshold_to_next}`;
+        const progPct = Math.min((c.stage_passes / (c.threshold_to_next || 1)) * 100, 100);
+        document.getElementById('sys-stage-progress-bar').style.width = `${progPct}%`;
+
+        // RL Info
+        document.getElementById('sys-epsilon').textContent = e.epsilon.toFixed(4);
+        document.getElementById('sys-steps').textContent = e.step_count;
+        document.getElementById('sys-reheat').textContent = e.last_reheat > 0 ? `L${e.last_reheat}` : 'None';
+
+        // Regime
+        const regimeEl = document.getElementById('sys-regime');
+        if (regimeEl) {
+            regimeEl.textContent = data.regime || 'UNKNOWN';
+            regimeEl.className = 'status-badge regime-' + (data.regime || 'unknown').toLowerCase();
+        }
     },
 
     initDiagnostics: async function () {
@@ -148,16 +188,19 @@ const app = {
         container.innerHTML = '';
 
         if (summary.taxonomy) {
-            Object.entries(summary.taxonomy).forEach(([issue, count]) => {
-                const pct = (count / (summary.rej_rate * 100 || 1)) * 100; // rough estimate or just raw count
-                // Actually taxonomy in summary is counts. Let's show as bars relative to total rejections.
+            // Sort taxonomy by count descending
+            const entries = Object.entries(summary.taxonomy).sort((a, b) => b[1] - a[1]);
+            entries.forEach(([issue, count]) => {
                 const totalRej = Object.values(summary.taxonomy).reduce((a, b) => a + b, 0);
                 const barPct = totalRej > 0 ? (count / totalRej) * 100 : 0;
 
                 const item = document.createElement('div');
                 item.className = 'tax-item';
                 item.innerHTML = `
-                    <span class="tax-label">${issue.replace('_', ' ')} (${count})</span>
+                    <div class="tax-row">
+                        <span class="tax-label">${issue.replace('FAIL_', '').replace('_', ' ')}</span>
+                        <span class="tax-count">${count}</span>
+                    </div>
                     <div class="tax-bar-bg">
                         <div class="tax-bar-fill" style="width: ${barPct}%"></div>
                     </div>
@@ -891,163 +934,178 @@ const app = {
         document.getElementById('m-winrate').textContent = (metrics.win_rate * 100).toFixed(1) + '%';
         document.getElementById('m-mdd').textContent = metrics.mdd_pct.toFixed(2) + '%';
 
+        // Gate Status UI
+        const gateEl = document.getElementById('model-gate-status');
+        if (gateEl) {
+            gateEl.style.display = 'inline-block';
+            if (data.is_approved) {
+                gateEl.textContent = 'GATE PASS';
+                gateEl.className = 'status-badge status-approved';
+            } else {
+                gateEl.textContent = 'GATE FAIL';
+                gateEl.className = 'status-badge status-rejected';
+            }
+        }
+
         const summary = document.getElementById('backtest-summary');
-        const text = document.getElementById('backtest-summary-text');
-        if (summary && text) {
+        const textArea = document.getElementById('backtest-summary-text');
+        if (summary && textArea) {
             summary.style.display = 'block';
-            text.textContent =
-                `From ${metrics.start_date} to ${metrics.end_date}, total return is ` +
-                `${metrics.total_return_pct.toFixed(2)}% with ${metrics.trade_count} trades ` +
-                `(${metrics.entry_signals} entry signals). Win rate ${(
-                    metrics.win_rate * 100
-                ).toFixed(1)}% and max drawdown ${metrics.mdd_pct.toFixed(2)}%.`;
+            if (data.is_approved) {
+                summary.querySelector('.summary-title').textContent = "Backtest Summary";
+                textArea.style.color = "#86868B";
+                textArea.style.background = "rgba(48, 209, 88, 0.05)";
+                textArea.textContent = `Strategy passed all validation gates. Performance from ${metrics.start_date} to ${metrics.end_date} shows a total return of ${metrics.total_return_pct.toFixed(2)}% with ${metrics.trade_count} trades.`;
+            } else {
+                summary.querySelector('.summary-title').textContent = "Failure Analysis";
+                textArea.style.color = "var(--accent-red)";
+                textArea.style.background = "rgba(255, 69, 58, 0.05)";
+                const reasons = (data.reason_codes || []).join(", ") || "Unknown constraint violation";
+                textArea.innerHTML = `<strong>Rejection Reasons:</strong><br>${reasons}<br><br><span style="font-size:11px; opacity:0.8;">The strategy failed to meet the minimum requirements for the current curriculum stage.</span>`;
+            }
         }
     },
 
     // === Analysis ===
     initAnalysis: async function () {
-        try {
-            const res = await fetch('/api/v1/stats/regime');
-            if (!res.ok) throw new Error("Failed to fetch stats");
-            const data = await res.json();
+        const [diagData, regimeStats] = await Promise.all([
+            this.fetchDataDiagnostics(),
+            this.fetchRegimeStats()
+        ]);
 
-            this.renderRejectionChart(data.rejections);
-            this.renderPriorsChart(data.priors);
-            this.renderRegimeLeaderboard(data.leaderboard);
-        } catch (e) {
-            console.error("Analysis Init Error:", e);
+        if (diagData && diagData.summary) {
+            this.renderRejectionBreakdown(diagData.summary.taxonomy);
+        }
+
+        if (regimeStats) {
+            this.renderPriorsChart(regimeStats.priors);
+            this.renderRegimeLeaderboard(regimeStats.leaderboard);
         }
     },
 
-    renderRejectionChart: function (rejections) {
-        if (!rejections || Object.keys(rejections).length === 0) return;
+    fetchDataDiagnostics: async function () {
+        try {
+            const res = await fetch('/api/v1/diagnostics');
+            if (!res.ok) throw new Error("Failed to fetch diagnostics data");
+            return await res.json();
+        } catch (err) {
+            console.error("Diagnostics Fetch Error:", err);
+            return null;
+        }
+    },
 
-        const labels = Object.keys(rejections).slice(0, 10);
-        const values = labels.map(l => rejections[l]);
+    fetchRegimeStats: async function () {
+        try {
+            const res = await fetch('/api/v1/stats/regime');
+            if (!res.ok) throw new Error("Failed to fetch regime stats");
+            return await res.json();
+        } catch (err) {
+            console.error(err);
+            return null;
+        }
+    },
+
+    renderRejectionBreakdown: function (taxonomy) {
+        const div = document.getElementById('rejection-chart');
+        if (!div || !taxonomy) return;
+
+        const labels = Object.keys(taxonomy).map(k => k.replace('FAIL_', '').replace('_', ' '));
+        const values = Object.values(taxonomy);
 
         const data = [{
+            type: 'pie',
             values: values,
             labels: labels,
-            type: 'pie',
             hole: 0.4,
             marker: {
-                colors: ['#FF453A', '#FF9F0A', '#FFD60A', '#30D158', '#64D2FF', '#BF5AF2', '#86868B', '#5E5E62', '#414144', '#2C2C2E']
+                colors: ['#2997FF', '#30D158', '#FF9F0A', '#BF5AF2', '#FF453A', '#8E8E93', '#FF375F', '#5E5CE6', '#64D2FF']
             },
-            textinfo: 'percent',
-            textposition: 'outside',
-            automargin: true
+            textinfo: 'label+percent',
+            insidetextorientation: 'radial'
         }];
 
         const layout = {
             paper_bgcolor: 'rgba(0,0,0,0)',
             plot_bgcolor: 'rgba(0,0,0,0)',
-            showlegend: true,
-            legend: {
-                font: { color: '#86868B', size: 10 },
-                orientation: 'v',
-                x: 1.1,
-                y: 0.5
-            },
-            margin: { t: 20, b: 20, l: 20, r: 120 },
-            font: { color: '#F5F5F7', family: 'Inter' }
+            font: { color: '#86868B', size: 11 },
+            showlegend: false,
+            margin: { t: 20, b: 20, l: 20, r: 20 },
+            height: 350
         };
 
-        const config = { displayModeBar: false, responsive: true };
-        if (document.getElementById('rejection-chart')) Plotly.newPlot('rejection-chart', data, layout, config);
+        Plotly.newPlot('rejection-chart', data, layout, { displayModeBar: false, responsive: true });
     },
 
     renderPriorsChart: function (priors) {
-        if (!priors || Object.keys(priors).length === 0) return;
+        const div = document.getElementById('priors-chart');
+        if (!div || !priors) return;
 
-        const regimes = Object.keys(priors);
-        const categories = Object.keys(priors[regimes[0]] || {});
+        // priors is { "RSI": 0.8, "SMA": 0.5, ... }
+        const entries = Object.entries(priors).sort((a, b) => b[1] - a[1]).slice(0, 10);
+        const labels = entries.map(e => e[0]);
+        const values = entries.map(e => e[1]);
 
-        const traces = regimes.map(regime => {
-            return {
-                x: categories,
-                y: categories.map(cat => (priors[regime][cat] || 0) * 100),
-                name: regime,
-                type: 'bar'
-            };
-        });
+        const data = [{
+            type: 'bar',
+            x: values,
+            y: labels,
+            orientation: 'h',
+            marker: {
+                color: '#2997FF',
+                opacity: 0.8
+            }
+        }];
 
         const layout = {
             paper_bgcolor: 'rgba(0,0,0,0)',
             plot_bgcolor: 'rgba(0,0,0,0)',
-            barmode: 'group',
-            xaxis: {
-                tickfont: { color: '#86868B', size: 10 },
-                showgrid: false
-            },
-            yaxis: {
-                title: 'Weight (%)',
-                titlefont: { color: '#86868B', size: 10 },
-                gridcolor: '#38383A',
-                color: '#86868B'
-            },
-            legend: {
-                font: { color: '#F5F5F7', size: 10 },
-                orientation: 'h',
-                y: -0.3
-            },
-            margin: { t: 20, b: 80, l: 40, r: 20 },
-            font: { family: 'Inter' }
+            font: { color: '#86868B', size: 11 },
+            xaxis: { gridcolor: '#2C2C2E', title: 'Prior Score' },
+            yaxis: { autorange: 'reversed' },
+            margin: { t: 20, b: 40, l: 100, r: 20 },
+            height: 350
         };
 
-        const config = { displayModeBar: false, responsive: true };
-        if (document.getElementById('priors-chart')) Plotly.newPlot('priors-chart', traces, layout, config);
+        Plotly.newPlot('priors-chart', data, layout, { displayModeBar: false, responsive: true });
     },
 
     renderRegimeLeaderboard: function (leaderboard) {
         const container = document.getElementById('regime-leaderboard');
-        if (!container) return;
+        if (!container || !leaderboard) return;
 
         container.innerHTML = "";
 
-        const regimes = Object.keys(leaderboard);
-        if (regimes.length === 0) {
-            container.innerHTML = '<div class="status-text">No approved strategies yet to rank.</div>';
-            return;
-        }
-
-        regimes.forEach(regime => {
-            const group = leaderboard[regime];
+        Object.entries(leaderboard).forEach(([regime, strategies]) => {
             const card = document.createElement('div');
-            card.className = "regime-card";
+            card.className = 'card';
+            card.style.flex = '1 1 300px';
 
-            let leadersHtml = "";
-            group.forEach((item, idx) => {
-                leadersHtml += `
-                    <div class="leader-item">
-                        <div class="leader-rank">RANK #${idx + 1} (${item.id})</div>
-                        <div class="leader-info">${item.indicators}</div>
-                        <div class="leader-stats">
-                            <span>Ret: ${item.total_return.toFixed(1)}%</span>
-                            Win: ${(item.win_rate * 100).toFixed(1)}%
-                            Trades: ${item.trades}
-                        </div>
+            const badgeClass = 'status-badge regime-' + regime.toLowerCase();
+            let stratHtml = strategies.map((s, idx) => `
+                <div class="regime-strat" onclick="window.location.href='detail.html?id=${s.id}'">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-weight:600; color:white;">#${idx + 1} | ${s.total_return.toFixed(1)}%</span>
+                        <span style="font-size:11px; color:#86868B;">${s.trades} trades</span>
                     </div>
-                `;
-            });
+                    <div style="font-size:11px; color:#86868B; margin-top:4px; font-family:'JetBrains Mono', monospace; text-overflow:ellipsis; overflow:hidden; white-space:nowrap;">
+                        ${s.indicators}
+                    </div>
+                </div>
+            `).join("");
 
             card.innerHTML = `
-                <div class="regime-name" style="color:${this.getRegimeColor(regime)}">${regime}</div>
-                ${leadersHtml}
+                <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+                    <span>${regime}</span>
+                    <span class="${badgeClass}">${regime}</span>
+                </div>
+                <div style="padding: 16px;">
+                    ${stratHtml || '<div style="color:#86868B; font-size:12px;">No approved strategies yet</div>'}
+                </div>
             `;
             container.appendChild(card);
         });
-    },
-
-    getRegimeColor: function (regime) {
-        const r = regime.toUpperCase();
-        if (r.includes("BULL") || r.includes("UP")) return "#30D158";
-        if (r.includes("BEAR") || r.includes("DOWN")) return "#FF453A";
-        if (r.includes("STAGNANT") || r.includes("FLAT") || r.includes("SIDE")) return "#FF9F0A";
-        if (r.includes("VOLATILE") || r.includes("SHOCK")) return "#BF5AF2";
-        return "#2997FF";
     }
 };
 
-// Auto Initialize - add backtest page check
-// Initialize
-app.init();
+// Initialize App
+document.addEventListener('DOMContentLoaded', () => app.init());

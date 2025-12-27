@@ -30,7 +30,7 @@ import ta
 import numpy as np
 
 class ATRIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 14, **kwargs) -> pd.DataFrame:
         atr_obj = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=window)
         vals = atr_obj.average_true_range()
         atr_norm = vals / df["close"] * 100
@@ -67,7 +67,7 @@ import ta
 import numpy as np
 
 class BBIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 20, std_dev: float = 2.0) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 20, std_dev: float = 2.0, **kwargs) -> pd.DataFrame:
         bb = ta.volatility.BollingerBands(df["close"], window=window, window_dev=std_dev)
         width = bb.bollinger_wband()
         
@@ -101,7 +101,7 @@ import pandas as pd
 import ta
 
 class KCIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 20, scalar: float = 2.0) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 20, scalar: float = 2.0, **kwargs) -> pd.DataFrame:
         # Note: ta library KeltnerChannel uses EMA for central line, and ATR for bands
         kc = ta.volatility.KeltnerChannel(df["high"], df["low"], df["close"], window=length, window_atr=length)
         # Using separate multipliers isn't directly supported in standard KeltnerChannel init in some versions, 
@@ -138,7 +138,7 @@ import pandas as pd
 import ta
 
 class DonchianIndicator:
-    def compute(self, df: pd.DataFrame, lower_length: int = 20, upper_length: int = 20) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, lower_length: int = 20, upper_length: int = 20, **kwargs) -> pd.DataFrame:
         # ta library DonchianChannel uses single window
         # We will iterate or use max window if different, but let's just use one window for simplicity in wrapper
         # if user passes different lengths, we default to max (or implement manually)
@@ -162,6 +162,21 @@ class DonchianIndicator:
     # ==========================
     # 2. MOMENTUM
     # ==========================
+    # [V18] Logical Constants
+    registry.register(overwrite=True, metadata=FeatureMetadata(
+        feature_id="TRUE", name="Constant True", category="LOGIC",
+        description="Always returns True.", code_snippet="import pandas as pd\nclass TrueInd: def compute(self, df, **k): return pd.DataFrame({'value': True}, index=df.index)",
+        handler_func="TrueInd", params=[], source="builtin",
+        state_logic="Constant Logic: Always Active", transition_logic="N/A", memory_window=1, causality_link="Identity",
+        outputs={"value": "value"}
+    ))
+    registry.register(overwrite=True, metadata=FeatureMetadata(
+        feature_id="FALSE", name="Constant False", category="LOGIC",
+        description="Always returns False.", code_snippet="import pandas as pd\nclass FalseInd: def compute(self, df, **k): return pd.DataFrame({'value': False}, index=df.index)",
+        handler_func="FalseInd", params=[], source="builtin",
+        state_logic="Constant Logic: Always Inactive", transition_logic="N/A", memory_window=1, causality_link="Identity",
+        outputs={"value": "value"}
+    ))
     
     # RSI
     rsi_code = """
@@ -170,7 +185,7 @@ import ta
 import numpy as np
 
 class RSIIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 14, **kwargs) -> pd.DataFrame:
         rsi = ta.momentum.RSIIndicator(df["close"], window=window).rsi()
         
         # [Alpha-Power V1] Flow Features
@@ -212,7 +227,7 @@ import pandas as pd
 import ta
 
 class MACDIndicator:
-    def compute(self, df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9, **kwargs) -> pd.DataFrame:
         macd = ta.trend.MACD(df["close"], window_slow=slow, window_fast=fast, window_sign=signal)
         return pd.DataFrame({
             "line": macd.macd(),
@@ -237,7 +252,7 @@ import pandas as pd
 import ta
 
 class StochIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 14, smooth_k: int = 3, smooth_d: int = 3, **kwargs) -> pd.DataFrame:
         stoch = ta.momentum.StochasticOscillator(df["high"], df["low"], df["close"], window=window, smooth_window=smooth_k)
         return pd.DataFrame({
             "k": stoch.stoch(),
@@ -261,7 +276,7 @@ import pandas as pd
 import ta
 
 class CCIIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 20, c: float = 0.015) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 20, c: float = 0.015, **kwargs) -> pd.DataFrame:
         # Fixed: ta.trend.CCIIndicator for updated library versions
         vals = ta.trend.CCIIndicator(df["high"], df["low"], df["close"], window=length, constant=c).cci()
         return pd.DataFrame({"cci": vals}, index=df.index)
@@ -282,7 +297,7 @@ import pandas as pd
 import ta
 
 class ROCIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 10) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 10, **kwargs) -> pd.DataFrame:
         vals = ta.momentum.ROCIndicator(df["close"], window=length).roc()
         return pd.DataFrame({"roc": vals}, index=df.index)
 """
@@ -299,7 +314,7 @@ import pandas as pd
 import ta
 
 class WillRIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 14, **kwargs) -> pd.DataFrame:
         vals = ta.momentum.WilliamsRIndicator(df["high"], df["low"], df["close"], lbp=length).williams_r()
         return pd.DataFrame({"willr": vals}, index=df.index)
 """
@@ -316,7 +331,7 @@ import pandas as pd
 import ta
 
 class CMOIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 14, **kwargs) -> pd.DataFrame:
         # CMO = (RSI - 50) * 2
         rsi = ta.momentum.RSIIndicator(df["close"], window=length).rsi()
         cmo = (rsi - 50) * 2
@@ -339,7 +354,7 @@ import pandas as pd
 import ta
 
 class MACrossIndicator:
-    def compute(self, df: pd.DataFrame, fast: int = 20, slow: int = 60, ma_type: str = "sma") -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, fast: int = 20, slow: int = 60, ma_type: str = "sma", **kwargs) -> pd.DataFrame:
         if ma_type == "ema":
             ma_f = ta.trend.EMAIndicator(df["close"], window=fast).ema_indicator()
             ma_s = ta.trend.EMAIndicator(df["close"], window=slow).ema_indicator()
@@ -366,7 +381,7 @@ import pandas as pd
 import ta
 
 class ADXIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 14, **kwargs) -> pd.DataFrame:
         # Note: ta ADX takes window param
         adx = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=length)
         return pd.DataFrame({
@@ -390,7 +405,7 @@ import pandas as pd
 import ta
 
 class TRIXIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 30) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 30, **kwargs) -> pd.DataFrame:
         t = ta.trend.TRIXIndicator(df["close"], window=length)
         return pd.DataFrame({"trix": t.trix()}, index=df.index)
 """
@@ -407,7 +422,7 @@ import pandas as pd
 import ta
 
 class IchimokuIndicator:
-    def compute(self, df: pd.DataFrame, tenkan: int = 9, kijun: int = 26, senkou: int = 52) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, tenkan: int = 9, kijun: int = 26, senkou: int = 52, **kwargs) -> pd.DataFrame:
         ichi = ta.trend.IchimokuIndicator(df["high"], df["low"], window1=tenkan, window2=kijun, window3=senkou)
         return pd.DataFrame({
             "conv": ichi.ichimoku_conversion_line(),
@@ -434,7 +449,7 @@ import numpy as np
 import ta
 
 class SupertrendIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 7, multiplier: float = 3.0) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 7, multiplier: float = 3.0, **kwargs) -> pd.DataFrame:
         # Manual Supertrend Implementation
         high = df['high']
         low = df['low']
@@ -523,7 +538,7 @@ import pandas as pd
 import ta
 
 class OBVIndicator:
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         obv = ta.volume.OnBalanceVolumeIndicator(df["close"], df["volume"]).on_balance_volume()
         return pd.DataFrame({"OBV": obv}, index=df.index)
 """
@@ -540,7 +555,7 @@ import pandas as pd
 import ta
 
 class MFIIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 14, **kwargs) -> pd.DataFrame:
         mfi = ta.volume.MFIIndicator(df["high"], df["low"], df["close"], df["volume"], window=length).money_flow_index()
         return pd.DataFrame({"mfi": mfi}, index=df.index)
 """
@@ -557,7 +572,7 @@ import pandas as pd
 import ta
 
 class CMFIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 20) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 20, **kwargs) -> pd.DataFrame:
         cmf = ta.volume.ChaikinMoneyFlowIndicator(df["high"], df["low"], df["close"], df["volume"], window=length).chaikin_money_flow()
         return pd.DataFrame({"cmf": cmf}, index=df.index)
 """
@@ -574,7 +589,7 @@ import pandas as pd
 import ta
 
 class EOMIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 14, **kwargs) -> pd.DataFrame:
         eom = ta.volume.EaseOfMovementIndicator(df["high"], df["low"], df["volume"], window=length).ease_of_movement()
         return pd.DataFrame({"eom": eom}, index=df.index)
 """
@@ -595,7 +610,7 @@ import pandas as pd
 import ta
 
 class PSARIndicator:
-    def compute(self, df: pd.DataFrame, step: float = 0.02, max_step: float = 0.2) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, step: float = 0.02, max_step: float = 0.2, **kwargs) -> pd.DataFrame:
         psar = ta.trend.PSARIndicator(df["high"], df["low"], df["close"], step=step, max_step=max_step)
         return pd.DataFrame({
             "psar": psar.psar(),
@@ -619,7 +634,7 @@ import pandas as pd
 import numpy as np
 
 class FRAMAIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 126, batch: int = 10) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 126, batch: int = 10, **kwargs) -> pd.DataFrame:
         # FRAMA implementation based on description
         # Using a simplified fractal dimension calculation
         # N3 = (High - Low) / (Time)
@@ -645,7 +660,7 @@ import pandas as pd
 import ta
 
 class AroonIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 25) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 25, **kwargs) -> pd.DataFrame:
         aroon = ta.trend.AroonIndicator(df["high"], df["low"], window=length)
         return pd.DataFrame({
             "up": aroon.aroon_up(),
@@ -668,7 +683,7 @@ import pandas as pd
 import ta
 
 class AOIndicator:
-    def compute(self, df: pd.DataFrame, fast: int = 5, slow: int = 34) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, fast: int = 5, slow: int = 34, **kwargs) -> pd.DataFrame:
         ao = ta.momentum.AwesomeOscillatorIndicator(df["high"], df["low"], window1=fast, window2=slow)
         return pd.DataFrame({"ao": ao.awesome_oscillator()}, index=df.index)
 """
@@ -688,7 +703,7 @@ import pandas as pd
 import ta
 
 class TSIIndicator:
-    def compute(self, df: pd.DataFrame, high_len: int = 25, low_len: int = 13) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, high_len: int = 25, low_len: int = 13, **kwargs) -> pd.DataFrame:
         tsi = ta.momentum.TSIIndicator(df["close"], window_slow=high_len, window_fast=low_len)
         return pd.DataFrame({"tsi": tsi.tsi()}, index=df.index)
 """
@@ -708,7 +723,7 @@ import pandas as pd
 import ta
 
 class KSTIndicator:
-    def compute(self, df: pd.DataFrame, r1: int = 10, r2: int = 15, r3: int = 20, r4: int = 30) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, r1: int = 10, r2: int = 15, r3: int = 20, r4: int = 30, **kwargs) -> pd.DataFrame:
         kst = ta.trend.KSTIndicator(df["close"], roc1=r1, roc2=r2, roc3=r3, roc4=r4)
         return pd.DataFrame({
             "kst": kst.kst(),
@@ -733,7 +748,7 @@ import pandas as pd
 import ta
 
 class VortexIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 14, **kwargs) -> pd.DataFrame:
         vortex = ta.trend.VortexIndicator(df["high"], df["low"], df["close"], window=length)
         return pd.DataFrame({
             "pos": vortex.vortex_indicator_pos(),
@@ -754,7 +769,7 @@ import pandas as pd
 import ta
 
 class PMOIndicator:
-    def compute(self, df: pd.DataFrame, len1: int = 35, len2: int = 20) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, len1: int = 35, len2: int = 20, **kwargs) -> pd.DataFrame:
         # PMO = EMA(EMA(ROC(1), 35), 20)
         # Custom Calc
         roc = df['close'].diff() # 1-period ROC (Price change)
@@ -800,7 +815,7 @@ import pandas as pd
 import ta
 
 class EFIIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 13) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 13, **kwargs) -> pd.DataFrame:
         efi = ta.volume.ForceIndexIndicator(df["close"], df["volume"], window=length).force_index()
         return pd.DataFrame({"efi": efi}, index=df.index)
 """
@@ -817,7 +832,7 @@ import pandas as pd
 import numpy as np
 
 class PAMIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 10) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 10, **kwargs) -> pd.DataFrame:
         # Simple Proxy for Price Action Momentum
         # Normalized Slope of Linear Regression over 'length'
         
@@ -846,7 +861,7 @@ import pandas as pd
 import ta
 
 class UlcerIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 14, **kwargs) -> pd.DataFrame:
         ui = ta.volatility.UlcerIndex(df["close"], window=length)
         return pd.DataFrame({"ui": ui.ulcer_index()}, index=df.index)
 """
@@ -863,7 +878,7 @@ import pandas as pd
 import ta
 
 class BBAdvIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 20, std_dev: float = 2.0) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 20, std_dev: float = 2.0, **kwargs) -> pd.DataFrame:
         bb = ta.volatility.BollingerBands(df["close"], window=window, window_dev=std_dev)
         return pd.DataFrame({
             "pct_b": bb.bollinger_pband(),
@@ -886,7 +901,7 @@ import pandas as pd
 import ta
 
 class CVIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 10, roc_window: int = 10) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 10, roc_window: int = 10, **kwargs) -> pd.DataFrame:
         # Chaikin Volatility: ROC of EMA (High-Low)
         
         # 1. HL Range
@@ -916,7 +931,7 @@ import pandas as pd
 import ta
 
 class RVIIndicator:
-    def compute(self, df: pd.DataFrame, height: int = 14, length: int = 14) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, height: int = 14, length: int = 14, **kwargs) -> pd.DataFrame:
         # RVI logic: Similar to RSI but using Stdev instead of Price Change
         # RVI = 100 * (UpStd / (UpStd + DownStd)) (Smoothed)
         
@@ -948,7 +963,7 @@ class RVIIndicator:
 import pandas as pd
 
 class EnvelopeIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 20, pct: float = 0.05) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 20, pct: float = 0.05, **kwargs) -> pd.DataFrame:
         ma = df["close"].rolling(window=length).mean()
         upper = ma * (1 + pct)
         lower = ma * (1 - pct)
@@ -973,7 +988,7 @@ class EnvelopeIndicator:
 import pandas as pd
 
 class StdDevIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 20) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 20, **kwargs) -> pd.DataFrame:
         std = df["close"].rolling(window=length).std()
         return pd.DataFrame({"std": std}, index=df.index)
 """
@@ -990,7 +1005,7 @@ import pandas as pd
 import numpy as np
 
 class KalmanFilterIndicator:
-    def compute(self, df: pd.DataFrame, r_ratio: float = 0.1) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, r_ratio: float = 0.1, **kwargs) -> pd.DataFrame:
         # Simple 1D Kalman Filter for Price Denoising
         # x_est = x_pred + K * (measured - x_pred)
         
@@ -1036,7 +1051,7 @@ import pandas as pd
 import ta
 
 class ADLIndicator:
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         adl = ta.volume.AccDistIndexIndicator(df["high"], df["low"], df["close"], df["volume"]).acc_dist_index()
         return pd.DataFrame({"ADL": adl}, index=df.index)
 """
@@ -1053,7 +1068,7 @@ import pandas as pd
 import ta
 
 class ChaikinOscIndicator:
-    def compute(self, df: pd.DataFrame, fast: int = 3, slow: int = 10) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, fast: int = 3, slow: int = 10, **kwargs) -> pd.DataFrame:
         # Chaikin Oscillator is (Fast EMA of ADL) - (Slow EMA of ADL)
         # TA Lib has it? Let's check or build manually from ADL
         adl = ta.volume.AccDistIndexIndicator(df["high"], df["low"], df["close"], df["volume"]).acc_dist_index()
@@ -1076,7 +1091,7 @@ class ChaikinOscIndicator:
 import pandas as pd
 
 class PVTIndicator:
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         # PVT = Cumulative (Volume * (Close - PrevClose) / PrevClose)
         # PVT = Cumulative (Volume * ROC)
         
@@ -1098,7 +1113,7 @@ import pandas as pd
 import ta
 
 class VROCIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 14, **kwargs) -> pd.DataFrame:
         # Volume ROC
         vroc = df['volume'].pct_change(periods=length) * 100
         return pd.DataFrame({"vroc": vroc}, index=df.index)
@@ -1118,7 +1133,7 @@ import pandas as pd
 import ta
 
 class KAMAIndicator:
-    def compute(self, df: pd.DataFrame, length: int = 10) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, length: int = 10, **kwargs) -> pd.DataFrame:
         kama = ta.momentum.KAMAIndicator(df["close"], window=length)
         return pd.DataFrame({"kama": kama.kama()}, index=df.index)
 """
@@ -1135,7 +1150,7 @@ import pandas as pd
 import numpy as np
 
 class RAVIIndicator:
-    def compute(self, df: pd.DataFrame, short_len: int = 7, long_len: int = 65) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, short_len: int = 7, long_len: int = 65, **kwargs) -> pd.DataFrame:
         # RAVI = Abs(SMA(7) - SMA(65)) / SMA(65) * 100
         sma_s = df['close'].rolling(window=short_len).mean()
         sma_l = df['close'].rolling(window=long_len).mean()
@@ -1159,7 +1174,7 @@ import pandas as pd
 import numpy as np
 
 class AdaptiveKalmanIndicator:
-    def compute(self, df: pd.DataFrame, q: float = 1e-5, r: float = 0.01) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, q: float = 1e-5, r: float = 0.01, **kwargs) -> pd.DataFrame:
         # Adaptive Kalman: Adjusts R based on recent volatility
         prices = df['close'].values
         n = len(prices)
@@ -1206,7 +1221,7 @@ class AdaptiveKalmanIndicator:
 import pandas as pd
 
 class PivotPointsIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 20, **kwargs) -> pd.DataFrame:
         # Rolling Standard Pivot Points
         # Using a window to simulate "Previous Period" (e.g., last 20 days as 'last month')
         
@@ -1246,7 +1261,7 @@ class PivotPointsIndicator:
 import pandas as pd
 
 class FiboIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 50, **kwargs) -> pd.DataFrame:
         # Dynamic Fibonacci Retracement within window
         # 0% = Low, 100% = High
         
@@ -1280,7 +1295,7 @@ import pandas as pd
 import numpy as np
 
 class SRLevelIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 20, **kwargs) -> pd.DataFrame:
         # Rolling Max/Min as proxies for S/R
         # Resistance
         res_level = df['high'].rolling(window=window).max().shift(1)
@@ -1309,7 +1324,7 @@ import pandas as pd
 import numpy as np
 
 class VPIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 50, bins: int = 10) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 50, bins: int = 10, **kwargs) -> pd.DataFrame:
         # Approximating Volume Profile features
         # We calculate VWAP of the window as the POC (Point of Control) proxy
         # And check if current price is in valid "Value Area"
@@ -1346,7 +1361,7 @@ import pandas as pd
 import numpy as np
 
 class ZigZagIndicator:
-    def compute(self, df: pd.DataFrame, deviation: float = 5.0) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, deviation: float = 5.0, **kwargs) -> pd.DataFrame:
         # Simple ZigZag implementation for peaks/troughs
         # deviation in %
         close = df['close'].values
@@ -1373,7 +1388,7 @@ import pandas as pd
 import numpy as np
 
 class HeikinAshiIndicator:
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         # HA Close: (O + H + L + C) / 4
         ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4
         
@@ -1416,7 +1431,7 @@ import pandas as pd
 import numpy as np
 
 class FakeoutIndicator:
-    def compute(self, df: pd.DataFrame, window: int = 20, lookback: int = 5) -> pd.DataFrame:
+    def compute(self, df: pd.DataFrame, window: int = 20, lookback: int = 5, **kwargs) -> pd.DataFrame:
         # 1. Detect Breakout of N-bar High/Low
         prev_high = df['high'].rolling(window).max().shift(1)
         prev_low = df['low'].rolling(window).min().shift(1)

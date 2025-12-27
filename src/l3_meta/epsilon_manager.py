@@ -47,6 +47,13 @@ class EpsilonManager:
             f"{old_eps:.3f} -> {self.epsilon:.3f}"
         )
 
+    def reset(self, force_val: Optional[float] = None):
+        """Resets epsilon to start or forced value."""
+        self.epsilon = force_val if force_val is not None else config.RL_EPSILON_START
+        self.step_count = 0
+        self.last_reheat_step = 0
+        logger.info(f"[EpsilonManager] RESET to {self.epsilon}")
+
     def set_decay(self, new_decay: float):
         self.decay = new_decay
 

@@ -54,92 +54,90 @@
     <!-- Main Content -->
     <main class="main-content">
         <div class="container">
-            </a>
-        </div>
-        </nav>
+            <header>
+                <h1>Backtest</h1>
+                <p class="subtitle">Select a model and run a rule-based backtest</p>
+            </header>
 
-        <!-- Main Content -->
-        <main class="main-content">
-            <div class="container">
-                <header>
-                    <h1>Backtest</h1>
-                    <p class="subtitle">Select a model and run a rule-based backtest</p>
-
-                    <!-- Model Selection Section -->
-                    <div class="builder-section">
-                        <div class="builder-header">
-                            <div style="display:flex; align-items:center; gap:15px;">
-                                <h3>Top 5 Approved Models</h3>
-                                <label style="font-size: 13px; color: #86868B; cursor: pointer;">
-                                    <input type="checkbox" id="bt-include-rejected" onchange="app.renderModelCards()">
-                                    Include Rejected
-                                </label>
-                            </div>
-                            <span class="selected-count" id="selected-model-label">Select a model to test</span>
-                        </div>
-
-                        <div class="model-cards" id="model-cards">
-                            <!-- JS Populated -->
-                        </div>
+            <!-- Model Selection Section -->
+            <div class="builder-section">
+                <div class="builder-header">
+                    <div style="display:flex; align-items:center; gap:15px;">
+                        <h3>Candidate Models</h3>
+                        <label style="font-size: 13px; color: #86868B; cursor: pointer;">
+                            <input type="checkbox" id="bt-include-rejected" onchange="app.renderModelCards()">
+                            Include Rejected
+                        </label>
                     </div>
+                    <span class="selected-count" id="selected-model-label">Select a model to test</span>
+                </div>
 
-                    <!-- Selected Model Details -->
-                    <div id="model-detail-section" class="results-section" style="display:none;">
-                        <div class="section-header"
-                            style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-                            <h3 id="selected-model-title">Model Details</h3>
-                            <button class="btn-primary" id="run-test-btn" onclick="app.runModelBacktest()">
-                                Run Backtest
-                            </button>
-                        </div>
-
-                        <!-- Metrics -->
-                        <div class="result-metrics" id="result-metrics">
-                            <div class="metric-card">
-                                <div class="metric-label">Total Return (%)</div>
-                                <div class="metric-value" id="m-total-return">-</div>
-                            </div>
-                            <div class="metric-card">
-                                <div class="metric-label">Entry Signals</div>
-                                <div class="metric-value" id="m-entry-signals">-</div>
-                            </div>
-                            <div class="metric-card">
-                                <div class="metric-label">Trades</div>
-                                <div class="metric-value" id="m-trades">-</div>
-                            </div>
-                            <div class="metric-card">
-                                <div class="metric-label">Win Rate</div>
-                                <div class="metric-value" id="m-winrate">-</div>
-                            </div>
-                            <div class="metric-card">
-                                <div class="metric-label">Max Drawdown</div>
-                                <div class="metric-value" id="m-mdd">-</div>
-                            </div>
-                        </div>
-
-                        <!-- Indicator Composition -->
-                        <div style="margin-top:24px; margin-bottom:20px;">
-                            <div
-                                style="font-size:12px; color:#86868B; text-transform:uppercase; font-weight:600; margin-bottom:10px;">
-                                Indicator Composition</div>
-                            <div id="model-comp-grid" class="comp-grid"></div>
-                        </div>
-
-                        <!-- Equity Curve -->
-                        <div class="chart-wrapper">
-                            <div id="model-chart"></div>
-                        </div>
-
-                        <div id="backtest-summary" class="summary-box" style="display:none; margin-top:24px;">
-                            <div class="summary-title">Backtest Summary</div>
-                            <div id="backtest-summary-text" class="summary-text"></div>
-                        </div>
-                    </div>
-
+                <div class="model-cards" id="model-cards">
+                    <!-- JS Populated -->
+                </div>
             </div>
-        </main>
 
-        <script src="app.js?v=2"></script>
+            <!-- Selected Model Details -->
+            <div id="model-detail-section" class="results-section" style="display:none;">
+                <div class="section-header"
+                    style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+                    <div style="display:flex; align-items:center; gap:12px;">
+                        <h3 id="selected-model-title">Model Details</h3>
+                        <span id="model-gate-status" class="status-badge" style="display:none;">GATE PASS</span>
+                    </div>
+                    <button class="btn-primary" id="run-test-btn" onclick="app.runModelBacktest()">
+                        Run Backtest
+                    </button>
+                </div>
+
+                <!-- Metrics -->
+                <div class="result-metrics" id="result-metrics">
+                    <div class="metric-card">
+                        <div class="metric-label">Total Return (%)</div>
+                        <div class="metric-value" id="m-total-return">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Entry Signals</div>
+                        <div class="metric-value" id="m-entry-signals">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Trades</div>
+                        <div class="metric-value" id="m-trades">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Win Rate</div>
+                        <div class="metric-value" id="m-winrate">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Max Drawdown</div>
+                        <div class="metric-value" id="m-mdd">-</div>
+                    </div>
+                </div>
+
+                <!-- Indicator Composition -->
+                <div style="margin-top:24px; margin-bottom:20px;">
+                    <div
+                        style="font-size:12px; color:#86868B; text-transform:uppercase; font-weight:600; margin-bottom:10px;">
+                        Indicator Composition</div>
+                    <div id="model-comp-grid" class="comp-grid"></div>
+                </div>
+
+                <!-- Equity Curve -->
+                <div class="chart-wrapper">
+                    <div id="model-chart"></div>
+                </div>
+
+                <div id="backtest-summary" class="summary-box" style="display:none; margin-top:24px;">
+                    <div class="summary-title">Failure Analysis</div>
+                    <div id="backtest-summary-text" class="summary-text"
+                        style="color:var(--accent-red); font-family: 'JetBrains Mono', monospace; font-size: 13px; padding: 15px; background: rgba(255,69,58,0.05); border-radius: 8px;">
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script src="app.js?v=4"></script>
 </body>
 
 </html>

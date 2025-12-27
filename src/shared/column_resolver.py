@@ -28,6 +28,9 @@ class ColumnResolver:
         """
         ColumnRef(feature_id, output_key) -> actual_column_name
         """
+        if ref.feature_id.upper() in ("TRUE", "FALSE"):
+            return ref.feature_id.upper()
+        
         # FeatureMetadata 조회
         meta = self.registry.get(ref.feature_id)
         

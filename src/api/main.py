@@ -26,6 +26,11 @@ from src.shared.returns import (
 from src.shared.backtest import run_signal_backtest
 from src.shared.ranking import check_return_stability
 
+# [V21] Added for Status Monitoring
+from src.l3_meta.curriculum_controller import get_curriculum_controller
+from src.l3_meta.epsilon_manager import get_epsilon_manager
+from src.l3_meta.detectors.regime import RegimeDetector
+
 app = FastAPI(title="Vibe Trading Lab API")
 
 # CORS
@@ -792,6 +797,43 @@ def get_regime_stats():
         }
     except Exception as e:
         print(f"Stats Error: {e}")
+        return {"error": str(e)}
+
+@app.get("/api/v1/system/status")
+def get_system_status():
+    """
+    Returns current system-wide status including:
+    - Current Curriculum Stage
+    - RL Explorer (Epsilon)
+    - Current Market Regime (if data available)
+    - System Load/Resource Info
+    """
+    try:
+        curriculum = get_curriculum_controller()
+        epsilon = get_epsilon_manager()
+        
+        c_info = curriculum.get_stage_info()
+        e_info = epsilon.snapshot()
+        
+        # Get Current Regime
+        regime_label = "UNKNOWN"
+        try:
+            df = get_cached_market_data()
+            if not df.empty:
+                detector = RegimeDetector()
+                regime = detector.detect(df)
+                regime_label = regime.label
+        except:
+            pass
+
+        return {
+            "curriculum": c_info,
+            "epsilon": e_info,
+            "regime": regime_label,
+            "timestamp": pd.Timestamp.now().isoformat()
+        }
+    except Exception as e:
+        print(f"Status Error: {e}")
         return {"error": str(e)}
 
 # Serve static files (Frontend)

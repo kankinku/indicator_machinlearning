@@ -190,6 +190,9 @@ class FeatureRegistry:
             return None
             
         # Compile dynamic code
+        if not metadata.code_snippet and metadata.source == "custom":
+            return None
+            
         try:
             local_scope = {}
             exec(metadata.code_snippet, globals(), local_scope)
