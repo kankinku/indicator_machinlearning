@@ -55,7 +55,7 @@ class BinanceDataLoader:
         all_data = []
         current_start = start_ts
         
-        logger.info(f">>> [Binance] Fetching {self.symbol} {self.interval} from {start_date} to {end_date}...")
+        logger.info(f"[Binance] 수집: {self.symbol} {self.interval} ({start_date}~{end_date})")
         
         while current_start < end_ts:
             params = {
@@ -84,11 +84,11 @@ class BinanceDataLoader:
                 time.sleep(0.1)
                 
             except Exception as e:
-                logger.error(f"Binance API Error: {e}")
+                logger.error(f"[Binance] API 오류: {e}")
                 break
         
         if not all_data:
-            logger.warning("No data fetched from Binance")
+            logger.warning("[Binance] 수집 데이터 없음")
             return pd.DataFrame()
         
         # Parse data
@@ -108,7 +108,7 @@ class BinanceDataLoader:
         # Keep only OHLCV
         df = df[["open", "high", "low", "close", "volume"]]
         
-        logger.info(f">>> [Binance] Fetched {len(df)} candles")
+        logger.info(f"[Binance] 캔들 수집 완료: {len(df)}개")
         return df
     
     def fetch_multiple_ranges(self, ranges: List[Tuple[str, str]]) -> pd.DataFrame:
@@ -134,7 +134,7 @@ class BinanceDataLoader:
         combined = combined[~combined.index.duplicated(keep='first')]
         combined = combined.sort_index()
         
-        logger.info(f">>> [Binance] Combined total: {len(combined)} candles")
+        logger.info(f"[Binance] 통합 캔들 수: {len(combined)}개")
         return combined
 
 

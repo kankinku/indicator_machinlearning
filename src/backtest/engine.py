@@ -24,6 +24,9 @@ class BacktestResult:
     excess_return: float = 0.0
     complexity_penalty: float = 0.0
     trade_returns: List[float] = None
+    invalid_action_count: int = 0
+    invalid_action_rate: float = 0.0
+    total_action_bars: int = 0
 
 class DeterministicBacktestEngine:
     """
@@ -39,7 +42,16 @@ class DeterministicBacktestEngine:
         self.commission_bps = commission_bps
         self.commission_frac = commission_bps / 10000.0
     
-    def run(self, close_prices: pd.Series, entry_signals: pd.Series, exit_signals: pd.Series, benchmark_returns: Optional[pd.Series] = None) -> BacktestResult:
+    def run(
+        self,
+        close_prices: pd.Series,
+        entry_signals: pd.Series,
+        exit_signals: pd.Series,
+        benchmark_returns: Optional[pd.Series] = None,
+        tp_pct: Optional[float] = None,
+        sl_pct: Optional[float] = None,
+        max_hold_bars: Optional[int] = None,
+    ) -> BacktestResult:
         if close_prices.empty:
             return self._empty_result()
             
@@ -55,27 +67,68 @@ class DeterministicBacktestEngine:
         
         state = 0 # 0: FLAT, 1: LONG
         entry_idx = None
+        entry_price = None
+        hold_bars = 0
+        invalid_action_count = 0
+        total_action_bars = 0
         
         # State Machine Loop
+        # Action set (long-only): HOLD / ENTER_LONG / EXIT_LONG
         for i in range(len(prices)):
+            raw_entry = bool(entries.iloc[i])
+            raw_exit = bool(exits.iloc[i])
+
+            if raw_entry or raw_exit:
+                total_action_bars += 1
+            if raw_entry and raw_exit:
+                invalid_action_count += 1
+
+            # State-gated actions (signals themselves are not actions).
+            entry_action = raw_entry and state == 0
+            exit_action = raw_exit and state == 1
+
             # 1. State: LONG -> Check EXIT
             if state == 1:
-                if exits.iloc[i]:
-                    self._record_trade(trades, prices, entry_idx, i, dates)
+                if exit_action:
+                    self._record_trade(trades, prices, entry_idx, i, dates, "AGENT_EXIT")
                     state = 0
                     entry_idx = None
+                    entry_price = None
+                    hold_bars = 0
+                else:
+                    hold_bars += 1
+                    if entry_price is not None:
+                        if tp_pct is not None and prices[i] >= entry_price * (1.0 + tp_pct):
+                            self._record_trade(trades, prices, entry_idx, i, dates, "TP")
+                            state = 0
+                            entry_idx = None
+                            entry_price = None
+                            hold_bars = 0
+                        elif sl_pct is not None and prices[i] <= entry_price * (1.0 - sl_pct):
+                            self._record_trade(trades, prices, entry_idx, i, dates, "SL")
+                            state = 0
+                            entry_idx = None
+                            entry_price = None
+                            hold_bars = 0
+                        elif max_hold_bars is not None and hold_bars >= max_hold_bars:
+                            self._record_trade(trades, prices, entry_idx, i, dates, "HORIZON")
+                            state = 0
+                            entry_idx = None
+                            entry_price = None
+                            hold_bars = 0
             
             # 2. State: FLAT -> Check ENTRY
             elif state == 0:
-                if entries.iloc[i]:
-                    if not exits.iloc[i]:
-                        state = 1
-                        entry_idx = i
+                if entry_action and not exit_action:
+                    state = 1
+                    entry_idx = i
+                    entry_price = prices[i]
+                    hold_bars = 0
             
             positions[i] = state
             
         if state == 1:
-            self._record_trade(trades, prices, entry_idx, len(prices)-1, dates)
+            self._record_trade(trades, prices, entry_idx, len(prices)-1, dates, "HORIZON")
             
         # [V13.5] Logic: Signal[i] -> Applied to returns[i+1]
         price_returns = np.diff(prices) / prices[:-1]
@@ -125,6 +178,10 @@ class DeterministicBacktestEngine:
         
         avg_trade_return = float(np.mean(trade_returns) * 100.0) if trade_count > 0 else 0.0
         
+        invalid_action_rate = 0.0
+        if total_action_bars > 0:
+            invalid_action_rate = float(invalid_action_count / total_action_bars)
+
         return BacktestResult(
             dates=[d.strftime("%Y-%m-%d") for d in dates],
             equity_curve=equity_curve.tolist(),
@@ -138,10 +195,13 @@ class DeterministicBacktestEngine:
             avg_trade_return=avg_trade_return,
             trades_per_year=trades_per_year,
             excess_return=excess_return,
-            trade_returns=trade_returns.tolist()
+            trade_returns=trade_returns.tolist(),
+            invalid_action_count=invalid_action_count,
+            invalid_action_rate=invalid_action_rate,
+            total_action_bars=total_action_bars,
         )
 
-    def _record_trade(self, trades, prices, entry_idx, exit_idx, dates):
+    def _record_trade(self, trades, prices, entry_idx, exit_idx, dates, exit_reason: str):
         raw_entry_price = prices[entry_idx]
         raw_exit_price = prices[exit_idx]
         
@@ -161,8 +221,24 @@ class DeterministicBacktestEngine:
             "net_entry_price": float(entry_price),
             "net_exit_price": float(exit_price),
             "return_pct": float(ret_pct),
+            "exit_reason": exit_reason,
             "bars": int(exit_idx - entry_idx)
         })
 
     def _empty_result(self) -> BacktestResult:
-        return BacktestResult([], [], [], 0.0, 0.0, 0, 0.0, 1.0, 0.0, 0.0, trade_returns=[])
+        return BacktestResult(
+            [],
+            [],
+            [],
+            0.0,
+            0.0,
+            0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            trade_returns=[],
+            invalid_action_count=0,
+            invalid_action_rate=0.0,
+            total_action_bars=0,
+        )

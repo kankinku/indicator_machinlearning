@@ -35,7 +35,7 @@ class TacticalModel:
         if risk_config is None:
             risk_config = {"pt": 1.0, "sl": 1.0, "window": 10}
             
-        logger.info(f"Training L2 Tactical Model ({self.model_type})...")
+        logger.info(f"[L2] 전술 모델 학습 시작 ({self.model_type})")
         
         # 1. Generate Labels (y)
         vol = compute_daily_volatility(close_prices)
@@ -63,7 +63,7 @@ class TacticalModel:
         y_train = y.loc[valid_idx]
         
         if X_train.empty:
-            logger.warning("No valid training data after alignment.")
+            logger.warning("[L2] 정렬 후 유효한 학습 데이터 없음")
             return
             
         # 3. Fit Model
@@ -77,7 +77,7 @@ class TacticalModel:
         self._is_fitted = True
         
         score = self.model.score(X_train, y_train)
-        logger.info(f"Model Trained. Training Accuracy: {score:.4f}")
+        logger.info(f"[L2] 학습 완료. 정확도 {score:.4f}")
         
     def predict_uncertainty(self, features: pd.DataFrame) -> pd.Series:
         """
@@ -95,7 +95,7 @@ class TacticalModel:
             pos_probs = probs[:, 1]
             return pd.Series(pos_probs, index=features.index)
         except Exception as e:
-            logger.error(f"Prediction failed: {e}")
+            logger.error(f"[L2] 예측 실패: {e}")
             return pd.Series(0.5, index=features.index)
             
     def get_feature_importance(self) -> Dict[str, float]:

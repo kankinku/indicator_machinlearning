@@ -167,7 +167,7 @@ class ContextFeatureGenerator:
         # NaN 처리
         features = features.ffill().fillna(0.0)
         
-        logger.debug(f"[ContextFeatures] Generated {len(features.columns)} context features")
+        logger.debug(f"[ContextFeatures] 컨텍스트 특징 생성: {len(features.columns)}개")
         
         return features
     

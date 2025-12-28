@@ -43,7 +43,7 @@ class EpsilonManager:
         self.last_reheat_step = self.step_count
         
         logger.warning(
-            f"[EpsilonManager] 🔥 REHEAT ({reason}): "
+            f"[EpsilonManager] 리히트({reason}): "
             f"{old_eps:.3f} -> {self.epsilon:.3f}"
         )
 
@@ -52,7 +52,7 @@ class EpsilonManager:
         self.epsilon = force_val if force_val is not None else config.RL_EPSILON_START
         self.step_count = 0
         self.last_reheat_step = 0
-        logger.info(f"[EpsilonManager] RESET to {self.epsilon}")
+        logger.info(f"[EpsilonManager] 초기화: {self.epsilon}")
 
     def set_decay(self, new_decay: float):
         self.decay = new_decay

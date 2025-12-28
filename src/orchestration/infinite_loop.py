@@ -40,6 +40,15 @@ from src.orchestration.evaluation import evaluate_stage, evaluate_v12_batch, per
 from src.data.loader import DataLoader
 from src.contracts import PolicySpec
 from src.shared.instrumentation import get_instrumentation
+from src.shared.observability import (
+    build_episode_summary,
+    build_batch_report,
+    log_batch,
+    load_recent_batch_reports,
+    detect_deadlock,
+)
+from src.orchestration.stage_controller import StageController
+from src.orchestration.regression_monitor import RegressionMonitor
 
 logger = get_logger("orchestration.loop")
 
@@ -62,6 +71,7 @@ def _run_single_experiment(
     policy: PolicySpec,
     df,
     regime_label: str,
+    stage_id: Optional[int] = None,
     preloaded_registry=None,  # [Optim] 메인 프로세스에서 전달받은 레지스트리
 ) -> ExperimentResult:
     """
@@ -77,7 +87,9 @@ def _run_single_experiment(
             inject_registry(preloaded_registry)
 
         # 평가 실행 (n_jobs=1로 내부 병렬화 비활성화 - 이미 외부에서 병렬화됨)
-        results, status = evaluate_stage([policy], df, "full", regime_label, n_jobs=1)
+        stage_id = int(stage_id or getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+        config.CURRICULUM_CURRENT_STAGE = stage_id
+        results, status = evaluate_stage([policy], df, "full", regime_label, n_jobs=1, stage_id=stage_id)
         
         if results:
             res = results[0]
@@ -131,6 +143,7 @@ def _run_batch_parallel(
     df,
     regime_label: str,
     n_jobs: int,
+    stage_id: Optional[int] = None,
 ) -> List[ExperimentResult]:
     """
     여러 실험을 병렬로 실행합니다.
@@ -161,6 +174,7 @@ def _run_batch_parallel(
             policy=policy,
             df=df,
             regime_label=regime_label,
+            stage_id=stage_id,
             preloaded_registry=main_registry, # [Optim] 객체 전달 (Pickling)
         )
         for policy in policies
@@ -176,6 +190,7 @@ def _run_batch_sequential(
     history,
     repo: LedgerRepo,
     batch_size: int,
+    stage_id: Optional[int] = None,
 ) -> Tuple[int, List[Tuple[float, PolicySpec]]]:
     """
     순차적으로 실험을 실행하고 즉시 학습합니다.
@@ -195,7 +210,9 @@ def _run_batch_sequential(
         
         # 2. 평가
         try:
-            results, status = evaluate_v12_batch([pol], df, regime.label, n_jobs=1)
+            stage_id = int(stage_id or getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+            config.CURRICULUM_CURRENT_STAGE = stage_id
+            results, status = evaluate_v12_batch([pol], df, regime.label, n_jobs=1, stage_id=stage_id)
             
             # 3. 저장
             existing_ids = {r.policy_spec.spec_id for r in history}
@@ -207,6 +224,8 @@ def _run_batch_sequential(
                 from src.shared.metrics import metrics_to_legacy_dict, aggregate_windows
                 res = results[0]
                 reward = res.score
+                if res.reward_breakdown and isinstance(res.reward_breakdown, dict):
+                    reward = float(res.reward_breakdown.get("total", reward))
                 
                 m_dict = {}
                 if res.best_sample:
@@ -219,9 +238,9 @@ def _run_batch_sequential(
                 agent.learn(reward, regime, pol, metrics=m_dict)
                 batch_results.append(res)
                 
-                status_icon = "OK" if reward > config.EVAL_SCORE_MIN else "NO"
+                status_icon = "통과" if reward > config.EVAL_SCORE_MIN else "실패"
                 logger.info(
-                    f"  [{i+1}] {status_icon} {pol.template_id:<20} | Score: {reward:>6.3f}"
+                    f"  [{i+1}] {status_icon} {pol.template_id:<20} | 점수: {reward:>6.3f}"
                 )
                 
                 # 5. [V11] Curriculum 결과 기록
@@ -238,14 +257,18 @@ def _run_batch_sequential(
                         alpha=breakdown.alpha,
                         profit_factor=m_dict.get("profit_factor", 1.0),
                     )
-                    status_change = curriculum.record_result(passed, m_dict)
+                    status_change = curriculum.record_result(
+                        passed,
+                        m_dict,
+                        allow_stage_change=not getattr(config, "STAGE_AUTO_ENABLED", True),
+                    )
                     if status_change.get("promoted"):
-                        logger.info(f"  >>> [Curriculum] PROMOTED to Stage {status_change['stage_after']}!")
+                        logger.info(f"  >>> [커리큘럼] 스테이지 {status_change['stage_after']} 승격.")
         except Exception as e:
             exc_type = type(e).__name__
             from src.shared.instrumentation import get_instrumentation
             get_instrumentation().record_exception(exc_type)
-            logger.error(f"!!! [Sequential Error] {e}", exc_info=True)
+            logger.error(f"!!! [순차 오류] {e}", exc_info=True)
     
     return saved_total, batch_results
 
@@ -267,10 +290,11 @@ def infinite_loop(
     ticker = target_ticker or config.TARGET_TICKER
     l_path = ledger_path or config.LEDGER_DIR
     max_exps = max_experiments if max_experiments is not None else config.MAX_EXPERIMENTS
+    max_batches = int(getattr(config, "MAX_BATCHES", 0))
     sleep_sec = sleep_interval if sleep_interval is not None else config.SLEEP_INTERVAL
 
     # 1. Setup
-    logger.info(">>> [System] Initializing Vibe Engine (Dynamic Evolved)...")
+    logger.info(">>> [시스템] 엔진 초기화 중...")
     
     # DI: 싱글톤 레지스트리 사용 (중복 초기화 방지)
     registry = get_registry()
@@ -281,6 +305,8 @@ def infinite_loop(
     detector = RegimeDetector()
     eps_manager = get_epsilon_manager()
     instrumentation = get_instrumentation()
+    stage_controller = StageController()
+    regression_monitor = RegressionMonitor()
     
     # 병렬 설정
     n_jobs = config.PARALLEL_BATCH_SIZE or multiprocessing.cpu_count()
@@ -288,16 +314,16 @@ def infinite_loop(
     
     # D3QN 모드 확인
     d3qn_mode = config.D3QN_ENABLED
-    logger.info(f">>> [System] Parallel Mode: {parallel_mode} | Workers: {n_jobs} | D3QN: {d3qn_mode}")
+    logger.info(f">>> [시스템] 병렬 모드: {parallel_mode} | 워커: {n_jobs} | D3QN: {d3qn_mode}")
     
     # [V11] Curriculum Controller 초기화
     curriculum = get_curriculum_controller() if config.CURRICULUM_ENABLED else None
     if curriculum:
         stage_info = curriculum.get_stage_info()
         logger.info(
-            f">>> [Curriculum] Stage {stage_info['current_stage']}: "
+            f">>> [커리큘럼] 스테이지 {stage_info['current_stage']}: "
             f"{stage_info['description']} | "
-            f"Passes: {stage_info['stage_passes']}/{stage_info['threshold_to_next']}"
+            f"통과 {stage_info['stage_passes']}/{stage_info['threshold_to_next']}"
         )
     
     # [Config] Suppress Spam Logs
@@ -318,7 +344,7 @@ def infinite_loop(
         source = config.DATA_SOURCE or "yfinance"
         target = ticker or "QQQ"
         
-        logger.info(f">>> [Data] Initializing DataLoader for {target} ({source})...")
+        logger.info(f">>> [데이터] 로더 초기화: {target} ({source})")
         if source == "binance":
             from src.data.binance_loader import fetch_btc_training_data
             df = fetch_btc_training_data()
@@ -329,25 +355,25 @@ def infinite_loop(
         if df.empty:
             raise ValueError(f"Fetched data is empty for {target}")
             
-        logger.info(f">>> [Data] Loaded {len(df)} bars successfully.")
+        logger.info(f">>> [데이터] 로드 완료: {len(df)} bars")
         
         # [V11.2] Pre-calculate Regime Labels for backtest validation
-        logger.info(">>> [System] Pre-calculating Market Regimes for validation...")
+        logger.info(">>> [시스템] 레짐 사전 계산 중...")
         df["regime_label"] = detector.detect_series(df)
         
         agent.set_market_data(df)
     except Exception as e:
-        logger.error(f"!!! [Error] Failed to load data: {e}", exc_info=True)
+        logger.error(f"!!! [오류] 데이터 로드 실패: {e}", exc_info=True)
         return
 
     # Resume Counter from History
     try:
         existing_records = repo.load_records()
         counter = len(existing_records)
-        logger.info(f">>> [System] Found {counter} past experiments. Resuming from #{counter + 1}...")
+        logger.info(f">>> [시스템] 기존 실험 {counter}건 발견. #{counter + 1}부터 재개.")
     except Exception as e:
         counter = 0
-        logger.warning(f">>> [System] Starting fresh (History load failed: {e}).")
+        logger.warning(f">>> [시스템] 기록 로드 실패로 새로 시작: {e}")
 
     batch_idx = 0
     
@@ -359,7 +385,7 @@ def infinite_loop(
         if max_exps > 0 and counter > max_exps:
             pruned = repo.prune_experiments(keep_n=max_exps)
             if pruned > 0:
-                logger.info(f">>> [System] Pruned {pruned} poor performers to maintain pool size {max_exps}.")
+                logger.info(f">>> [시스템] 하위 성능 {pruned}건 정리 (풀 크기 {max_exps} 유지)")
 
         batch_idx += 1
         
@@ -376,6 +402,7 @@ def infinite_loop(
         batch_rewards = []
         diagnostic_status = {"status": "EMPTY"}
         tuner = None
+        diversity_info = {}
 
         # A. Detect Regime (Situation Awareness)
         regime = detector.detect(df)
@@ -386,6 +413,11 @@ def infinite_loop(
         # B. Load History (Memory)
         history = repo.load_records()
         existing_ids = {r.policy_spec.spec_id for r in history}
+        if curriculum:
+            current_stage = int(curriculum.current_stage)
+        else:
+            current_stage = int(getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+        config.CURRICULUM_CURRENT_STAGE = current_stage
 
         # logger.info("-" * 90) removed to replace with better header
         
@@ -393,21 +425,33 @@ def infinite_loop(
             # ========================================
             # C-1. 병렬 실행 모드
             # ========================================
-            logger.info(f"  >>> [Parallel] Generating {n_jobs} Policies (Regime: {regime.label})...")
+            logger.info(f"  >>> [병렬] 정책 생성 {n_jobs}개 (레짐: {regime.label})")
             
             # 1. 정책 배치 생성 (Diversity-aware Batch)
             policies = agent.propose_batch(regime, history, n_jobs, seed=batch_seed)
             
             # 2. 병렬 평가 (V14 Optimized)
-            logger.info(f"  >>> [V14] Evaluating {len(policies)} experiments in batch (Parallel)...")
+            logger.info(f"  >>> [평가] 배치 평가 {len(policies)}개 (병렬)")
             s2_start = time.time()
-            results, diagnostic_status = evaluate_v12_batch(policies, df, regime.label, n_jobs)
+            results, diagnostic_status = evaluate_v12_batch(
+                policies,
+                df,
+                regime.label,
+                n_jobs,
+                stage_id=current_stage,
+            )
             s2_duration = time.time() - s2_start
             
             # [V19] Minimum Valid Strategy Safeguard
-            valid_count = len([r for r in results if r.score > config.EVAL_SCORE_MIN])
+            valid_count = len([
+                r for r in results
+                if r.best_sample
+                and r.best_sample.metrics
+                and not r.best_sample.metrics.is_rejected
+                and getattr(r.best_sample.metrics.trades, "cycle_count", 0) > 0
+            ])
             if valid_count < 1:
-                logger.warning("!!! [CRITICAL] No valid strategies found in batch. Action Space might be failing.")
+                logger.warning("!!! [치명] 유효 전략 없음. 액션 공간이 비활성일 수 있음.")
                 # Emergency: Force high exploration next batch if complete failure
                 eps_manager.reset(force_val=1.0)
             
@@ -417,7 +461,7 @@ def infinite_loop(
             if len(scores) > 5:
                 variance = np.var(scores)
                 if variance < 1e-4:
-                     logger.warning(f"!!! [WATCHDOG] Reward Variance too low ({variance:.5f}). Learning may stall. Check feature pipeline or gates.")
+                     logger.warning(f"!!! [감시] 보상 분산이 너무 낮음 ({variance:.5f}). 학습 정체 가능.")
                      diagnostic_status['status'] = "COLLAPSED"
 
             # Instrument Stage 2 (Detailed)
@@ -434,17 +478,62 @@ def infinite_loop(
 
             # 3. [V11.3] Diversity Selection & Persistence
             from src.l1_judge.diversity import select_diverse_top_k
-            
+            from src.l1_judge.evaluator import compute_gate_diagnostics
+
+            gate_diag_by_id = {}
+            learning_candidates = []
+            for res in results:
+                if not res.best_sample or not res.best_sample.metrics:
+                    continue
+                metrics = res.best_sample.metrics
+                if getattr(metrics.trades, "cycle_count", 0) <= 0:
+                    continue
+                gate_diag = compute_gate_diagnostics(metrics)
+                gate_diag_by_id[res.policy_spec.spec_id] = gate_diag
+                learning_candidates.append(res)
+
             # Succeeded experiments only (Score above min)
-            valid_results = [r for r in results if r.score > config.EVAL_SCORE_MIN]
-            
-            # Diverse selection among valid candidates
+            valid_results = [
+                r for r in learning_candidates
+                if gate_diag_by_id.get(r.policy_spec.spec_id)
+                and gate_diag_by_id[r.policy_spec.spec_id].approval_pass
+            ]
+
+            soft_gate_k = int(getattr(config, "SELECTION_SOFT_GATE_TOP_K", 0))
+            if soft_gate_k < 0:
+                soft_gate_k = 0
+            soft_gate_elites = []
+            if soft_gate_k > 0 and learning_candidates:
+                def _soft_gate_score(res):
+                    diag = gate_diag_by_id.get(res.policy_spec.spec_id)
+                    return diag.soft_gate_score if diag else float("-inf")
+
+                soft_gate_elites = sorted(
+                    learning_candidates,
+                    key=_soft_gate_score,
+                    reverse=True,
+                )[:soft_gate_k]
+
+            # Diverse selection among learning candidates
             diverse_results, diversity_info = select_diverse_top_k(
-                valid_results, 
+                learning_candidates,
                 k=config.DIVERSITY_K,
                 jaccard_th=config.DIVERSITY_JACCARD_TH,
-                param_th=config.DIVERSITY_PARAM_DIST_TH
+                param_th=config.DIVERSITY_PARAM_DIST_TH,
+                gate_diag_map=gate_diag_by_id,
+                seed=soft_gate_elites,
             )
+
+            gate_focus = None
+            if gate_diag_by_id:
+                gate_counts = {}
+                for diag in gate_diag_by_id.values():
+                    if diag.nearest_gate != "PASS":
+                        gate_counts[diag.nearest_gate] = gate_counts.get(diag.nearest_gate, 0) + 1
+                if gate_counts:
+                    gate_focus = max(gate_counts, key=gate_counts.get)
+            if gate_focus and hasattr(agent, "update_mutation_gate_focus"):
+                agent.update_mutation_gate_focus(gate_focus)
             
             # Instrument Quality & Diversity
             if valid_results:
@@ -477,16 +566,17 @@ def infinite_loop(
                 counter += saved
             except Exception as e:
                 import traceback
-                logger.error(f"Failed to persist or EAGL update: {e}\n{traceback.format_exc()}")
+                logger.error(f"저장 또는 EAGL 업데이트 실패: {e}\n{traceback.format_exc()}")
                 instrumentation.record_exception(type(e).__name__)
             batch_rewards = [] # Initialize batch_rewards for curriculum and reporting
             diverse_ids = {r.policy_spec.spec_id for r in diverse_results} # Get IDs of diverse results
+            template_summary = {}
+            summary_order = []
             for res in results: # Iterate over all results, not just diverse ones
                 from src.shared.metrics import metrics_to_legacy_dict, aggregate_windows
                 
                 # Default metrics for logging
-                status_icon = "OK" if res.score > config.EVAL_SCORE_MIN else "NO"
-                t1_share = 0.0
+                status_icon = "통과" if res.score > config.EVAL_SCORE_MIN else "실패"
                 
                 # Build metrics dict for reporting and potential learning
                 m_dict = {}
@@ -496,18 +586,26 @@ def infinite_loop(
                     )
                     m_dict["trade_logic"] = res.best_sample.core.get("trade_logic", {})
                     m_dict["is_rejected"] = res.score <= config.EVAL_SCORE_MIN
+                    gate_diag = gate_diag_by_id.get(res.policy_spec.spec_id)
+                    if gate_diag:
+                        m_dict["soft_gate_score"] = float(gate_diag.soft_gate_score)
+                        m_dict["nearest_gate"] = gate_diag.nearest_gate
+                        m_dict["approval_pass"] = gate_diag.approval_pass
                     t1_share = m_dict.get('top1_share', 0.0)
                     
                     # Only learn from diverse winners & NOT an error
                     is_error = res.module_key in ("ERROR", "FEATURE_MISSING", "INVALID_SPEC")
                     if res.policy_spec.spec_id in diverse_ids and not is_error:
-                        batch_rewards.append((res.score, res.policy_spec, m_dict))
+                        reward_total = res.score
+                        if res.reward_breakdown and isinstance(res.reward_breakdown, dict):
+                            reward_total = float(res.reward_breakdown.get("total", reward_total))
+                        batch_rewards.append((reward_total, res.policy_spec, m_dict))
                     
                     if is_error:
                         # [Step 7] Log systemic error to ledger
                         error_type = res.module_key
                         error_msg = res.metadata.get("error", "Unknown systemic error")
-                        logger.error(f"  [SYSTEM_ERROR] {error_type} for {res.policy_spec.template_id}: {error_msg}")
+                        logger.error(f"  [시스템오류] {error_type} ({res.policy_spec.template_id}): {error_msg}")
                         # Record specifically for UI/Dashboard
                         diag_file = Path(config.LEDGER_DIR) / "system_errors.jsonl"
                         with open(diag_file, "a") as f:
@@ -520,16 +618,13 @@ def infinite_loop(
                 elif res.module_key in ("ERROR", "FEATURE_MISSING", "INVALID_SPEC"):
                      # Evaluation itself crashed hard or spec failed
                      err_msg = res.metadata.get("error", "Hard crash")
-                     logger.error(f"  [SYSTEM_FAILURE] Batch element failed ({res.module_key}): {err_msg}")
+                     logger.error(f"  [시스템실패] 배치 요소 실패 ({res.module_key}): {err_msg}")
                 
                 # [V18] Log detailed reward breakdown
-                status_icon = "OK" if res.score > config.EVAL_SCORE_MIN else "NO"
-                t1_share = 0.0
                 breakdown_str = ""
                 
                 # Calculate detailed breakdown
                 if m_dict:
-                    t1_share = m_dict.get('top1_share', 0.0)
                     try:
                         shaper = get_reward_shaper()
                         bd = shaper.compute_breakdown(m_dict)
@@ -541,12 +636,44 @@ def infinite_loop(
                             f"Reg:{bd.regime_trade_component:>.1f}"
                         )
                     except Exception as e:
-                        logger.error(f"  [ERROR] Breakdown computation failed: {e}")
+                        logger.error(f"  [오류] 보상 분해 계산 실패: {e}")
                         breakdown_str = "Breakdown Error"
-                
-                logger.info(
-                    f"  [{results.index(res) + 1}] {status_icon} {res.policy_spec.template_id:<20} | Score: {res.score:>6.2f} | AOS: {res.aos_score:.2f} | {breakdown_str}"
-                )
+                # [V18] Improved status line with rejection reason
+                rej_reason = m_dict.get("rejection_reason", "N/A") if res.score <= config.EVAL_SCORE_MIN else ""
+                rej_str = f" | 사유: {rej_reason}" if rej_reason and rej_reason != "PASS" else ""
+
+                template_id = res.policy_spec.template_id
+                if template_id not in template_summary:
+                    template_summary[template_id] = {
+                        "count": 0,
+                        "best_score": res.score,
+                        "best_aos": res.aos_score,
+                        "status": status_icon,
+                        "breakdown": breakdown_str,
+                        "rej_reason": rej_str,
+                    }
+                    summary_order.append(template_id)
+
+                summary = template_summary[template_id]
+                summary["count"] += 1
+                if res.score >= summary["best_score"]:
+                    summary["best_score"] = res.score
+                    summary["best_aos"] = res.aos_score
+                    summary["status"] = status_icon
+                    summary["breakdown"] = breakdown_str
+                    summary["rej_reason"] = rej_str
+
+            if template_summary:
+                logger.info("  >>> [요약] 템플릿별 결과")
+                for template_id in summary_order:
+                    summary = template_summary[template_id]
+                    breakdown = summary["breakdown"]
+                    reason = summary["rej_reason"]
+                    detail = f" | {breakdown}" if breakdown else ""
+                    logger.info(
+                        f"  - {template_id:<20} x{summary['count']} | {summary['status']} | "
+                        f"최고점수: {summary['best_score']:>6.2f} | AOS: {summary['best_aos']:.2f}{detail}{reason}"
+                    )
             
             # 5. [V11] 배치 학습 (Parallel Mode)
             if batch_rewards:
@@ -565,21 +692,25 @@ def infinite_loop(
                             alpha=breakdown.alpha,
                             profit_factor=metrics.get("profit_factor", 1.0),
                         )
-                        status_change = curriculum.record_result(passed, metrics)
+                        status_change = curriculum.record_result(
+                            passed,
+                            metrics,
+                            allow_stage_change=not getattr(config, "STAGE_AUTO_ENABLED", True),
+                        )
                         if status_change.get("promoted"):
-                            logger.info(f"  >>> [Curriculum] PROMOTED to Stage {status_change['stage_after']}! Triggering Exploration Reset.")
+                            logger.info(f"  >>> [커리큘럼] 스테이지 {status_change['stage_after']} 승격. 탐색 리셋.")
                             eps_manager.reset(force_val=0.7) # [V12.3] Reignite learning upon stage up
 
             # C-1 Complete
-            logger.info(f"  >>> [Parallel] Batch Complete. {len(batch_rewards)} diverse strategies selected.")
+            logger.info(f"  >>> [병렬] 배치 완료. 다양성 전략 {len(batch_rewards)}개 선택.")
             
         else:
             # ========================================
             # C-2. 순차 실행 모드 (기존 방식)
             # ========================================
-            logger.info(f"  >>> [Sequential] Starting {n_jobs} Experiments (Regime: {regime.label})...")
+            logger.info(f"  >>> [순차] 실험 시작 {n_jobs}개 (레짐: {regime.label})")
             saved_total, results = _run_batch_sequential(
-                agent, df, regime, history, repo, n_jobs
+                agent, df, regime, history, repo, n_jobs, stage_id=current_stage
             )
             counter += saved_total
             
@@ -591,21 +722,118 @@ def infinite_loop(
                     m_dict = metrics_to_legacy_dict(
                         aggregate_windows([res.best_sample.metrics], eval_score_override=res.score)
                     )
-                    batch_rewards.append((res.score, res.policy_spec, m_dict))
+                    reward_total = res.score
+                    if res.reward_breakdown and isinstance(res.reward_breakdown, dict):
+                        reward_total = float(res.reward_breakdown.get("total", reward_total))
+                    batch_rewards.append((reward_total, res.policy_spec, m_dict))
             
             policies = [r.policy_spec for r in results]
-            valid_results = [r for r in results if r.score > config.EVAL_SCORE_MIN]
+            valid_results = [
+                r for r in results
+                if r.best_sample
+                and r.best_sample.metrics
+                and not r.best_sample.metrics.is_rejected
+                and getattr(r.best_sample.metrics.trades, "cycle_count", 0) > 0
+            ]
             diverse_results = list(valid_results)
             diagnostic_status = {"status": "OK"}
-            logger.info(f"  >>> [Sequential] Batch Complete. {len(results)} experiments run.")
+            logger.info(f"  >>> [순차] 배치 완료. 실험 {len(results)}개 실행.")
 
         # ==========================================================================================
         # [V16] BATCH INSTRUMENTATION (Common)
         # ==========================================================================================
+        episode_summaries = []
+        from src.shared.metrics import TradeStats, EquityStats, WindowMetrics
+        for res in results:
+            if res.best_sample and res.best_sample.metrics:
+                metrics = res.best_sample.metrics
+                core = res.best_sample.core or {}
+                bt_result = core.get("bt_result")
+            else:
+                metrics = WindowMetrics(
+                    window_id="EPISODE",
+                    trades=TradeStats(),
+                    equity=EquityStats(),
+                    bars_total=len(df),
+                )
+                bt_result = None
+
+            episode_summaries.append(
+                build_episode_summary(
+                    policy_id=res.policy_spec.spec_id,
+                    stage=res.stage,
+                    metrics=metrics,
+                    bt_result=bt_result,
+                    reward_breakdown=res.reward_breakdown,
+                    eval_score=res.score,
+                    module_key=res.module_key,
+                )
+            )
+
+        batch_report = build_batch_report(batch_idx, episode_summaries)
+        batch_report["stage_snapshot"] = {
+            "stage_id": int(current_stage),
+            "source": "curriculum",
+        }
+        if isinstance(diagnostic_status, dict):
+            eval_usage = diagnostic_status.get("eval_usage")
+            if eval_usage:
+                batch_report["eval_usage"] = eval_usage
+        wf_pass_rate = 0.0
+        wf_alpha_min_mean = 0.0
+        wf_alpha_std_mean = 0.0
+        wf_samples = []
+        stage_cfg = config.CURRICULUM_STAGES.get(config.CURRICULUM_CURRENT_STAGE)
+        alpha_floor = float(getattr(stage_cfg, "alpha_floor", -10.0)) if stage_cfg else -10.0
+        for res in results:
+            if not res.window_results:
+                continue
+            alphas = [w.avg_alpha for w in res.window_results if w is not None]
+            if not alphas:
+                continue
+            wf_samples.append({
+                "pass": all(a >= alpha_floor for a in alphas),
+                "min_alpha": float(min(alphas)),
+                "std_alpha": float(np.std(alphas)) if len(alphas) > 1 else 0.0,
+            })
+        if wf_samples:
+            wf_pass_rate = float(np.mean([1.0 if s["pass"] else 0.0 for s in wf_samples]))
+            wf_alpha_min_mean = float(np.mean([s["min_alpha"] for s in wf_samples]))
+            wf_alpha_std_mean = float(np.mean([s["std_alpha"] for s in wf_samples]))
+
+        batch_report["wf_pass_rate"] = wf_pass_rate
+        batch_report["wf_alpha_min_mean"] = wf_alpha_min_mean
+        batch_report["wf_alpha_std_mean"] = wf_alpha_std_mean
+        batch_report["diversity_info"] = diversity_info
+        history = load_recent_batch_reports(getattr(config, "OBS_DEADLOCK_WINDOW", 20))
+        batch_report["deadlock"] = detect_deadlock(history + [batch_report])
+        log_batch(batch_report)
+
+        stage_decision = stage_controller.update(batch_report, batch_idx)
+        if stage_decision.action in ("promote", "demote"):
+            logger.info(
+                f">>> [Stage] {stage_decision.action.upper()} {stage_decision.stage_before} -> {stage_decision.stage_after} | "
+                f"Reasons: {', '.join(stage_decision.reasons) if stage_decision.reasons else 'N/A'}"
+            )
+
+        regression_report = regression_monitor.evaluate(
+            batch_report=batch_report,
+            episode_summaries=episode_summaries,
+            diversity_info=diversity_info,
+            history=history,
+        )
+        if regression_report:
+            codes = [s.code for s in regression_report.signals if s.triggered]
+            logger.warning(f"!!! [퇴행] 감지됨: {', '.join(codes)}")
+
         if batch_rewards:
             trades = [r[2].get("n_trades", 0) for r in batch_rewards if r[2]]
             zero_ratio = len([t for t in trades if t == 0]) / len(trades) if trades else 0
             instrumentation.record_trades(np.mean(trades) if trades else 0, zero_ratio)
+
+            cycles = [r[2].get("cycle_count", 0) for r in batch_rewards if r[2]]
+            zero_cycle_ratio = len([c for c in cycles if c == 0]) / len(cycles) if cycles else 0
+            instrumentation.record_cycles(np.mean(cycles) if cycles else 0, zero_cycle_ratio)
         
         if valid_results:
             scs = [r.score for r in valid_results if hasattr(r, 'score')]
@@ -641,12 +869,53 @@ def infinite_loop(
         report.append(f"[SYSTEM] Regime: {regime.label:<12} | Eps: {e_snap['epsilon']:<6.4f} | Steps: {e_snap['step_count']:<5} | Reheat: {e_snap['last_reheat']}")
         report.append(f"[STAGE ] {c_info['description']} ({c_info['current_stage']}) | Pass: {c_info['stage_passes']:>2} / {c_info['threshold_to_next']:>2} to Next | Target: {c_info['target_return_pct']}%")
         report.append(f"[EVAL  ] Total: {len(policies):>2} | Valid: {len(valid_results):>2} | Diverse: {len(diverse_results):>2} | Best Sharpe: {best_sharpe:>5.2f}")
+        cycle_hist = batch_report.get("cycle_count_hist", {})
+        report.append(
+            f"[CYCLE ] Median: {cycle_hist.get('median', 0.0):>5.2f} | "
+            f"P10: {cycle_hist.get('p10', 0.0):>5.2f} | "
+            f"P90: {cycle_hist.get('p90', 0.0):>5.2f} | "
+            f"GatePass: {batch_report.get('gate_pass_rate', 0.0):>5.2f}"
+        )
+        report.append(
+            f"[SINGLE] Rate: {batch_report.get('single_trade_rate', 0.0):>5.2f} | "
+            f"EntryRate: {batch_report.get('single_trade_entry_rate_mean', 0.0):>6.4f}"
+        )
+
+        perf_summary = batch_report.get("performance_summary", {})
+        if perf_summary:
+            ret = perf_summary.get("total_return_pct", {})
+            mdd = perf_summary.get("mdd_pct", {})
+            sharpe = perf_summary.get("sharpe", {})
+            win_rate = perf_summary.get("win_rate", {})
+            trades_year = perf_summary.get("trades_per_year", {})
+            report.append(
+                f"[PERF ] Ret: {ret.get('mean', 0.0):>6.2f}% (P10 {ret.get('p10', 0.0):>6.2f}, P90 {ret.get('p90', 0.0):>6.2f}) | "
+                f"MDD: {mdd.get('mean', 0.0):>6.2f}% | "
+                f"Sharpe: {sharpe.get('mean', 0.0):>5.2f} | "
+                f"Win: {win_rate.get('mean', 0.0):>5.2f} | "
+                f"Trades/Y: {trades_year.get('mean', 0.0):>5.1f}"
+            )
+
+        topk_perf = batch_report.get("topk_performance", [])
+        if topk_perf:
+            topk_lines = []
+            for idx, perf in enumerate(topk_perf[:3], start=1):
+                topk_lines.append(
+                    f"#{idx} score={perf.get('reward_total', 0.0):.1f} "
+                    f"ret={perf.get('total_return_pct', 0.0):.1f}% "
+                    f"alpha={perf.get('excess_return', 0.0):.1f}% "
+                    f"mdd={perf.get('mdd_pct', 0.0):.1f}% "
+                    f"trd={perf.get('trade_count', 0)} "
+                    f"cyc={perf.get('cycle_count', 0)} "
+                    f"gate={perf.get('nearest_gate', 'PASS')}"
+                )
+            report.append(f"[TOPK ] {' | '.join(topk_lines)}")
         
         # [V18] LogicTree Diagnostics KPI
         from src.shared.logic_tree_diagnostics import get_and_reset_diagnostics
         lt_diag = get_and_reset_diagnostics(batch_id=f"batch_{batch_idx}")
         if lt_diag.total_condition_evals > 0:
-            status_icon = "✓" if lt_diag.is_healthy else "⚠"
+            status_icon = "정상" if lt_diag.is_healthy else "경고"
             report.append(
                 f"[TREE  ] {status_icon} Match: {lt_diag.match_rate:.1%} | "
                 f"Direct: {lt_diag.matched_direct} | Fuzzy: {lt_diag.matched_fuzzy} | "
@@ -669,6 +938,10 @@ def infinite_loop(
         
         # [V16] End Batch Instrumentation
         instrumentation.end_batch()
+
+        if max_batches > 0 and batch_idx >= max_batches:
+            logger.info(f">>> [시스템] 최대 배치 도달 ({max_batches}). 종료.")
+            break
 
         # F. Iterate
         time.sleep(sleep_sec)

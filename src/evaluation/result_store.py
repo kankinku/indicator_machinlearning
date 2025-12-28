@@ -42,7 +42,7 @@ class ResultStore:
     def put(self, policy_sig: str, window_sig: str, result: ModuleResult):
         key = (policy_sig, window_sig)
         if key in self.cache:
-            logger.warning(f"!!! [ResultStore] Overwriting existing result for {key}. This should be avoided.")
+            logger.warning(f"[ResultStore] 기존 결과 덮어씀: {key} (중복 저장 주의)")
         self.cache[key] = result
 
     def clear(self):

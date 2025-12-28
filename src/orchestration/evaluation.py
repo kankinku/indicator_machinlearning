@@ -37,6 +37,7 @@ from src.shared.hashing import generate_policy_id, get_eval_config_signature, ha
 from src.l3_meta.reward_shaper import get_reward_shaper
 from src.shared.event_bus import record_event
 from src.shared.caching import get_signal_cache, get_backtest_cache
+from src.shared.observability import build_episode_summary, log_episode
 
 logger = get_logger("orchestration.evaluation")
 
@@ -113,18 +114,18 @@ class OperationalQACollector:
             self.similarity_stats["collision_rate"] = collisions / pairs
             
         if self.similarity_stats["collision_rate"] > 0.3:
-            logger.warning(f"!!! [QA] Similarity Alert: Batch collision rate {self.similarity_stats['collision_rate']:.1%}")
+            logger.warning(f"[QA] 전략 중복 경고: 배치 충돌률 {self.similarity_stats['collision_rate']:.1%}")
 
     def report(self):
         if self.total_samples == 0:
-            logger.warning(f"QA Report [{self.stage_name}]: No samples collected.")
+            logger.warning(f"[QA] 샘플 없음: {self.stage_name}")
             return
 
         pass_rate = self.passed_samples / self.total_samples
         rej_rate = 1.0 - pass_rate
         
-        logger.info(f"--- [V14] QA DIAGNOSTIC: {self.stage_name.upper()} ---")
-        logger.info(f"Summary: Success {pass_rate:.1%} | Rejection {rej_rate:.1%} (n={self.total_samples})")
+        logger.info(f"[QA] 진단 보고: {self.stage_name.upper()}")
+        logger.info(f"[QA] 요약: 통과 {pass_rate:.1%} | 탈락 {rej_rate:.1%} (n={self.total_samples})")
         
         # 1. Failure Taxonomy Grouping
         taxonomy = {}
@@ -134,11 +135,11 @@ class OperationalQACollector:
                 taxonomy[cat] = taxonomy.get(cat, 0) + count
             
             tax_str = ", ".join([f"{k}: {v}" for k, v in taxonomy.items()])
-            logger.info(f"Taxonomy: {tax_str}")
+            logger.info(f"[QA] 실패 분류: {tax_str}")
             
             top_raw = sorted(self.failure_counts.items(), key=lambda x: x[1], reverse=True)[:3]
             raw_str = ", ".join([f"{k}({v})" for k, v in top_raw])
-            logger.info(f"Top Reasons: {raw_str}")
+            logger.info(f"[QA] 주요 사유: {raw_str}")
 
         # 2. Performance Profiling
         avg_tpy = 0.0
@@ -146,7 +147,7 @@ class OperationalQACollector:
             avg_ret = np.mean(self.performance_stats["returns"])
             avg_mdd = np.mean(self.performance_stats["mdds"])
             avg_tpy = float(np.mean(self.performance_stats["annual_trades"]))
-            logger.info(f"Perf: Avg Ret {avg_ret:.2f}% | Avg MDD {avg_mdd:.2f}% | Avg Trades/Y {avg_tpy:.1f}")
+            logger.info(f"[QA] 성능: 평균 수익 {avg_ret:.2f}% | 평균 MDD {avg_mdd:.2f}% | 연간 거래 {avg_tpy:.1f}")
 
         # 3. [V14] Self-Healing Status Determination (Numerical Triggers)
         # =============================================================
@@ -174,7 +175,7 @@ class OperationalQACollector:
             if avg_tpy > 0 and avg_tpy < t_min:
                 status += "_LOW_ACTIVITY"
         
-        logger.info(f"Diagnostic Result: >>> {status} <<<")
+        logger.info(f"[QA] 상태: {status}")
         
         # [V14] Persist for Dashboard
         report_data = self._persist_diagnostics(
@@ -185,7 +186,7 @@ class OperationalQACollector:
             similarity=self.similarity_stats
         )
 
-        logger.info("------------------------------------------")
+        logger.info("[QA] 진단 종료")
         
         # Add rich metrics for AutoTuner
         report_data["mean_tpy"] = avg_tpy
@@ -225,7 +226,7 @@ class OperationalQACollector:
             return report_data
                 
         except Exception as e:
-            logger.error(f"Failed to persist diagnostics: {e}")
+            logger.error(f"[QA] 진단 저장 실패: {e}")
             return {"status": status, "pass_rate": pass_rate}
 
 
@@ -267,27 +268,53 @@ def _sample_reduced_windows(df: pd.DataFrame, slices: int, slice_bars: int) -> L
     return windows
 
 
-def build_windows(df: pd.DataFrame, stage: str) -> List[Tuple[str, pd.DataFrame]]:
-    current_stage_idx = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
+def _get_eval_caps(stage_id: int) -> Dict[str, int]:
+    caps = getattr(config, "EVAL_CAPS_BY_STAGE", {}) or {}
+    stage_caps = caps.get(int(stage_id), {}) or {}
+    return {
+        "max_windows": int(stage_caps.get("max_windows", 0) or 0),
+        "max_risk_samples": int(stage_caps.get("max_risk_samples", 0) or 0),
+        "max_wf_splits": int(stage_caps.get("max_wf_splits", 0) or 0),
+    }
+
+
+def build_windows(df: pd.DataFrame, stage: str, stage_id: Optional[int] = None) -> List[Tuple[str, pd.DataFrame]]:
+    current_stage_idx = int(stage_id or getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+    caps = _get_eval_caps(current_stage_idx)
     
     if stage == "fast":
         lookback = min(config.EVAL_FAST_LOOKBACK_BARS, len(df))
         fast_df = df.iloc[-lookback:]
-        return _split_contiguous_windows(fast_df, config.EVAL_WINDOW_COUNT_FAST, "FAST")
+        cnt = config.EVAL_WINDOW_COUNT_FAST
+        if caps["max_windows"] > 0:
+            cnt = min(cnt, caps["max_windows"])
+        return _split_contiguous_windows(fast_df, cnt, "FAST")
     
     if stage == "reduced":
-        return _sample_reduced_windows(df, config.EVAL_REDUCED_SLICES, config.EVAL_REDUCED_SLICE_BARS)
+        slices = config.EVAL_REDUCED_SLICES
+        if caps["max_windows"] > 0:
+            slices = min(slices, caps["max_windows"])
+        return _sample_reduced_windows(df, slices, config.EVAL_REDUCED_SLICE_BARS)
     
     # [V11.3] Full Evaluation - Dynamic WF Splits
     if config.WF_GATE_ENABLED:
-        if current_stage_idx == 1:
-            cnt = config.WF_SPLITS_STAGE1
-        elif current_stage_idx == 2:
-            cnt = config.WF_SPLITS_STAGE2
+        stage_cfg = config.CURRICULUM_STAGES.get(current_stage_idx)
+        if stage_cfg and getattr(stage_cfg, "wf_splits", None):
+            cnt = int(stage_cfg.wf_splits)
         else:
-            cnt = config.WF_SPLITS_STAGE3
+            if current_stage_idx == 1:
+                cnt = config.WF_SPLITS_STAGE1
+            elif current_stage_idx == 2:
+                cnt = config.WF_SPLITS_STAGE2
+            else:
+                cnt = config.WF_SPLITS_STAGE3
+        if caps["max_wf_splits"] > 0:
+            cnt = min(cnt, caps["max_wf_splits"])
     else:
         cnt = config.EVAL_WINDOW_COUNT_FULL
+
+    if caps["max_windows"] > 0:
+        cnt = min(cnt, caps["max_windows"])
         
     return _split_contiguous_windows(df, cnt, "FULL")
 
@@ -348,9 +375,13 @@ def _evaluate_policy_windows(
     window_sig: str,
     eval_sig: str,
     dataset_sig: str,
+    stage_id: Optional[int] = None,
     pre_X: Optional[pd.DataFrame] = None, # [V12-O] Pre-calculated features
 ) -> EvaluationResult:
     try:
+        stage_id = int(stage_id or getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+        config.CURRICULUM_CURRENT_STAGE = stage_id
+
         if df.empty:
             return ModuleResult(policy_spec=policy_spec, module_key="", score=config.EVAL_SCORE_MIN, window_results=[], best_sample=None, stage=stage)
 
@@ -405,7 +436,7 @@ def _evaluate_policy_windows(
             cost_model_id=cost_model_id,
         )
 
-        windows = build_windows(df_local, stage)
+        windows = build_windows(df_local, stage, stage_id=stage_id)
         window_results: List[WindowResult] = []
         best_sample: Optional[BestSample] = None
         policy_sig = get_policy_sig(policy_spec)
@@ -444,10 +475,6 @@ def _evaluate_policy_windows(
             seed = stable_hash(f"{module_key}|{window_id}")
             samples = sample_risk_params(tp_dist, sl_dist, h_dist, sample_count, seed)
 
-            # [V12-O] Single-Train, Multi-Test Optimization
-            # Train once per window using the base risk budget to get the "model signals"
-            base_signals = entry_sig
-
             sample_scores: List[float] = []
             violations: List[bool] = []
             alphas: List[float] = []
@@ -460,7 +487,8 @@ def _evaluate_policy_windows(
                 evaluator = RealEvaluator(cost_bps=cost_bps)
                 metrics, bt = evaluator.evaluate(
                     df=window_df,
-                    signals=base_signals,
+                    entry_signals=entry_sig,
+                    exit_signals=exit_sig,
                     risk_budget=sample_risk,
                     target_regime=regime_id,
                     complexity_score=complexity
@@ -534,7 +562,7 @@ def _evaluate_policy_windows(
             # [V14-O] Early Exit: If this window failed hard gates significantly, skip remaining windows
             if agg["violation_rate"] > 0.8:
                 record_event("WINDOW_EARLY_EXIT", policy_id=policy_spec.spec_id, stage=stage, payload={"window_id": window_id})
-                logger.debug(f" [EarlyExit] Policy {policy_spec.template_id} rejected at {window_id}")
+                logger.debug(f"[조기종료] {policy_spec.template_id} -> {window_id}에서 탈락")
                 break
 
         # [V11.4] After evaluation, compute trade logic for the overall best sample to provide feedback
@@ -555,8 +583,12 @@ def _evaluate_policy_windows(
         # [V16] Reward Breakdown calculation for learning SSOT
         reward_breakdown = None
         if best_sample:
+            from src.shared.metrics import aggregate_windows, metrics_to_legacy_dict
+            legacy_metrics = metrics_to_legacy_dict(
+                aggregate_windows([best_sample.metrics], eval_score_override=config.EVAL_SCORE_MIN)
+            )
             shaper = get_reward_shaper()
-            reward_breakdown = asdict(shaper.compute_breakdown(asdict(best_sample.metrics)))
+            reward_breakdown = asdict(shaper.compute_breakdown(legacy_metrics))
 
         return EvaluationResult(
             policy_spec=policy_spec,
@@ -573,7 +605,7 @@ def _evaluate_policy_windows(
         import traceback
         exc_type = type(e).__name__
         err_msg = f"Worker Exception ({exc_type}): {str(e)}\n{traceback.format_exc()}"
-        logger.error(f"!!! [{stage}] Evaluation failed for {policy_spec.template_id}: {err_msg}")
+        logger.error(f"[{stage}] 평가 실패: {policy_spec.template_id} ({err_msg})")
         return EvaluationResult(
             policy_spec=policy_spec,
             module_key="ERROR",
@@ -650,10 +682,15 @@ def evaluate_stage(
     stage: str,
     regime_id: str,
     n_jobs: int,
+    stage_id: Optional[int] = None,
     feature_map: Optional[Dict[str, pd.DataFrame]] = None, # [V12-O] Optional map
 ) -> Tuple[List[EvaluationResult], dict]:
     if not policies:
         return [], {"status": "EMPTY"}
+
+    stage_id = int(stage_id or getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+    config.CURRICULUM_CURRENT_STAGE = stage_id
+    eval_caps = _get_eval_caps(stage_id)
 
     if stage == "fast":
         sample_count = config.EVAL_RISK_SAMPLES_FAST
@@ -661,20 +698,24 @@ def evaluate_stage(
         sample_count = config.EVAL_RISK_SAMPLES_REDUCED
     else:
         # [V12-O] Curriculum-aware sample count
-        curr_stage = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
-        stage_cfg = config.CURRICULUM_STAGES.get(curr_stage)
+        stage_cfg = config.CURRICULUM_STAGES.get(stage_id)
         if stage_cfg is not None and hasattr(stage_cfg, "eval_samples"):
             sample_count = getattr(stage_cfg, "eval_samples")
         else:
             sample_count = config.EVAL_RISK_SAMPLES_FULL
 
+    requested_samples = sample_count
+    if eval_caps["max_risk_samples"] > 0:
+        sample_count = min(sample_count, eval_caps["max_risk_samples"])
+
     # [V15] Check ResultStore first
     store = get_result_store()
     dataset_sig = hash_dataframe(df)
     eval_sig = get_eval_config_signature()
-    window_sig = f"{stage}_{regime_id}_{dataset_sig}_{eval_sig}"
+    window_sig = f"{stage}_{regime_id}_s{stage_id}_{dataset_sig}_{eval_sig}"
     remaining_policies = []
     final_results = [None] * len(policies)
+    window_count = len(build_windows(df, stage, stage_id=stage_id))
     
     # Use any available window signature logic. Here we use 'stage' as part of sig.
     for i, p in enumerate(policies):
@@ -689,7 +730,7 @@ def evaluate_stage(
             
     if remaining_policies:
         indices, subset = zip(*remaining_policies)
-        logger.info(f">>> [Evaluation] Running {len(subset)} / {len(policies)} policies (after ResultStore Filter)")
+        logger.info(f"[평가] ResultStore 필터 후 {len(subset)}/{len(policies)}개 실행")
         
         from src.shared.logger import _log_queue, setup_worker_logging
         from src.orchestration.parallel_manager import get_parallel_pool
@@ -699,13 +740,14 @@ def evaluate_stage(
         chunk_size = getattr(config, "PARALLEL_CHUNK_SIZE", 10)
         
         # [V14-O] Chunking Stage 2
-        def process_chunk_s2(chunk_subset: List[PolicySpec], df_v, df_c, df_i, stage_name, r_id, samples, w_sig, e_sig, d_sig):
+        def process_chunk_s2(chunk_subset: List[PolicySpec], df_v, df_c, df_i, stage_name, r_id, samples, w_sig, e_sig, d_sig, stage_value):
             # Reconstruct DataFrame locally to avoid serialization of the object itself
             df_local = pd.DataFrame(df_v, columns=df_c, index=df_i).copy()
+            config.CURRICULUM_CURRENT_STAGE = int(stage_value)
             results_chunk = []
             for p in chunk_subset:
                 res = _evaluate_policy_windows(
-                    p, df_local, stage_name, r_id, samples, w_sig, e_sig, d_sig
+                    p, df_local, stage_name, r_id, samples, w_sig, e_sig, d_sig, stage_id=stage_value
                 )
                 results_chunk.append(res)
             return results_chunk
@@ -719,7 +761,7 @@ def evaluate_stage(
 
         s2_start = time.time()
         chunked_results = get_parallel_pool()(
-            delayed(process_chunk_s2)(c, df_v, df_c, df_i, stage, regime_id, sample_count, window_sig, eval_sig, dataset_sig)
+            delayed(process_chunk_s2)(c, df_v, df_c, df_i, stage, regime_id, sample_count, window_sig, eval_sig, dataset_sig, stage_id)
             for c in chunks
         )
         s2_duration = time.time() - s2_start
@@ -755,10 +797,48 @@ def evaluate_stage(
                 reason=f"EXCEPTION_{res.metadata.get('exc_type', 'UNKNOWN')}",
                 metrics=None
             )
-    diagnostic_status = qa_collector.report()
+    diagnostic_status = qa_collector.report() or {"status": "EMPTY"}
+    diagnostic_status["eval_usage"] = {
+        "stage_id": stage_id,
+        "stage_label": stage,
+        "window_count": window_count,
+        "sample_count": sample_count,
+        "sample_count_requested": requested_samples,
+        "max_windows_cap": eval_caps["max_windows"],
+        "max_risk_samples_cap": eval_caps["max_risk_samples"],
+        "max_wf_splits_cap": eval_caps["max_wf_splits"],
+    }
 
     _normalize_window_scores(results)
     _finalize_module_scores(results)
+
+    # Episode-level observability (Cycle SSOT)
+    from src.shared.metrics import TradeStats, EquityStats, WindowMetrics
+    for res in results:
+        if res.best_sample and res.best_sample.metrics:
+            metrics = res.best_sample.metrics
+            core = res.best_sample.core or {}
+            bt_result = core.get("bt_result")
+        else:
+            metrics = WindowMetrics(
+                window_id="EPISODE",
+                trades=TradeStats(),
+                equity=EquityStats(),
+                bars_total=len(df),
+            )
+            bt_result = None
+
+        summary = build_episode_summary(
+            policy_id=res.policy_spec.spec_id,
+            stage=res.stage,
+            metrics=metrics,
+            bt_result=bt_result,
+            reward_breakdown=res.reward_breakdown,
+            eval_score=res.score,
+            module_key=res.module_key,
+        )
+        log_episode(summary)
+
     return results, diagnostic_status
 
 
@@ -767,6 +847,7 @@ def evaluate_v12_batch(
     df: pd.DataFrame,
     regime_id: str,
     n_jobs: int,
+    stage_id: Optional[int] = None,
 ) -> Tuple[List[EvaluationResult], dict]:
     """
     V12-BT Batch Evaluation Orchestrator
@@ -774,6 +855,9 @@ def evaluate_v12_batch(
     """
     if not policies:
         return [], {"status": "EMPTY"}
+
+    stage_id = int(stage_id or getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+    config.CURRICULUM_CURRENT_STAGE = stage_id
 
     # 0. Prepare Data for Workers (numpy-only to avoid massive serialization)
     df_values = df.values
@@ -786,12 +870,13 @@ def evaluate_v12_batch(
     inst = get_instrumentation()
 
     # 1. Stage 1: Fast Filter (All Policies)
-    logger.info(f">>> [V12-BT] Stage 1: Fast Filtering {len(policies)} candidates (Chunking: {chunk_size})...")
+    logger.info(f"[평가] 1단계(빠른 필터): 후보 {len(policies)}개 (청크 {chunk_size})")
     s1_start = time.time()
     
     # [V14-O] Chunking Stage 1 to reduce IPC overhead
-    def process_chunk_s1(chunk: List[PolicySpec], values, columns, index):
+    def process_chunk_s1(chunk: List[PolicySpec], values, columns, index, stage_value):
         from src.orchestration.policy_evaluator import RuleEvaluator
+        config.CURRICULUM_CURRENT_STAGE = int(stage_value)
         evaluator = RuleEvaluator()
         signals = []
         for p in chunk:
@@ -806,7 +891,7 @@ def evaluate_v12_batch(
     
     # Run Stage 1 (Single pool call)
     chunked_signals = get_parallel_pool()(
-        delayed(process_chunk_s1)(c, df_values, df_columns, df_index) 
+        delayed(process_chunk_s1)(c, df_values, df_columns, df_index, stage_id) 
         for c in chunks
     )
     
@@ -825,8 +910,7 @@ def evaluate_v12_batch(
     
     # Selection (Mixed Strategy: Elites + Explorers)
     top_n = getattr(config, "V12_ELITE_TOP_N", 5)
-    curr_stage = getattr(config, "CURRICULUM_CURRENT_STAGE", 1)
-    stage_cfg = config.CURRICULUM_STAGES.get(curr_stage, {})
+    stage_cfg = config.CURRICULUM_STAGES.get(stage_id, {})
     exploration_slot = float(getattr(stage_cfg, "exploration_slot", 0.2))
     
     from src.evaluation.dual_stage import DualStageEvaluator
@@ -847,14 +931,20 @@ def evaluate_v12_batch(
     cold_ratio = explorer_n / max(1, promote_total) if promote_total > 0 else 0.0
     if hasattr(inst, "record_exploration"):
         inst.record_exploration(cold_ratio)
-    logger.info(
-        f">>> [V12-BT] Promotion Mix: Elite {elite_n} | Cold-start {explorer_n} ({cold_ratio:.1%})"
-    )
-    logger.info(f">>> [V12-BT] Stage 2: Detailed Evaluation for {len(promoted_policies)} promoted candidates...")
+    logger.info(f"[평가] 승격 믹스: 엘리트 {elite_n} | 콜드스타트 {explorer_n} ({cold_ratio:.1%})")
+    logger.info(f"[평가] 2단계(정밀 평가): 승격 {len(promoted_policies)}개")
     
     # 2. Stage 2: Detailed Evaluation (Promoted only)
     # feature_map=None as it will be generated locally in workers
-    promoted_results, diagnostic_status = evaluate_stage(promoted_policies, df, "full", regime_id, n_jobs, feature_map=None)
+    promoted_results, diagnostic_status = evaluate_stage(
+        promoted_policies,
+        df,
+        "full",
+        regime_id,
+        n_jobs,
+        stage_id=stage_id,
+        feature_map=None,
+    )
     
     # 3. Handle Filtered (Give them base scores/ModuleResults)
     promoted_map = {res.policy_spec.template_id: res for res in promoted_results}
@@ -912,7 +1002,8 @@ def persist_best_samples(
         return 0
     
     stage = results[0].stage
-    windows = build_windows(df, stage)
+    stage_id = int(getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+    windows = build_windows(df, stage, stage_id=stage_id)
     window_map = {win_id: win_df for win_id, win_df in windows}
     df_values = df.values
     df_columns = df.columns.tolist()
@@ -1005,5 +1096,5 @@ def persist_best_samples(
         repo.save_record(record, artifact)
         saved += 1
     if saved > 0 or skipped > 0:
-        logger.info(f">>> [Persistence] Saved {saved} | Skipped {skipped} (One-Pass).")
+        logger.info(f"[저장] 평가 결과 저장: {saved} | 건너뜀 {skipped} (원패스)")
     return saved

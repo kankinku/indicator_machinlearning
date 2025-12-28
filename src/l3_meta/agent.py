@@ -37,7 +37,7 @@ class MetaAgent:
         
         # [V11.4] Integrated Multi-head D3QN 모드
         if config.D3QN_ENABLED:
-            logger.info("[MetaAgent] Integrated Multi-head D3QN 모드로 초기화")
+            logger.info("[MetaAgent] D3QN 통합 모드 초기화")
             from src.l3_meta.d3qn_agent import get_integrated_agent, DEFAULT_ACTIONS
             self.integrated_rl = get_integrated_agent(
                 repo.base_dir,
@@ -46,7 +46,7 @@ class MetaAgent:
             )
             self.reward_shaper = get_reward_shaper()
         else:
-            logger.info("[MetaAgent] Q-Table 모드로 초기화")
+            logger.info("[MetaAgent] Q-Table 모드 초기화")
             from src.l3_meta.q_learner import QLearner
             self.strategy_rl = QLearner(repo.base_dir)
             risk_actions = list(self._get_risk_profile_ids()) or ["DEFAULT"]
@@ -69,6 +69,10 @@ class MetaAgent:
         
         # Epsilon Manager
         self.eps_manager = get_epsilon_manager()
+
+        # Gate-guided mutation focus (Stage 4)
+        self.mutation_gate_focus: Optional[str] = None
+        self.mutation_operator_weights = self._get_mutation_operator_weights(None)
         
         # 현재 시장 데이터 참조 (D3QN용)
         self._current_df: Optional[pd.DataFrame] = None
@@ -85,9 +89,9 @@ class MetaAgent:
                 with open(f, "r") as r:
                     baselines.append(json.load(r))
             except Exception as e:
-                logger.error(f"Failed to load baseline {f}: {e}")
+                logger.error(f"[MetaAgent] 베이스라인 로드 실패: {f} ({e})")
         
-        logger.info(f"[MetaAgent] {len(baselines)} baselines loaded from {path}")
+        logger.info(f"[MetaAgent] 베이스라인 로드: {len(baselines)}개 ({path})")
         return baselines
 
     def _get_risk_profile_ids(self) -> List[str]:
@@ -118,7 +122,7 @@ class MetaAgent:
 
         elif "SOFT" in status:
             # Maybe slow down decay or just log
-            logger.info(f"[MetaAgent] 🛡 Self-Healing: SOFT state. Exploitation favored.")
+            logger.info("[MetaAgent] Self-Healing: SOFT 상태 (활용 비중 강화)")
 
     def apply_market_context_modulation(self, regime: RegimeState):
         """
@@ -128,21 +132,54 @@ class MetaAgent:
         # 1. De-sync (Correlation breakdown) detection
         is_desync, trust_mult = self.eagl.should_discount_trust(regime)
         if is_desync:
-            logger.warning(f"  [EAGL] ⚠️ DE-SYNC Detected (Corr: {regime.corr_score:.2f}). Discounting Knowledge Trust.")
+            logger.warning(f"[EAGL] 디싱크 감지 (Corr: {regime.corr_score:.2f}) -> 신뢰도 할인")
             # For now, we increase exploration as a way to "re-learn"
             self.eps_manager.request_reheat("DE_SYNC_DISCOUNT", strength=0.3)
             
         # 2. Vol Squeeze / Explosion
         if regime.vol_level < 0.7:
-             logger.info(f"  [EAGL] 💎 VOL_SQUEEZE (Vol: {regime.vol_level:.2f}). Boosting discovery budget.")
+             logger.info(f"[EAGL] VOL_SQUEEZE (Vol: {regime.vol_level:.2f}) -> 탐색 강화")
              # Reheat slightly to explore new patterns before breakout
              self.eps_manager.request_reheat("VOL_SQUEEZE", strength=0.2)
         elif regime.vol_level > 2.0:
-             logger.info(f"  [EAGL] 🌋 VOL_EXPLOSION (Vol: {regime.vol_level:.2f}). Encouraging safety.")
+             logger.info(f"[EAGL] VOL_EXPLOSION (Vol: {regime.vol_level:.2f}) -> 보수적 동작")
              # Maybe slow down epsilon decrease? Or just log.
              pass
 
             
+
+    def _get_mutation_operator_weights(self, gate_focus: Optional[str]) -> Dict[str, float]:
+        base = getattr(config, "MUTATION_OPERATOR_BASE_WEIGHTS", {}) or {}
+        weights = {op: float(base.get(op, 1.0)) for op in base}
+        if not weights:
+            weights = {
+                "ADD_CONDITION": 1.0,
+                "REMOVE_CONDITION": 1.0,
+                "MUTATE_THRESHOLD": 1.0,
+                "SWAP_FEATURE": 1.0,
+                "CHANGE_OP": 1.0,
+            }
+
+        bias_map = getattr(config, "MUTATION_GATE_BIASES", {}) or {}
+        if gate_focus and gate_focus in bias_map:
+            for op, mult in bias_map[gate_focus].items():
+                if op in weights:
+                    weights[op] *= float(mult)
+
+        return weights
+
+    def _choose_mutation_operator(self) -> str:
+        ops = list(self.mutation_operator_weights.keys())
+        if not ops:
+            return "MUTATE_THRESHOLD"
+        weights = [max(0.0, float(self.mutation_operator_weights.get(op, 1.0))) for op in ops]
+        if sum(weights) <= 0.0:
+            return random.choice(ops)
+        return random.choices(ops, weights=weights, k=1)[0]
+
+    def update_mutation_gate_focus(self, gate_code: str) -> None:
+        self.mutation_gate_focus = gate_code
+        self.mutation_operator_weights = self._get_mutation_operator_weights(gate_code)
 
     def propose_policy(self, regime: RegimeState, history: List[LedgerRecord]) -> PolicySpec:
         """
@@ -161,7 +198,7 @@ class MetaAgent:
             
         if self.baselines and random.random() < baseline_prob:
             base = random.choice(self.baselines)
-            logger.debug(f"[MetaAgent] Warm-start: Using baseline '{base.get('name')}'")
+            logger.debug(f"[MetaAgent] 웜스타트: 베이스라인 사용 '{base.get('name')}'")
             spec = self._make_spec(
                 genome=base["feature_genome"],
                 template_tag=base.get("template_id", "BASELINE"),
@@ -177,7 +214,7 @@ class MetaAgent:
             return spec
 
         # 1. Standard RL Flow
-        logger.debug(f"[MetaAgent] Regime Detected: {regime.label} (Trend: {regime.trend_score:.2f}, VIX: {regime.vol_level:.2f})")
+        logger.debug(f"[MetaAgent] 레짐 감지: {regime.label} (Trend {regime.trend_score:.2f}, VIX {regime.vol_level:.2f})")
 
         from src.l3_meta.auto_tuner import get_auto_tuner
         tuner = get_auto_tuner()
@@ -194,7 +231,7 @@ class MetaAgent:
             
             # Risk profile still from RL for now or default
             _, _, risk_profile_id, risk_action_idx = self.integrated_rl.get_action(regime, df=self._current_df)
-            logger.info(f"    [AutoTuner] Override Action: {action_name} (from mix)")
+            logger.info(f"[AutoTuner] 행동 오버라이드: {action_name} (mix)")
         else:
             # Get Action from RL (Multi-head Integrated)
             if config.D3QN_ENABLED:
@@ -358,7 +395,7 @@ class MetaAgent:
                     feature_genome = mutate(temp_spec).feature_genome
                 return feature_genome
             else:
-                logger.debug("    [MetaAgent] Not enough elites for EVOLVE, falling back to Trend Alpha")
+                logger.debug("[MetaAgent] EVOLVE 엘리트 부족 -> Trend Alpha로 대체")
                 action_name = "TREND_ALPHA"
 
         cats, f_min, f_max, q_bias = profile_map.get(action_name, (["TREND"], 2, 2, "center"))
@@ -441,6 +478,59 @@ class MetaAgent:
         [V17] Build LogicTree structure based on Action and Regime.
         """
         from src.shared.logic_tree import LogicTree, ConditionNode, LogicalOpNode, mutate_tree, asdict
+
+        def _is_false_tree(tree_dict: Optional[Dict[str, Any]]) -> bool:
+            if not tree_dict:
+                return True
+            try:
+                tree = LogicTree.from_dict(tree_dict)
+            except Exception:
+                return False
+            if not tree or not tree.root:
+                return True
+            if isinstance(tree.root, ConditionNode):
+                if tree.root.feature_key == "FALSE" and tree.root.op == "==" and tree.root.value == 1.0:
+                    return True
+            return False
+
+        def _build_exit_node(
+            candidates: List[ConditionNode],
+            q_bias: str,
+        ) -> ConditionNode:
+            if candidates:
+                base = random.choice(candidates)
+                exit_op = "<" if base.op in (">", ">=") else ">"
+                return ConditionNode(
+                    feature_key=base.feature_key,
+                    column_ref=base.column_ref,
+                    op=exit_op,
+                    value=base.value if base.value else "[q0.5]",
+                )
+
+            fallback_features = self.registry.list_all() if hasattr(self.registry, "list_all") else []
+            if not fallback_features:
+                return ConditionNode(feature_key="FALSE", op="==", value=1.0)
+
+            from src.contracts import ColumnRef
+            feat = random.choice(fallback_features)
+            meta = self.registry.get(feat.feature_id)
+            outputs = meta.outputs if meta else {"value": "value"}
+            key = "value" if "value" in outputs else list(outputs.keys())[0]
+            exit_quantiles = [0.3, 0.5, 0.7]
+            if q_bias == "tail":
+                exit_weights = [0.45, 0.1, 0.45]
+            elif q_bias == "center":
+                exit_weights = [0.2, 0.6, 0.2]
+            else:
+                exit_weights = [0.34, 0.32, 0.34]
+            q_val = random.choices(exit_quantiles, weights=exit_weights, k=1)[0]
+            exit_op = ">" if random.random() > 0.5 else "<"
+            return ConditionNode(
+                feature_key=feat.feature_id,
+                column_ref=ColumnRef(feature_id=feat.feature_id, output_key=key),
+                op=exit_op,
+                value=f"[q{q_val}]",
+            )
         
         # [EVOLVE] Logic: Mutate existing elite tree
         if action_name == "EVOLVE":
@@ -449,10 +539,15 @@ class MetaAgent:
                 parent = random.choice(elite_records).policy_spec
                 if parent.logic_trees:
                     entry_tree = LogicTree.from_dict(parent.logic_trees["entry"])
-                    mutated_entry = mutate_tree(entry_tree, self.registry, action_type=random.choice(["ADD_CONDITION", "MUTATE_THRESHOLD", "SWAP_FEATURE", "CHANGE_OP"]))
+                    action_type = self._choose_mutation_operator()
+                    mutated_entry = mutate_tree(entry_tree, self.registry, action_type=action_type)
+                    exit_tree_dict = parent.logic_trees.get("exit")
+                    if _is_false_tree(exit_tree_dict):
+                        exit_node = _build_exit_node(mutated_entry.get_condition_nodes(), q_bias="center")
+                        exit_tree_dict = asdict(exit_node)
                     return {
                         "entry": asdict(mutated_entry.root),
-                        "exit": parent.logic_trees.get("exit", asdict(ConditionNode(feature_key="FALSE", op="==", value=1.0)))
+                        "exit": exit_tree_dict,
                     }
 
         # [Genome v2] Profile to Market Question Mapping
@@ -480,6 +575,11 @@ class MetaAgent:
         }
         
         subset_size, q_bias = profile_info.get(action_name, (2, "center"))
+        stage_id = int(getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+        stage_cfg = getattr(config, "CURRICULUM_STAGES", {}).get(stage_id)
+        if stage_cfg:
+            min_terms, max_terms = getattr(stage_cfg, "and_terms_range", (1, subset_size))
+            subset_size = max(min_terms, min(subset_size, max_terms))
         target_questions = PROFILE_TO_QUESTIONS.get(action_name, ["TREND_CONFIRMATION"])
         
         # [Genome v2] Combinator Mode: Pick features that answer the questions
@@ -496,7 +596,7 @@ class MetaAgent:
         
         if not candidates:
             # Fallback to general category if questions yield nothing
-            logger.warning(f"  [Genome v2] No features found for questions {target_questions}, falling back to registry.")
+            logger.warning(f"[Genome v2] 질문 {target_questions}에 해당 특징 없음 -> 레지스트리로 대체")
             candidates = self.registry.list_all()
             
         selected_features = []
@@ -561,9 +661,9 @@ class MetaAgent:
             entry_root = ConditionNode(feature_key="TRUE", op="==", value=1.0)
             
         # Build Simple Exit Tree
-        exit_root = ConditionNode(feature_key="FALSE", op="==", value=1.0)
+        exit_node = _build_exit_node(entry_nodes, q_bias)
         
-        return {"entry": asdict(entry_root), "exit": asdict(exit_root)}
+        return {"entry": asdict(entry_root), "exit": asdict(exit_node)}
 
     def _sync_genome_from_trees(self, logic_trees: Dict[str, Dict[str, Any]], action_name: str, regime: RegimeState) -> Dict[str, Any]:
         """
@@ -757,7 +857,7 @@ class MetaAgent:
         # 3. Logging for Analysis
         # ========================================
         logger.debug(
-            f"[PolicySpec] Generated Risk Params: "
+            f"[PolicySpec] 리스크 파라미터: "
             f"k_up={k_up:.2f}, k_down={k_down:.2f}, horizon={horizon}, "
             f"RR={risk_reward_ratio:.2f}, SL={stop_loss:.3f}"
         )

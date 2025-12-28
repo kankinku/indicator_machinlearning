@@ -121,7 +121,7 @@ class StateEncoder:
             EncodedState: 인코딩된 상태
         """
         if len(df) < self.window_size + 20:
-            logger.warning(f"데이터 부족: {len(df)} < {self.window_size + 20}")
+            logger.warning(f"[StateEncoder] 데이터 부족: {len(df)} < {self.window_size + 20}")
             # 부족한 경우 0으로 패딩
             return self._create_empty_state(df)
         
@@ -329,7 +329,7 @@ class StateEncoder:
                 }
         
         self._save_scaler()
-        logger.info(f"스케일러 업데이트됨: {len(self.scaler_params)} 특성")
+        logger.info(f"[StateEncoder] 스케일러 업데이트: {len(self.scaler_params)}개")
     
     def _save_scaler(self) -> None:
         """스케일러 파라미터를 저장합니다."""
@@ -338,7 +338,7 @@ class StateEncoder:
             with open(self.scaler_path, "w") as f:
                 json.dump(self.scaler_params, f, indent=2)
         except Exception as e:
-            logger.warning(f"스케일러 저장 실패: {e}")
+            logger.warning(f"[StateEncoder] 스케일러 저장 실패: {e}")
     
     def _load_scaler(self) -> None:
         """스케일러 파라미터를 로드합니다."""
@@ -346,9 +346,9 @@ class StateEncoder:
             try:
                 with open(self.scaler_path, "r") as f:
                     self.scaler_params = json.load(f)
-                logger.debug(f"스케일러 로드됨: {len(self.scaler_params)} 특성")
+                logger.debug(f"[StateEncoder] 스케일러 로드: {len(self.scaler_params)}개")
             except Exception as e:
-                logger.warning(f"스케일러 로드 실패: {e}")
+                logger.warning(f"[StateEncoder] 스케일러 로드 실패: {e}")
 
 
 # 전역 인코더 인스턴스 (싱글톤)

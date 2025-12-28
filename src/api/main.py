@@ -418,12 +418,37 @@ def get_backtest_result(exp_id: str):
         start_date = bt.dates[0] if bt.dates else "-"
         end_date = bt.dates[-1] if bt.dates else "-"
 
+        # [V21] Standardized Rejection/Status
+        is_approved = not record.is_rejected if record else True
+        reason_codes = record.reason_codes if record else []
+        if not reason_codes and not is_approved:
+            # Fallback to rejection_reason if reason_codes is empty
+            rej_reason = record.rejection_reason if record and record.rejection_reason else "Unknown rejection"
+            reason_codes = [rej_reason] if rej_reason != "PASS" else []
+            if not reason_codes: is_approved = True
+
+        # Calculate enriched metrics for validation parity
+        trade_returns = np.array([t["return_pct"] for t in bt.trades])
+        wins = trade_returns[trade_returns > 0]
+        losses = trade_returns[trade_returns < 0]
+        gross_profit = np.sum(wins) if wins.size > 0 else 0.0
+        gross_loss = abs(np.sum(losses)) if losses.size > 0 else 0.0
+        profit_factor = float(gross_profit / gross_loss) if gross_loss > 1e-9 else (100.0 if gross_profit > 0 else 1.0)
+        
+        # Trades per year
+        days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days if start_date != "-" and end_date != "-" else 252
+        trades_per_year = bt.trade_count / (max(1, days) / 365.25)
+
         return {
             "success": True,
+            "is_approved": is_approved,
+            "reason_codes": reason_codes,
             "metrics": {
                 "total_return_pct": float(bt.total_return_pct),
                 "mdd_pct": float(bt.mdd_pct),
                 "win_rate": float(bt.win_rate),
+                "profit_factor": profit_factor,
+                "trades_per_year": trades_per_year,
                 "trade_count": int(bt.trade_count),
                 "entry_signals": entry_signals,
                 "start_date": start_date,

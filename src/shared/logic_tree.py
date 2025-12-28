@@ -395,7 +395,7 @@ def _handle_ambiguous(
     
     # 학습 모드 + error 정책: 즉시 예외
     if strict_mode and policy == "error":
-        msg = f"[LogicTree] AMBIGUOUS: '{f_key}' has {len(candidates)} candidates: {candidates[:5]}"
+        msg = f"[LogicTree] 모호함: '{f_key}' 후보 {len(candidates)}개 {candidates[:5]}"
         logger.error(msg)
         raise LogicTreeMatchError(
             message=msg,
@@ -404,7 +404,7 @@ def _handle_ambiguous(
         )
     
     # 운영 모드 또는 warn 정책: 대표 컬럼 선택
-    logger.warning(f"[LogicTree] AMBIGUOUS: '{f_key}' -> {candidates[:5]}. Selecting representative.")
+    logger.warning(f"[LogicTree] 모호함: '{f_key}' -> {candidates[:5]} (대표 컬럼 선택)")
     
     # 대표 선택 규칙: __value 우선, 없으면 알파벳 순
     selected = None
@@ -417,7 +417,7 @@ def _handle_ambiguous(
         # 알파벳 순 첫 번째
         selected = sorted(candidates)[0]
     
-    logger.warning(f"[LogicTree] Selected '{selected}' for ambiguous key '{f_key}'")
+    logger.warning(f"[LogicTree] 모호함 해결: '{f_key}' -> '{selected}'")
     
     col = df[selected]
     return _apply_comparison(col, node, df)
@@ -442,7 +442,7 @@ def _handle_unmatched(
     strict_mode = getattr(config, 'LOGICTREE_STRICT', True)
     
     if strict_mode:
-        msg = f"[LogicTree] UNMATCHED: Feature key '{f_key}' not found in DataFrame columns. Available: {list(df.columns)[:10]}"
+        msg = f"[LogicTree] 미매칭: '{f_key}' 컬럼 없음. 사용 가능: {list(df.columns)[:10]}"
         logger.error(msg)
         raise LogicTreeMatchError(
             message=msg,
@@ -451,7 +451,7 @@ def _handle_unmatched(
         )
     
     # 운영 모드: False 반환 + 로그
-    logger.warning(f"[LogicTree] UNMATCHED: '{f_key}' not found. Returning False (production fallback).")
+    logger.warning(f"[LogicTree] 미매칭: '{f_key}' 없음 (운영 모드 False 반환)")
     return pd.Series(False, index=df.index)
 
 def parse_text_to_logic(expr: str) -> LogicTree:

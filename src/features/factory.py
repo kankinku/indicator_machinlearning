@@ -63,9 +63,9 @@ class FeatureFactory:
                 ctx_features = generate_context_features(df)
                 if not ctx_features.empty:
                     feature_chunks.append(ctx_features)
-                    logger.debug(f"[FeatureFactory] Added {len(ctx_features.columns)} context features")
+                    logger.debug(f"[FeatureFactory] 컨텍스트 특징 추가: {len(ctx_features.columns)}개")
             except Exception as e:
-                logger.warning(f"[FeatureFactory] Context feature generation failed: {e}")
+                logger.warning(f"[FeatureFactory] 컨텍스트 특징 생성 실패: {e}")
         
         # ============================================
         # 2. RL이 선택한 Genome 피처 추가
@@ -82,7 +82,7 @@ class FeatureFactory:
                     pass
                     
             except Exception as e:
-                print(f"Error generating {feature_id}: {e}")
+                logger.warning(f"[FeatureFactory] 특징 생성 실패: {feature_id} ({e})")
                 continue
 
         if not feature_chunks:
@@ -93,7 +93,7 @@ class FeatureFactory:
         # De-duplicate columns (keep first occurrence to maintain 'One Source of Truth')
         if features.columns.duplicated().any():
             dupes = features.columns[features.columns.duplicated()].unique().tolist()
-            logger.warning(f"[FeatureFactory] Duplicate features detected and removed: {dupes}")
+            logger.warning(f"[FeatureFactory] 중복 특징 제거: {dupes}")
             features = features.loc[:, ~features.columns.duplicated()]
         
         # Handle Inf/Nan
@@ -126,7 +126,7 @@ class FeatureFactory:
             return result
         except Exception as e:
             import traceback
-            logger.error(f"Execution Error for {feature_id}: {e}\n{traceback.format_exc()}")
+            logger.error(f"[FeatureFactory] 실행 오류: {feature_id} ({e})\n{traceback.format_exc()}")
             raise e
 
     def _align_outputs(self, feature_id: str, result: pd.DataFrame) -> pd.DataFrame:

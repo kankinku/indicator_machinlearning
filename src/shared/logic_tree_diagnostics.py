@@ -109,16 +109,16 @@ class LogicTreeDiagnostics:
     def log_summary(self, level: str = "info") -> None:
         """진단 결과 요약 로그 출력."""
         msg = (
-            f"[LogicTree KPI] Match: {self.match_rate:.1%} | "
-            f"Direct: {self.matched_direct} | Fuzzy: {self.matched_fuzzy} | "
-            f"Ambiguous: {self.ambiguous} | Unmatched: {self.unmatched}"
+            f"[LogicTree] 매칭률 {self.match_rate:.1%} | "
+            f"직접 {self.matched_direct} | 유사 {self.matched_fuzzy} | "
+            f"모호 {self.ambiguous} | 미매칭 {self.unmatched}"
         )
         if not self.is_healthy:
-            msg += f" | ⚠️ UNHEALTHY"
+            msg += " | 상태: 비정상"
             if self.unmatched_keys:
-                msg += f" | Missing: {self.unmatched_keys[:3]}"
+                msg += f" | 누락: {self.unmatched_keys[:3]}"
             if self.ambiguous_keys:
-                msg += f" | Ambiguous: {self.ambiguous_keys[:3]}"
+                msg += f" | 모호: {self.ambiguous_keys[:3]}"
         
         if level == "warning" or not self.is_healthy:
             logger.warning(msg)

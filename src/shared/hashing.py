@@ -73,6 +73,8 @@ def get_eval_config_signature() -> str:
         "WF_SPLITS_STAGE1": getattr(config, "WF_SPLITS_STAGE1", 2),
         "WF_SPLITS_STAGE2": getattr(config, "WF_SPLITS_STAGE2", 3),
         "WF_SPLITS_STAGE3": getattr(config, "WF_SPLITS_STAGE3", 4),
+        "EVAL_CAPS_BY_STAGE": getattr(config, "EVAL_CAPS_BY_STAGE", {}),
         "EVAL_SCORE_MIN": config.EVAL_SCORE_MIN,
+        "EVAL_CACHE_VERSION": getattr(config, "EVAL_CACHE_VERSION", 0),
     }
     return calculate_sha256(eval_cfg)[:16]

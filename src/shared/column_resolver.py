@@ -106,7 +106,7 @@ class ColumnResolver:
             self.diag.record_ambiguous(feature_id, candidates)
             # 운영 모드 안전 선택 (알파벳순)
             selected = sorted(candidates)[0]
-            logger.warning(f"[Resolver] Ambiguous '{feature_id}' -> {candidates}. Picked '{selected}'")
+            logger.warning(f"[Resolver] 모호함: '{feature_id}' -> {candidates} (선택: '{selected}')")
             return selected
             
         # Last resort: Try exact match (maybe feature_id IS the column name?)

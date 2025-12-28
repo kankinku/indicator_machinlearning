@@ -83,7 +83,7 @@ class AutoTuner:
             )
             self.record_batch(state)
         except Exception as e:
-            logger.error(f"[AutoTuner] Failed to process diagnostics: {e}")
+            logger.error(f"[AutoTuner] 진단 처리 실패: {e}")
 
     def record_batch(self, state: BatchState):
         self.history.append(state)
@@ -105,7 +105,7 @@ class AutoTuner:
         # Log status
         active = [p for p in self.interventions if p.status == "ACTIVE"]
         if active:
-            logger.info(f"[AutoTuner] Active Intervention: {active[0].intervention_id} ({active[0].cause})")
+            logger.info(f"[AutoTuner] 활성 개입: {active[0].intervention_id} ({active[0].cause})")
 
     def _check_interventions(self, current_batch: int):
         """Verifies if active interventions met their goals or need rollback."""
@@ -116,11 +116,11 @@ class AutoTuner:
                 if success:
                     plan.status = "SUCCESS"
                     record_event("AUTOTUNER_INTERVENTION_SUCCESS", payload={"plan_id": plan.intervention_id, "cause": plan.cause})
-                    logger.info(f"[AutoTuner] ✅ Intervention {plan.intervention_id} SUCCESS. Maintaining levers.")
+                    logger.info(f"[AutoTuner] 개입 성공: {plan.intervention_id} (레버 유지)")
                 else:
                     plan.status = "FAILED"
                     record_event("AUTOTUNER_INTERVENTION_FAILED", payload={"plan_id": plan.intervention_id, "cause": plan.cause})
-                    logger.warning(f"[AutoTuner] ❌ Intervention {plan.intervention_id} FAILED. Rolling back.")
+                    logger.warning(f"[AutoTuner] 개입 실패: {plan.intervention_id} (롤백)")
                     self._rollback(plan)
                     record_event("AUTOTUNER_INTERVENTION_ROLLBACK", payload={"plan_id": plan.intervention_id})
 
@@ -268,7 +268,7 @@ class AutoTuner:
             initial_values=initial
         )
         self.interventions.append(plan)
-        logger.warning(f"[AutoTuner] 🚀 New Intervention Applied: {plan_id}\nCause: {cause}\nLevers: {levers}")
+        logger.warning(f"[AutoTuner] 개입 적용: {plan_id} | 원인 {cause} | 레버 {levers}")
 
     def _evaluate_intervention(self, plan: InterventionPlan) -> bool:
         """Compares current state with state before intervention."""
@@ -306,7 +306,7 @@ class AutoTuner:
     def _rollback(self, plan: InterventionPlan):
         for k, v in plan.initial_values.items():
             self.current_levers[k] = v
-        logger.info(f"[AutoTuner] Rollback successful for {plan.intervention_id}")
+        logger.info(f"[AutoTuner] 롤백 완료: {plan.intervention_id}")
 
     def get_levers(self) -> Dict[str, Any]:
         return self.current_levers

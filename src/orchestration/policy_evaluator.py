@@ -38,30 +38,48 @@ class RuleEvaluator:
         from src.shared.logic_tree_diagnostics import LogicTreeMatchError
         
         # 1. Sync LogicTree (Phase 1 Migration)
-        if not policy_spec.logic_trees:
-            # Lazy migration from text
-            policy_spec.logic_trees = {
-                "entry": asdict(parse_text_to_logic(policy_spec.decision_rules.get("entry", "True")).root),
-                "exit": asdict(parse_text_to_logic(policy_spec.decision_rules.get("exit", "False")).root)
-            }
+        entry_tree_dict = None
+        exit_tree_dict = None
+        if policy_spec.logic_trees:
+            entry_tree_dict = policy_spec.logic_trees.get("entry")
+            exit_tree_dict = policy_spec.logic_trees.get("exit")
+
+        if not entry_tree_dict:
+            entry_rule = policy_spec.decision_rules.get("entry", "True")
+            entry_tree_dict = asdict(parse_text_to_logic(entry_rule).root)
+            if policy_spec.logic_trees is None:
+                policy_spec.logic_trees = {}
+            policy_spec.logic_trees["entry"] = entry_tree_dict
+
+        if not exit_tree_dict:
+            exit_rule = policy_spec.decision_rules.get("exit", "")
+            if exit_rule and exit_rule.strip().lower() not in {"false", ""}:
+                exit_tree_dict = asdict(parse_text_to_logic(exit_rule).root)
+                if policy_spec.logic_trees is None:
+                    policy_spec.logic_trees = {}
+                policy_spec.logic_trees["exit"] = exit_tree_dict
+            else:
+                policy_spec._exit_tree_disabled = True
             
         try:
             # 2. Evaluate using LogicTree
-            entry_tree = LogicTree.from_dict(policy_spec.logic_trees.get("entry"))
-            exit_tree = LogicTree.from_dict(policy_spec.logic_trees.get("exit"))
+            entry_tree = LogicTree.from_dict(entry_tree_dict) if entry_tree_dict else None
+            exit_tree = LogicTree.from_dict(exit_tree_dict) if exit_tree_dict else None
             
             # [V17] Use LogicTree for Signal Generation
-            entry_sig = evaluate_logic_tree(entry_tree, df)
-            exit_sig = evaluate_logic_tree(exit_tree, df)
+            entry_sig = evaluate_logic_tree(entry_tree, df) if entry_tree else pd.Series(False, index=df.index)
+            exit_sig = evaluate_logic_tree(exit_tree, df) if exit_tree else pd.Series(False, index=df.index)
             
             # 3. Complexity Calculation (Structural)
-            complexity = self._calculate_tree_complexity(entry_tree) + self._calculate_tree_complexity(exit_tree)
+            complexity = self._calculate_tree_complexity(entry_tree)
+            if exit_tree:
+                complexity += self._calculate_tree_complexity(exit_tree)
             
             return entry_sig, exit_sig, complexity
             
         except LogicTreeMatchError as e:
             # [V18] 매칭 실패: 명시적 실패 반환
-            logger.error(f"[RuleEvaluator] LogicTree match failed: {e.message}")
+            logger.error(f"[RuleEvaluator] LogicTree 매칭 실패: {e.message}")
             
             # 실패 마커: complexity = -1.0 (caller가 이를 확인해야 함)
             # 모든 신호를 False로 설정하고, 실패 원인을 policy_spec에 기록
@@ -164,7 +182,7 @@ class RuleEvaluator:
                     if match:
                         processed_tokens.append(f"`{match}`")
                     else:
-                        logger.warning(f"[Evaluator] Unknown token: {t}")
+                        logger.warning(f"[Evaluator] 알 수 없는 토큰: {t}")
                         return pd.Series(False, index=df.index), 10.0
             
             # Store in Cache
@@ -184,7 +202,7 @@ class RuleEvaluator:
                             quant_val = col_vals.quantile(q_val)
                             eval_tokens[i] = str(round(quant_val, 6))
                 except Exception as e:
-                    logger.error(f"[Evaluator] Quantile resolution failed: {e}")
+                    logger.error(f"[Evaluator] 분위수 해석 실패: {e}")
                     eval_tokens[i] = "0.0"
 
         safe_expr = " ".join(eval_tokens)
@@ -194,7 +212,7 @@ class RuleEvaluator:
                 return result.fillna(False).astype(bool), complexity
             return pd.Series(bool(result), index=df.index), complexity
         except Exception as e:
-            logger.error(f"[Evaluator] Eval failed for '{expr}': {e}")
+            logger.error(f"[Evaluator] 평가 실패: '{expr}' ({e})")
             return pd.Series(False, index=df.index), complexity + 5.0
 
     def _normalize_rule(self, expr: str) -> str:

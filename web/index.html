@@ -54,75 +54,86 @@
     <!-- Main Content -->
     <main class="main-content">
         <div class="container">
-            <header class="dashboard-header">
-                <div>
-                    <h1>Dashboard</h1>
-                    <p class="subtitle">Real-time Performance Overview</p>
-                </div>
-                <div id="system-monitor-section" class="system-monitor" style="display:none;">
-                    <div class="sm-item">
-                        <span class="sm-label">CURRENT REGIME</span>
-                        <span id="sys-regime" class="status-badge">UNKNOWN</span>
-                    </div>
-                    <div class="sm-divider"></div>
-                    <div class="sm-item">
-                        <span class="sm-label">CURRICULUM</span>
-                        <div class="sm-val-group">
-                            <span id="sys-stage-id" class="sm-text">STAGE 0</span>
-                            <span id="sys-stage-name" class="sm-subtext">-</span>
-                        </div>
-                        <div class="sm-progress-container">
-                            <div class="sm-progress-text">Pass <span id="sys-stage-progress">0/0</span></div>
-                            <div class="sm-progress-bg">
-                                <div id="sys-stage-progress-bar" class="sm-progress-fill"></div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="sm-divider"></div>
-                    <div class="sm-item">
-                        <span class="sm-label">RL EXPLORER</span>
-                        <div class="sm-val-group">
-                            <span class="sm-text">EPS <span id="sys-epsilon">0.0000</span></span>
-                            <span class="sm-subtext">STEPS: <span id="sys-steps">0</span> | RH: <span
-                                    id="sys-reheat">None</span></span>
-                        </div>
-                    </div>
-                </div>
+            <div class="header-main">
+                <h1>Dashboard</h1>
+                <p class="subtitle">Real-time Performance Overview</p>
+            </div>
             </header>
 
-            <!-- [V14] System Health Section -->
-            <div id="diag-section" class="diagnostic-grid" style="display:none;">
-                <div class="card diag-card">
-                    <div class="diag-header">
-                        <span class="label">SYSTEM HEALTH</span>
-                        <span id="diag-status" class="status-badge">UNKNOWN</span>
-                    </div>
-                    <div class="diag-split">
-                        <div class="diag-main">
-                            <div class="diag-stat">
-                                <span class="d-label">Pass Rate</span>
-                                <span id="diag-pass-rate" class="d-value">0%</span>
+            <!-- [V21] Unified Top Monitoring Row -->
+            <div id="dash-top-row" class="top-monitor-row" style="display:none;">
+                <div id="system-status-panel" class="status-panel">
+                    <div class="status-grid">
+                        <!-- Column 1: Market & Health -->
+                        <div class="status-col">
+                            <span class="status-label">ENVIRONMENT & HEALTH</span>
+                            <div class="status-row">
+                                <span id="sys-regime" class="status-badge regime-unknown">UNKNOWN</span>
+                                <span id="diag-status" class="status-badge status-unknown">UNKNOWN</span>
                             </div>
-                            <div class="diag-stat">
-                                <span class="d-label">Rejection</span>
-                                <span id="diag-rej-rate" class="d-value">0%</span>
-                            </div>
-                            <div class="diag-stat">
-                                <span class="d-label">Similarity</span>
-                                <span id="diag-sim-rate" class="d-value">0%</span>
+                            <div class="status-mini-stats">
+                                <div class="mini-stat">
+                                    <span class="ms-lbl">Pass Rate</span>
+                                    <span id="diag-pass-rate" class="ms-val">0%</span>
+                                </div>
+                                <div class="mini-stat">
+                                    <span class="ms-lbl">Rejection</span>
+                                    <span id="diag-rej-rate" class="ms-val">0%</span>
+                                </div>
+                                <div class="mini-stat">
+                                    <span class="ms-lbl">Similarity</span>
+                                    <span id="diag-sim-rate" class="ms-val">0%</span>
+                                </div>
                             </div>
                         </div>
-                        <div class="diag-details">
-                            <span class="d-label">Issue Taxonomy</span>
-                            <div id="diag-taxonomy-bars" class="taxonomy-bars">
-                                <!-- Bars injected by JS -->
+
+                        <!-- Column 2: Curriculum Progress -->
+                        <div class="status-col">
+                            <span class="status-label">CURRICULUM PHASE</span>
+                            <div class="phase-info">
+                                <span id="sys-stage-id" class="phase-id">STAGE 0</span>
+                                <span id="sys-stage-name" class="phase-name">-</span>
                             </div>
+                            <div class="progress-wrapper">
+                                <div class="progress-text">
+                                    <span>Goal Alignment</span>
+                                    <span id="sys-stage-progress">0/0</span>
+                                </div>
+                                <div class="progress-bar-bg">
+                                    <div id="sys-stage-progress-bar" class="progress-bar-fill"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Column 3: RL Explorer -->
+                        <div class="status-col">
+                            <span class="status-label">RL EXPLORER</span>
+                            <div class="rl-info">
+                                <div class="epsilon-group">
+                                    <span class="eps-lbl">ϵ</span>
+                                    <span id="sys-epsilon" class="eps-val">0.0000</span>
+                                </div>
+                                <div class="rl-meta">
+                                    <span>STEPS: <span id="sys-steps">0</span></span>
+                                    <span>REHEAT: <span id="sys-reheat">None</span></span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Bottom: Rejection Taxonomy (Simplified) -->
+                    <div class="taxonomy-strip">
+                        <span class="tax-strip-lbl">PRIMARY BOTTLENECKS:</span>
+                        <div id="diag-taxonomy-bars" class="taxonomy-horizontal-list">
+                            <!-- Bars/Pills injected by JS -->
                         </div>
                     </div>
                 </div>
-            </div>
 
-            <div id="kpi-grid" class="kpi-grid"></div>
+                <div id="kpi-grid" class="kpi-grid">
+                    <!-- Dynamic KPIs -->
+                </div>
+            </div>
 
             <div id="hof-section" class="hof-section" style="display:none;">
                 <div class="hof-card" id="hof-card">

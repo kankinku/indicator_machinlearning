@@ -24,6 +24,11 @@ class TradeStats:
     trades_per_year: float = 0.0
     entry_signal_rate: float = 0.0
     avg_holding_bars: float = 0.0
+    cycle_count: int = 0
+    entry_count: int = 0
+    exit_count: int = 0
+    invalid_action_count: int = 0
+    invalid_action_rate: float = 0.0
 
 @dataclass
 class EquityStats:
@@ -153,7 +158,10 @@ def compute_trades_stats(trade_returns: np.ndarray, bars_total: int) -> TradeSta
         reward_risk=float(rr),
         top1_share=top1_share,
         top3_share=top3_share,
-        trades_per_year=float(trades_per_year)
+        trades_per_year=float(trades_per_year),
+        cycle_count=int(tc),
+        entry_count=int(tc),
+        exit_count=int(tc),
     )
 
 def compute_equity_stats(
@@ -329,6 +337,9 @@ def metrics_to_legacy_dict(agg: AggregateMetrics) -> Dict[str, Any]:
         "entry_signal_rate": entry_rate,
         "avg_holding_bars": np.mean([w.trades.avg_holding_bars for w in agg.window_results]) if agg.window_results else 0.0,
         "percent_in_market": np.mean([w.equity.percent_in_market for w in agg.window_results]) if agg.window_results else 0.0,
+        "cycle_count": int(np.sum([w.trades.cycle_count for w in agg.window_results])) if agg.window_results else 0,
+        "invalid_action_count": int(np.sum([w.trades.invalid_action_count for w in agg.window_results])) if agg.window_results else 0,
+        "invalid_action_rate": np.mean([w.trades.invalid_action_rate for w in agg.window_results]) if agg.window_results else 0.0,
     }
     
     # Add oos_bars (sum of all windows)

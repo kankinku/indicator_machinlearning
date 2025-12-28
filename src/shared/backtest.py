@@ -169,13 +169,13 @@ def simulate_backtest(
             hit_stop = low <= stop_price
             if hit_target and hit_stop:
                 exit_price = stop_price
-                exit_reason = "stop"
+                exit_reason = "SL"
             elif hit_target:
                 exit_price = target_price
-                exit_reason = "target"
+                exit_reason = "TP"
             elif hit_stop:
                 exit_price = stop_price
-                exit_reason = "stop"
+                exit_reason = "SL"
         else:
             target_price = entry_price * (1.0 - tp_pct)
             stop_price = entry_price * (1.0 + sl_pct)
@@ -183,21 +183,21 @@ def simulate_backtest(
             hit_stop = high >= stop_price
             if hit_target and hit_stop:
                 exit_price = stop_price
-                exit_reason = "stop"
+                exit_reason = "SL"
             elif hit_target:
                 exit_price = target_price
-                exit_reason = "target"
+                exit_reason = "TP"
             elif hit_stop:
                 exit_price = stop_price
-                exit_reason = "stop"
+                exit_reason = "SL"
 
         if exit_price is None and hold_bars >= horizon:
             exit_price = close
-            exit_reason = "horizon"
+            exit_reason = "HORIZON"
 
         if exit_price is None and (signal == 0 or signal != position):
             exit_price = close
-            exit_reason = "signal"
+            exit_reason = "AGENT_EXIT"
 
         if exit_price is not None:
             pnl_pct = (exit_price / entry_price - 1.0) * position
@@ -233,7 +233,7 @@ def simulate_backtest(
             "entry_price": round(entry_price, 6),
             "exit_price": round(close, 6),
             "return_pct": round(pnl_pct * 100.0, 4),
-            "reason": "eod",
+            "reason": "HORIZON",
             "bars": hold_bars,
             "is_valid": is_regime_match,
         })

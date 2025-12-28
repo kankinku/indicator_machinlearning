@@ -43,9 +43,9 @@ class IndicatorPriorController:
             try:
                 with open(self.priors_file, "r", encoding="utf-8") as f:
                     self.priors = json.load(f)
-                logger.info(f"[Analyst] Loaded indicator priors from {self.priors_file}")
+                logger.info(f"[Analyst] 인디케이터 사전 로드: {self.priors_file}")
             except Exception as e:
-                logger.error(f"[Analyst] Failed to load priors: {e}")
+                logger.error(f"[Analyst] 사전 로드 실패: {e}")
         
     def _save(self):
         try:
@@ -53,7 +53,7 @@ class IndicatorPriorController:
             with open(self.priors_file, "w", encoding="utf-8") as f:
                 json.dump(self.priors, f, indent=4)
         except Exception as e:
-            logger.error(f"[Analyst] Failed to save priors: {e}")
+            logger.error(f"[Analyst] 사전 저장 실패: {e}")
 
     def update_with_record(self, record: Any, regime_str: str, registry: Any):
         """

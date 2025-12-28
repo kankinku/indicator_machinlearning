@@ -44,13 +44,13 @@ class TestRunner:
             # Validate results
             events = self.recorder.get_events()
             self.validate(name, events)
-            print(f"✅ Test Case {name} PASSED")
+            print(f"[PASS] Test Case {name} PASSED")
             
         except AssertionError as e:
-            print(f"❌ Test Case {name} FAILED: {str(e)}")
+            print(f"[FAIL] Test Case {name} FAILED: {str(e)}")
             self.print_timeline()
         except Exception as e:
-            print(f"💥 Test Case {name} CRASHED: {str(e)}")
+            print(f"[CRASH] Test Case {name} CRASHED: {str(e)}")
             import traceback
             traceback.print_exc()
         finally:

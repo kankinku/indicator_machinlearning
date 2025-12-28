@@ -149,7 +149,7 @@ class D3QNAgent:
         # 모델 로드 시도
         self.load()
         
-        logger.info(f"D3QN 에이전트 초기화됨 - 상태: {self.state_dim}, 행동: {self.n_actions}, 장치: {self.device}")
+        logger.info(f"[D3QN] 초기화: 상태 {self.state_dim}, 행동 {self.n_actions}, 장치 {self.device}")
     
     def get_action(
         self,
@@ -183,9 +183,9 @@ class D3QNAgent:
         
         # 로깅
         if exploration:
-            logger.debug(f"    [D3QN] 탐색 (ε={epsilon:.3f}) -> {action_name}")
+            logger.debug(f"[D3QN] 탐색 (ε={epsilon:.3f}) -> {action_name}")
         else:
-            logger.debug(f"    [D3QN] 활용 -> {action_name}")
+            logger.debug(f"[D3QN] 활용 -> {action_name}")
         
         return action_name, action_idx
     
@@ -215,7 +215,7 @@ class D3QNAgent:
         경험을 저장하고 신경망을 학습합니다.
         """
         if self.last_state is None:
-            logger.warning("이전 상태가 없어 학습을 건너뜁니다")
+            logger.warning("[D3QN] 이전 상태 없음 -> 학습 스킵")
             return
         
         action_idx = action_idx if action_idx is not None else self.last_action_idx
@@ -242,7 +242,7 @@ class D3QNAgent:
         
         # [V11.2] 탈락(Rejection) 처리 - 학습을 스킵하고 싶은 경우
         if is_rejected and getattr(config, 'RL_SKIP_LEARNING_ON_REJECTION', False):
-            logger.info(f"    [D3QN] Strategy REJECTED. Skipping experience storage.")
+            logger.info("[D3QN] 전략 거절 -> 경험 저장 생략")
             return
 
         # 경험 저장
@@ -273,7 +273,7 @@ class D3QNAgent:
                 # Target 네트워크 업데이트
                 if self.learn_count % self.target_update_freq == 0:
                     soft_update(self.online_net, self.target_net, self.tau)
-                    logger.debug(f"    [D3QN] Target 네트워크 업데이트됨")
+                    logger.debug("[D3QN] 타깃 네트워크 업데이트")
         
         # Stagnation check
         if self.step_count > 0 and self.step_count % self.reheat_period == 0:
@@ -288,17 +288,17 @@ class D3QNAgent:
             self._log_stats()
         
         logger.info(
-            f"    [D3QN] 보상: {reward:.3f} | 버퍼: {len(self.replay_buffer)} | "
-            f"ε: {self.eps_manager.get_epsilon():.3f} | 학습: {self.learn_count}"
+            f"[D3QN] 보상 {reward:.3f} | 리플레이 {len(self.replay_buffer)} | "
+            f"ε {self.eps_manager.get_epsilon():.3f} | 학습 {self.learn_count}"
         )
         
     def _log_stats(self):
         recent_rewards = self.reward_history[-config.REWARD_STD_WINDOW:] if self.reward_history else []
         if recent_rewards:
             reward_std = float(np.std(recent_rewards))
-            logger.info(f"    [D3QN] Reward Std({config.REWARD_STD_WINDOW}): {reward_std:.4f}")
+            logger.info(f"[D3QN] 보상 표준편차({config.REWARD_STD_WINDOW}): {reward_std:.4f}")
             if reward_std < config.REWARD_STD_MIN:
-                logger.warning(f"    [D3QN] Reward variance low: {reward_std:.6f}")
+                logger.warning(f"[D3QN] 보상 분산 낮음: {reward_std:.6f}")
                 record_event("REWARD_VARIANCE_LOW", payload={"reward_std": reward_std})
         
         try:
@@ -309,7 +309,7 @@ class D3QNAgent:
                 hard_ratio = tag_counts.get("HARD_FAIL", 0) / total
                 near_ratio = tag_counts.get("NEAR_PASS", 0) / total
                 pass_ratio = tag_counts.get("PASS", 0) / total
-                logger.info("    [D3QN] Replay Mix: PASS %.2f | NEAR %.2f | HARD %.2f" % (pass_ratio, near_ratio, hard_ratio))
+                logger.info("[D3QN] 리플레이 믹스: PASS %.2f | NEAR %.2f | HARD %.2f" % (pass_ratio, near_ratio, hard_ratio))
         except Exception:
             pass
 
@@ -379,9 +379,9 @@ class D3QNAgent:
                     'optimizer_state_dict': self.optimizer.state_dict(),
                 }, self.model_path)
             
-            logger.debug(f"D3QN 모델 저장됨: {self.model_path}")
+            logger.debug(f"[D3QN] 모델 저장: {self.model_path}")
         except Exception as e:
-            logger.error(f"모델 저장 실패: {e}")
+            logger.error(f"[D3QN] 모델 저장 실패: {e}")
 
     def load(self) -> None:
         """[V18] Level-2 Loading."""
@@ -402,9 +402,9 @@ class D3QNAgent:
                     self.target_net.load_state_dict(checkpoint['target_state_dict'])
                     if 'optimizer_state_dict' in checkpoint:
                         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                logger.info(f"D3QN 모델 로드됨: {self.model_path}")
+                logger.info(f"[D3QN] 모델 로드: {self.model_path}")
             except Exception as e:
-                logger.error(f"모델 로드 실패: {e}")
+                logger.error(f"[D3QN] 모델 로드 실패: {e}")
 
 
 class IntegratedD3QNAgent(D3QNAgent):
@@ -625,9 +625,9 @@ class IntegratedD3QNAgent(D3QNAgent):
                 'target_state_dict': self.target_net.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
             }, self.model_path)
-            logger.debug(f"Integrated 모델 저장됨: {self.model_path}")
+            logger.debug(f"[D3QN] 통합 모델 저장: {self.model_path}")
         except Exception as e:
-            logger.error(f"Integrated 모델 저장 실패: {e}")
+            logger.error(f"[D3QN] 통합 모델 저장 실패: {e}")
 
     def load(self):
         """[V18] Integrated Load."""
@@ -645,9 +645,9 @@ class IntegratedD3QNAgent(D3QNAgent):
                 self.target_net.load_state_dict(ckpt.get('target_state_dict', ckpt.get('target_net_state_dict')))
                 if 'optimizer_state_dict' in ckpt:
                     self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                logger.info(f"Integrated D3QN loaded: {self.model_path}")
+                logger.info(f"[D3QN] 통합 모델 로드: {self.model_path}")
             except Exception as e:
-                logger.error(f"Load failed: {e}")
+                logger.error(f"[D3QN] 로드 실패: {e}")
 
 
 def get_integrated_agent(
@@ -667,7 +667,7 @@ def create_rl_agent(
     
     if use_deep:
         if not TORCH_AVAILABLE:
-            logger.warning("[D3QN] Torch unavailable. Switching to QLearner mode (Manual Fallback).")
+            logger.warning("[D3QN] Torch 미사용 -> QLearner 모드로 전환(수동 폴백)")
             from src.l3_meta.q_learner import QLearner
             return QLearner(storage_path, actions)
         return D3QNAgent(storage_path, actions)

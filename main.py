@@ -21,7 +21,7 @@ from src.orchestration.infinite_loop import infinite_loop
 logger = get_logger("main")
 
 def main():
-    logger.info(">>> [Vibe Launcher] Starting Meta-Optimization Engine...")
+    logger.info(">>> [런처] 메타 최적화 엔진 시작...")
     
     # Execute Loop
     try:

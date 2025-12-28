@@ -179,7 +179,12 @@ class CurriculumController:
         else:
             return False, " | ".join(reasons)
     
-    def record_result(self, passed: bool, metrics: Optional[Dict] = None) -> Dict:
+    def record_result(
+        self,
+        passed: bool,
+        metrics: Optional[Dict] = None,
+        allow_stage_change: bool = True,
+    ) -> Dict:
         """
         실험 결과를 기록하고 Stage 승급 여부를 판단합니다.
         
@@ -211,6 +216,10 @@ class CurriculumController:
             else:
                  self.state.rolling_alpha = (1 - eta) * self.state.rolling_alpha + eta * alpha
                  self.state.rolling_win_rate = (1 - eta) * self.state.rolling_win_rate + eta * wr
+
+        if not allow_stage_change:
+            self._save_state()
+            return status_change
 
         # [vLearn+] Dynamic Promotion Logic
         threshold = config.CURRICULUM_STAGE_UP_THRESHOLD
@@ -248,6 +257,43 @@ class CurriculumController:
             if self.state.stage_attempts > 0 else 0.0
         )
         
+        self._save_state()
+        return status_change
+
+    def set_stage(self, stage_id: int, reason: str, batch_id: Optional[int] = None, metadata: Optional[Dict] = None) -> Dict:
+        """StageController에서 사용하는 강제 스테이지 설정."""
+        stage_id = int(stage_id)
+        max_stage = max(self.stages.keys())
+        min_stage = min(self.stages.keys())
+        stage_id = max(min_stage, min(max_stage, stage_id))
+
+        status_change = {
+            "stage_before": self.state.current_stage,
+            "stage_after": self.state.current_stage,
+            "promoted": False,
+            "demoted": False,
+        }
+
+        if stage_id == self.state.current_stage:
+            return status_change
+
+        action = "promoted" if stage_id > self.state.current_stage else "demoted"
+        status_change[action] = True
+        status_change["stage_after"] = stage_id
+
+        self.state.current_stage = stage_id
+        self.state.stage_passes = 0
+        self.state.stage_attempts = 0
+        self.state.rolling_alpha = -1.0
+
+        self.state.stage_history.append({
+            "stage": stage_id,
+            "action": action,
+            "reason": reason,
+            "batch_id": batch_id,
+            "metadata": metadata or {},
+        })
+
         self._save_state()
         return status_change
     

@@ -27,15 +27,15 @@ class DataLoader:
         """
         from src.config import config # Import here to avoid circular if any
         
-        logger.info(f">>> [Data] Fetching Market Data for {self.target_ticker}...")
+        logger.info(f"[데이터] 시장 데이터 수집: {self.target_ticker}")
         main_df = self._fetch_ohlcv(self.target_ticker)
         
         if main_df.empty:
-            logger.error(f"Failed to fetch target ticker {self.target_ticker}")
+            logger.error(f"[데이터] 대상 티커 수집 실패: {self.target_ticker}")
             return pd.DataFrame()
 
         # 1. Fetch Macro/Context from YFinance (Fast & reliable)
-        logger.info(f">>> [Data] Fetching Macro & Context Assets...")
+        logger.info("[데이터] 거시/컨텍스트 자산 수집")
         
         # Define Context Map: {Ticker: Column_Name_Prefix}
         # We want Close price for these
@@ -64,19 +64,19 @@ class DataLoader:
                 c_clean = c_df[["close"]].rename(columns={"close": f"{prefix}_close"})
                 context_dfs.append(c_clean)
             except Exception as e:
-                logger.warning(f"Failed to fetch context {ticker}: {e}")
+                logger.warning(f"[데이터] 컨텍스트 수집 실패: {ticker} ({e})")
         
         # 2. Fetch Deep Macro from FRED (Slower, requires pandas_datareader)
         # T10Y2Y (Yield Curve), UNRATE (Unemployment), FEDFUNDS (Fed Rate)
         # Using a try-except block strictly
         macro_df = pd.DataFrame()
         try:
-            logger.info(">>> [Data] Fetching Deep Macro (FRED)...")
+            logger.info("[데이터] 심화 거시(FRED) 수집")
             fred_ids = ["T10Y2Y", "UNRATE", "FEDFUNDS"]
             macro_df = self._fetch_fred(fred_ids)
             macro_df.columns = [c.lower() for c in macro_df.columns]
         except Exception as e:
-            logger.warning(f"[Data] FRED fetch skipped/failed (No API Key?): {e}. Using YFinance proxies only.")
+            logger.warning(f"[데이터] FRED 수집 실패/스킵: {e} (YFinance 대체 사용)")
 
         # 3. Merge Strategy
         df = main_df.copy()
@@ -103,7 +103,7 @@ class DataLoader:
         # Standardize columns lower case
         df.columns = [c.lower() for c in df.columns]
         
-        logger.info(f">>> [Data] Complete. Shape: {df.shape}. Columns: {list(df.columns)}")
+        logger.info(f"[데이터] 완료: shape={df.shape}, columns={list(df.columns)}")
         return df
 
     def _fetch_ohlcv(self, ticker: str) -> pd.DataFrame:
@@ -139,7 +139,7 @@ class DataLoader:
             
             return data[[c for c in wanted if c in data.columns]]
         except Exception as e:
-            logger.warning(f"YF Download Error ({ticker}): {e}")
+            logger.warning(f"[데이터] YFinance 다운로드 실패: {ticker} ({e})")
             return pd.DataFrame()
 
     def _fetch_fred(self, series_ids: List[str]) -> pd.DataFrame:

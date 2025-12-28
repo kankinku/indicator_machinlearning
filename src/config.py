@@ -42,6 +42,18 @@ class BaseConfig:
     @property
     def LOG_DIR(self) -> Path:
         return self.BASE_DIR / "logs"
+
+    @property
+    def OBSERVABILITY_DIR(self) -> Path:
+        return self.LOG_DIR / "observability"
+
+    @property
+    def INCIDENT_DIR(self) -> Path:
+        return self.LOG_DIR / "incidents"
+
+    @property
+    def HARNESS_DIR(self) -> Path:
+        return self.LOG_DIR / "harness"
     
     @property
     def FEATURE_REGISTRY_PATH(self) -> Path:
@@ -92,6 +104,7 @@ class BaseConfig:
     # ----------------------------------------
     STRICT_MODE: bool = False
     MAX_EXPERIMENTS: int = field(default_factory=lambda: int(os.getenv("MAX_EXPERIMENTS", "0")))
+    MAX_BATCHES: int = field(default_factory=lambda: int(os.getenv("MAX_BATCHES", "0")))
     SLEEP_INTERVAL: int = field(default_factory=lambda: int(os.getenv("SLEEP_INTERVAL", "1")))
     USE_FAST_MODE: bool = True
     
@@ -161,6 +174,105 @@ class BaseConfig:
     # Reward Variance Watchdog
     REWARD_STD_WINDOW: int = field(default_factory=lambda: int(os.getenv("REWARD_STD_WINDOW", "200")))
     REWARD_STD_MIN: float = field(default_factory=lambda: float(os.getenv("REWARD_STD_MIN", "0.001")))
+
+    # ----------------------------------------
+    # Observability
+    # ----------------------------------------
+    OBS_BATCH_TOP_K: int = 5
+    OBS_DEADLOCK_WINDOW: int = 20
+    OBS_DEADLOCK_MEDIAN_CYCLES_MAX: float = 1.0
+    OBS_DEADLOCK_REWARD_VARIANCE_MAX: float = 1e-4
+    OBS_DEADLOCK_GATE_PASS_MAX: float = 0.01
+    OBS_ONE_SHOT_HOLD_RATIO: float = 0.7
+    OBS_ONE_SHOT_HOLD_HORIZON_RATIO: float = 0.7
+    OBS_RARE_SIGNAL_ENTRY_COUNT_MAX: int = 1
+    OBS_RARE_SIGNAL_ENTRY_RATE_MAX: float = 0.001
+    OBS_OVERFILTER_ENTRY_RATE_MAX: float = 0.002
+    OBS_OVERFILTER_COMPLEXITY_MIN: float = 4.0
+    OBS_TRADE_COUNT_BINS: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 5, 10, 20, 50, 100])
+    OBS_CYCLE_COUNT_BINS: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 5, 10, 20, 50, 100])
+    OBS_HOLD_BARS_BINS: List[int] = field(default_factory=lambda: [0, 1, 2, 5, 10, 20, 50, 100, 200, 500])
+    OBS_REENTRY_GAP_BINS: List[int] = field(default_factory=lambda: [0, 1, 2, 5, 10, 20, 50, 100, 200, 500])
+
+    # ----------------------------------------
+    # Stage Auto-Promotion/Demotion (Batch-based)
+    # ----------------------------------------
+    STAGE_AUTO_ENABLED: bool = True
+    STAGE_AUTO_PROMOTE_STREAK: int = 1
+    STAGE_AUTO_DEMOTE_STREAK: int = 1
+    STAGE_AUTO_MIN_BATCH_INTERVAL: int = 2
+    STAGE_AUTO_PROMOTION_RULES: Dict[int, Dict[str, Any]] = field(default_factory=lambda: {
+        1: {
+            "min_median_cycle": 1.0,
+            "max_no_cycle_fail_rate": 0.6,
+            "min_reward_variance": 1e-4,
+            "nearest_gate_not_in": ["FAIL_NO_CYCLE"],
+        },
+        2: {
+            "min_agent_exit_ratio": 0.05,
+            "max_invalid_action_rate": 0.05,
+            "max_median_hold_bars": 200.0,
+        },
+        3: {
+            "min_median_cycle": 2.0,
+            "min_cost_component_mean": 0.05,
+            "min_gate_pass_rate": 0.01,
+            "max_distance_to_pass_mean": 5.0,
+            "min_wf_pass_rate": 0.2,
+        },
+    })
+    STAGE_AUTO_DEMOTION_RULES: Dict[int, Dict[str, Any]] = field(default_factory=lambda: {
+        2: {
+            "min_median_cycle": 0.5,
+            "max_no_cycle_fail_rate": 0.8,
+            "min_reward_variance": 1e-5,
+        },
+        3: {
+            "min_agent_exit_ratio": 0.02,
+            "max_invalid_action_rate": 0.1,
+            "min_median_cycle": 0.8,
+        },
+        4: {
+            "min_median_cycle": 1.0,
+            "max_invalid_action_rate": 0.1,
+            "min_reward_variance": 1e-5,
+            "min_wf_pass_rate": 0.1,
+        },
+    })
+
+    # ----------------------------------------
+    # Regression Monitor Thresholds
+    # ----------------------------------------
+    REGRESSION_HISTORY_WINDOW: int = 5
+    REGRESSION_DISTANCE_IMPROVEMENT_MIN: float = 0.05
+    REGRESSION_R1_DEADLOCK: Dict[str, float] = field(default_factory=lambda: {
+        "max_median_cycle": 1.0,
+        "max_reward_variance": 1e-4,
+        "max_gate_pass_rate": 0.01,
+    })
+    REGRESSION_R2_ONE_SHOT: Dict[str, float] = field(default_factory=lambda: {
+        "min_one_shot_hold_rate": 0.6,
+        "min_avg_hold_bars_median": 150.0,
+    })
+    REGRESSION_R3_INVALID_ACTION: Dict[str, float] = field(default_factory=lambda: {
+        "min_invalid_action_rate": 0.1,
+    })
+    REGRESSION_R4_SELECTION: Dict[str, float] = field(default_factory=lambda: {
+        "max_collision_rate": 0.6,
+        "min_diversity_mean": 0.2,
+        "max_nearest_gate_ratio": 0.8,
+    })
+
+    # ----------------------------------------
+    # Eval Harness (Regression Scenarios)
+    # ----------------------------------------
+    EVAL_HARNESS_WINDOW_BARS: int = 400
+    EVAL_HARNESS_MAX_POLICIES: int = 10
+    EVAL_HARNESS_SCENARIOS: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
+        "trend": {"score": "trend"},
+        "range": {"score": "range"},
+        "volatile": {"score": "volatile"},
+    })
     
     # =========================================================
     # [V11] Reward Shaping - 설계도 기반 전면 개선
@@ -200,7 +312,7 @@ class BaseConfig:
     # Rejection Scoring (Decomposed Penalty Vector)
     # ----------------------------------------
     REJECT_BASE_PENALTY_BY_STAGE: dict = field(default_factory=lambda: {
-        1: -15.0,
+        1: -25.0, # [V18] Lowered to show more variance in failure
         2: -30.0,
         3: -50.0,
     })
@@ -226,7 +338,7 @@ class BaseConfig:
         "FAIL_LUCKY_STRIKE": -12.0,
         "FAIL_SIGNAL_DEGENERATE": -10.0,
     })
-    REJECT_SCORE_FLOOR: float = -30.0  # [V12.3] Softened floor (-100 -> -30) to prevent death spirals
+    REJECT_SCORE_FLOOR: float = -200.0 # [V18] Extended floor to avoid clipping
     REJECT_SOFT_PENALTY_SCALE: float = 0.5
     REJECT_NEAR_PASS_MAX_FAILURES: int = 2
     REJECT_NEAR_PASS_MAX_DISTANCE: float = 0.35
@@ -244,12 +356,29 @@ class BaseConfig:
     GENOME_FEATURE_COUNT_MIN: int = 1
     GENOME_FEATURE_COUNT_MAX: int = 5
     
-    ENTRY_THRESHOLD_MIN: float = 0.45
-    ENTRY_THRESHOLD_MAX: float = 0.55
+    ENTRY_THRESHOLD_MIN: float = 0.40
+    ENTRY_THRESHOLD_MAX: float = 0.60
     
     PARAM_DEFENSIVE_WINDOW_RATIO: float = 0.5
     PARAM_SCALPING_MAX_WINDOW: int = 20
     PARAM_PANIC_MAX_WINDOW: int = 30
+
+    # Mutation operator weighting (gate-guided)
+    MUTATION_OPERATOR_BASE_WEIGHTS: Dict[str, float] = field(default_factory=lambda: {
+        "ADD_CONDITION": 1.0,
+        "REMOVE_CONDITION": 1.0,
+        "MUTATE_THRESHOLD": 1.0,
+        "SWAP_FEATURE": 1.0,
+        "CHANGE_OP": 1.0,
+    })
+    MUTATION_GATE_BIASES: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+        "FAIL_MIN_TRADES": {"REMOVE_CONDITION": 1.5, "MUTATE_THRESHOLD": 1.3},
+        "FAIL_SIGNAL_DEGENERATE": {"REMOVE_CONDITION": 1.5, "MUTATE_THRESHOLD": 1.3},
+        "FAIL_LOW_EXPOSURE": {"REMOVE_CONDITION": 1.2},
+        "FAIL_NO_CYCLE": {"REMOVE_CONDITION": 1.2},
+        "FAIL_INVALID_ACTION": {"CHANGE_OP": 1.2},
+        "FAIL_MDD_BREACH": {"ADD_CONDITION": 1.2},
+    })
     
     # [V11] Stage별 지표 풀 - 점진적 확장
     # "인기 지표 우대" ❌ / "초반 학습 가속용 Prior" ⭕
@@ -327,6 +456,9 @@ class BaseConfig:
     EVAL_WINDOW_COUNT_FULL: int = 6
     EVAL_MIN_WINDOW_BARS: int = 120
     EVAL_LOWER_QUANTILE: float = 0.2
+    # Benchmark for excess return calculation (alpha = total_return - benchmark)
+    EVAL_BENCHMARK_MODE: str = "fixed"  # "fixed" | "bh"
+    EVAL_BENCHMARK_RETURN_PCT: float = 15.0
 
     EVAL_FAST_LOOKBACK_BARS: int = 600
     EVAL_REDUCED_SLICE_BARS: int = 500
@@ -336,6 +468,12 @@ class BaseConfig:
     EVAL_REDUCED_TOP_PCT: float = 0.3
     EVAL_FULL_TOP_K: int = 0
     EVAL_FULL_EVERY: int = 3
+    EVAL_CAPS_BY_STAGE: Dict[int, Dict[str, int]] = field(default_factory=lambda: {
+        1: {"max_windows": 3, "max_risk_samples": 20, "max_wf_splits": 3},
+        2: {"max_windows": 4, "max_risk_samples": 25, "max_wf_splits": 4},
+        3: {"max_windows": 6, "max_risk_samples": 35, "max_wf_splits": 5},
+        4: {"max_windows": 8, "max_risk_samples": 40, "max_wf_splits": 6},
+    })
 
     # ----------------------------------------
     # Evaluation Cache Settings
@@ -430,6 +568,43 @@ class BaseConfig:
     VAL_MIN_TRADES_PER_YEAR: int = 6 # 연간 최소 거래 (30 -> 6)
     VAL_MIN_EXPOSURE: float = 0.02    # [Gate 2] 최소 시장 참여율 낮춤 (5% -> 2%)
     VAL_MAX_MDD_PCT: float = 50.0     # [Gate 3] 생존 최대 손실폭
+    VAL_MAX_INVALID_ACTION_RATE: float = 0.0  # Invalid action tolerance (Stage 2)
+
+    # ----------------------------------------
+    # Learning Gate (Soft) - distance-based
+    # ----------------------------------------
+    LEARNING_GATE_CODES: List[str] = field(default_factory=lambda: [
+        "FAIL_NO_CYCLE",
+        "FAIL_INVALID_ACTION",
+        "FAIL_MIN_TRADES",
+        "FAIL_LOW_EXPOSURE",
+        "FAIL_LOW_RETURN",
+        "FAIL_WINRATE_LOW",
+        "FAIL_WINRATE_HIGH",
+        "FAIL_MDD_BREACH",
+        "FAIL_PF",
+        "FAIL_LUCKY_STRIKE",
+        "FAIL_SIGNAL_DEGENERATE",
+    ])
+    LEARNING_GATE_DISTANCE_WEIGHTS: Dict[str, float] = field(default_factory=lambda: {
+        "FAIL_NO_CYCLE": 1.0,
+        "FAIL_INVALID_ACTION": 1.0,
+        "FAIL_MIN_TRADES": 1.0,
+        "FAIL_LOW_EXPOSURE": 1.0,
+        "FAIL_LOW_RETURN": 1.0,
+        "FAIL_WINRATE_LOW": 1.0,
+        "FAIL_WINRATE_HIGH": 1.0,
+        "FAIL_MDD_BREACH": 1.0,
+        "FAIL_PF": 1.0,
+        "FAIL_LUCKY_STRIKE": 1.0,
+        "FAIL_SIGNAL_DEGENERATE": 1.5,
+    })
+    LEARNING_GATE_SCORE_SCALE: float = 1.0
+    SELECTION_SOFT_GATE_TOP_K: int = 5
+    SELECTION_W_PERFORMANCE: float = 1.0
+    SELECTION_W_PROGRESS: float = 1.0
+    SELECTION_W_ROBUSTNESS: float = 1.0
+    SELECTION_W_DIVERSITY: float = 0.5
 
     # [V10] 승률 범위 제한 (추세 추종 전략을 위해 하한 대폭 완화)
     VAL_WINRATE_MIN: float = 0.30     # [V10] 최소 승률 하향 (0.35 -> 0.30)
@@ -483,11 +658,11 @@ class BaseConfig:
             stage_id=1,
             name="Discovery",
             target_return_pct=10.0,     # [V12.3] Lowered target (15 -> 10) to focus on structural integrity
-            alpha_floor=-10.0,          # [V12.3] Very soft alpha floor
-            min_trades_per_year=4.0,    # [V12.3] Lowered (6 -> 4) to allow emerging signals
+            alpha_floor=-60.0,          # [V21] Relaxed to prevent alpha gate from blocking Stage 1 discovery
+            min_trades_per_year=2.0,    # [V18] Relaxed (4 -> 2) to help unblock learning
             max_mdd_pct=50.0,           # [V12.3] Relaxed MDD (40 -> 50)
-            min_profit_factor=0.9,      # [V12.3] Relaxed PF (1.0 -> 0.9)
-            and_terms_range=(1, 2),
+            min_profit_factor=0.8,      # [V18] Relaxed (1.0 -> 0.8)
+            and_terms_range=(1, 1),
             quantile_bias="center",
             wf_splits=3,
             wf_gate_mode="soft",
@@ -500,10 +675,10 @@ class BaseConfig:
             name="Survival",
             target_return_pct=30.0,
             alpha_floor=0.0,
-            min_trades_per_year=12.0,
+            min_trades_per_year=8.0,
             max_mdd_pct=25.0,
             min_profit_factor=1.1,
-            and_terms_range=(2, 3),
+            and_terms_range=(1, 2),
             quantile_bias="spread",
             wf_splits=3,
             wf_gate_mode="soft",
@@ -515,16 +690,32 @@ class BaseConfig:
             stage_id=3,
             name="Deployment",
             target_return_pct=60.0,
-            alpha_floor=15.0,           # High edge required
-            min_trades_per_year=15.0,
+            alpha_floor=10.0,           # High edge required
+            min_trades_per_year=12.0,
             max_mdd_pct=15.0,
             min_profit_factor=1.3,
-            and_terms_range=(2, 4),
+            and_terms_range=(2, 3),
             quantile_bias="tail",
             wf_splits=5,
             wf_gate_mode="hard",
             exploration_slot=0.1,
             reject_base_penalty=-50.0,
+            signal_degeneracy_mode="hard"
+        ),
+        4: StageSpec(
+            stage_id=4,
+            name="RobustAlpha",
+            target_return_pct=80.0,
+            alpha_floor=15.0,
+            min_trades_per_year=15.0,
+            max_mdd_pct=12.0,
+            min_profit_factor=1.5,
+            and_terms_range=(2, 3),
+            quantile_bias="tail",
+            wf_splits=5,
+            wf_gate_mode="hard",
+            exploration_slot=0.05,
+            reject_base_penalty=-60.0,
             signal_degeneracy_mode="hard"
         )
     })
@@ -534,7 +725,7 @@ class BaseConfig:
     # [V14] Failure Taxonomy Tree
     # Categories: SIGNAL, EDGE, RISK, COMPLEXITY, DATA
     FAILURE_TAXONOMY: dict = field(default_factory=lambda: {
-        "SIGNAL_ISSUE": ["FAIL_MIN_TRADES", "FAIL_LOW_EXPOSURE", "FAIL_ZERO_EXPOSURE", "FAIL_OVER_EXPOSURE", "FAIL_SIGNAL_DEGENERATE"],
+        "SIGNAL_ISSUE": ["FAIL_NO_CYCLE", "FAIL_INVALID_ACTION", "FAIL_MIN_TRADES", "FAIL_LOW_EXPOSURE", "FAIL_ZERO_EXPOSURE", "FAIL_OVER_EXPOSURE", "FAIL_SIGNAL_DEGENERATE"],
         "EDGE_ISSUE": ["FAIL_LOW_RETURN", "FAIL_NEG_ALPHA", "FAIL_PF", "FAIL_WINRATE_LOW", "FAIL_WINRATE_HIGH"],
         "RISK_ISSUE": ["FAIL_MDD_BREACH", "FAIL_LUCKY_STRIKE", "FAIL_WORST_WINDOW"],
         "COMPLEXITY_ISSUE": ["FAIL_COMPLEXITY_HIGH", "FAIL_AST_DEPTH"],
@@ -674,8 +865,9 @@ class BaseConfig:
 
     # (Deprecated but kept for backward compatibility)
     EVAL_ENTRY_THRESHOLD: float = 0.50
-    EVAL_ENTRY_MAX_PROB: float = 0.9
-    EVAL_SCORE_MIN: float = -15.0     # [V10] 하한값 현실화 (-9999 -> -15)
+    EVAL_ENTRY_MAX_PROB: float = 1.0     # [V18] Restored missing attribute
+    EVAL_SCORE_MIN: float = -100.0     # [V18] Lowered floor to allow variance in failure scores
+    EVAL_CACHE_VERSION: int = 2
     
     # [Backward Compatibility Aliases] Old names -> New names
     EVAL_MIN_TRADES: int = 30         # -> VAL_MIN_TRADES
@@ -726,6 +918,9 @@ class BaseConfig:
         self.LEDGER_DIR.mkdir(parents=True, exist_ok=True)
         self.ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
         self.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        self.OBSERVABILITY_DIR.mkdir(parents=True, exist_ok=True)
+        self.INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
+        self.HARNESS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass

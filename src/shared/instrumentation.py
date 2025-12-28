@@ -34,6 +34,8 @@ class BatchMetrics:
     # Trades
     mean_trades_topk: float = 0.0
     zero_trade_ratio: float = 0.0
+    mean_cycles_topk: float = 0.0
+    zero_cycle_ratio: float = 0.0
     
     # Diversity
     diversity_mean_jaccard: float = 0.0
@@ -65,7 +67,7 @@ class BatchInstrumentation:
             n_policies=n_policies
         )
         self._batch_start_time = time.time()
-        logger.info(f"=== [INSTRUMENTATION] Batch {batch_id} Started (Seed: {seed}, Pols: {n_policies}) ===")
+        logger.info(f"[계측] 배치 시작: {batch_id} (시드 {seed}, 정책 {n_policies})")
 
     def end_batch(self):
         if not self.current_metrics:
@@ -80,7 +82,11 @@ class BatchInstrumentation:
         with open(self.history_file, "a") as f:
             f.write(self.current_metrics.to_jsonl() + "\n")
             
-        logger.info(f"=== [INSTRUMENTATION] Batch {self.current_metrics.batch_id} End: {self.current_metrics.total_time:.2f}s (S1: {self.current_metrics.stage1_time:.2f}s, S2: {self.current_metrics.stage2_time:.2f}s, OH: {self.current_metrics.overhead_time:.2f}s) ===")
+        logger.info(
+            f"[계측] 배치 종료: {self.current_metrics.batch_id} "
+            f"(총 {self.current_metrics.total_time:.2f}s, S1 {self.current_metrics.stage1_time:.2f}s, "
+            f"S2 {self.current_metrics.stage2_time:.2f}s, 기타 {self.current_metrics.overhead_time:.2f}s)"
+        )
         self.current_metrics = None
 
     def record_stage1(self, duration: float, pass_rate: float):
@@ -103,6 +109,11 @@ class BatchInstrumentation:
         if self.current_metrics:
             self.current_metrics.mean_trades_topk = mean_trades
             self.current_metrics.zero_trade_ratio = zero_ratio
+
+    def record_cycles(self, mean_cycles: float, zero_ratio: float):
+        if self.current_metrics:
+            self.current_metrics.mean_cycles_topk = mean_cycles
+            self.current_metrics.zero_cycle_ratio = zero_ratio
 
     def record_diversity(self, mean_jaccard: float, duplicate_ratio: float):
         if self.current_metrics:

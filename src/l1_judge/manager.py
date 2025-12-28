@@ -114,7 +114,7 @@ class OprManagerRL:
             with open(self.storage_path, "w") as f:
                 json.dump(serializable, f)
         except Exception as e:
-            logger.error(f"Failed to save L1 Q-Table: {e}")
+            logger.error(f"[L1] Q-Table 저장 실패: {e}")
 
     def load(self):
         if self.storage_path.exists():

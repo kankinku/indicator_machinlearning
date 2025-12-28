@@ -128,7 +128,7 @@ def _run_experiment_core(
         error_type = error_info.get("type", "unknown")
         error_key = error_info.get("feature_key", "unknown")
         
-        logger.warning(f"[Experiment] FEATURE_MISSING detected: {error_type} for '{error_key}'")
+        logger.warning(f"[실험] 특징 누락 감지: {error_type} ('{error_key}')")
         
         # 실패 결과 구조 (REJECT 처리용)
         return {
@@ -171,8 +171,17 @@ def _run_experiment_core(
         }
     
     # 2. Run Deterministic Backtest
+    from src.shared.backtest import derive_trade_params
+    tp_pct, sl_pct, horizon = derive_trade_params(risk_budget)
     bt_engine = DeterministicBacktestEngine()
-    bt_result = bt_engine.run(df["close"], entry_sig, exit_sig)
+    bt_result = bt_engine.run(
+        df["close"],
+        entry_sig,
+        exit_sig,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        max_hold_bars=horizon,
+    )
     
     # 3. Format results for ledger
     results_df = pd.DataFrame({
@@ -187,9 +196,15 @@ def _run_experiment_core(
     if bt_result.trades_per_year < 2.0 or bt_result.trades_per_year > 300.0:
         pass # Rejection handled by validate_sample later
         
+    from src.shared.observability import compute_cycle_stats
+    _, cycle_stats = compute_cycle_stats(bt_result.trades, len(df))
+
     # metrics for scoring
     cpcv = {
         "n_trades": bt_result.trade_count,
+        "cycle_count": cycle_stats.get("cycle_count", 0),
+        "entry_count": cycle_stats.get("entry_count", 0),
+        "exit_count": cycle_stats.get("exit_count", 0),
         "win_rate": bt_result.win_rate,
         "total_return_pct": bt_result.total_return,
         "mdd_pct": bt_result.mdd,
@@ -199,6 +214,8 @@ def _run_experiment_core(
         "complexity_score": complexity,
         "trades_per_year": bt_result.trades_per_year, # [V13.5]
         "excess_return": bt_result.excess_return,     # [V13.5]
+        "invalid_action_count": getattr(bt_result, "invalid_action_count", 0),
+        "invalid_action_rate": getattr(bt_result, "invalid_action_rate", 0.0),
         "oos_bars": len(df),
     }
 
@@ -353,7 +370,12 @@ def build_record_and_artifact(
             trade_count=n_trades,
             valid_trade_count=cpcv.get("valid_trade_count", n_trades),
             win_rate=win_rate,
-            reward_risk=rr
+            reward_risk=rr,
+            cycle_count=int(cpcv.get("cycle_count", n_trades)),
+            entry_count=int(cpcv.get("entry_count", n_trades)),
+            exit_count=int(cpcv.get("exit_count", n_trades)),
+            invalid_action_count=int(cpcv.get("invalid_action_count", 0)),
+            invalid_action_rate=float(cpcv.get("invalid_action_rate", 0.0)),
         ),
         equity=EquityStats(
             total_return_pct=total_ret,
@@ -476,9 +498,9 @@ def run_experiment(
         shock_series = (df["close"] < bb_lower).astype(float)
         X_features["_CTX_ShockFlag"] = shock_series.reindex(X_features.index).fillna(0.0)
         
-        logger.debug(f"[Experiment] Injected Optimized Global Context Features")
+        logger.debug("[실험] 최적화된 글로벌 컨텍스트 주입")
     except Exception as e:
-        logger.warning(f"[Experiment] Context Injection failed: {e}")
+        logger.warning(f"[실험] 컨텍스트 주입 실패: {e}")
 
     core = _run_experiment_core(
         policy_spec=policy_spec,
@@ -508,6 +530,9 @@ def run_experiment(
 
     total_time = time.time() - t0
     t_train = core.get("t_train", 0.0)
-    logger.info(f"[Perf] Exp {policy_spec.archetype} | Total: {total_time:.2f}s | Feat: {t1-t0:.2f}s | Train: {t_train:.2f}s | Trades: {core.get('n_trades', 0)} | WinRate: {core.get('win_rate', 0):.1%}")
+    logger.info(
+        f"[성능] {policy_spec.archetype} | 총 {total_time:.2f}s | 특징 {t1-t0:.2f}s | 학습 {t_train:.2f}s "
+        f"| 거래 {core.get('n_trades', 0)} | 승률 {core.get('win_rate', 0):.1%}"
+    )
 
     return ledger_record, artifact

@@ -44,6 +44,15 @@ class ValidationFailure:
     is_hard: bool = True
 
 
+@dataclass(frozen=True)
+class GateDiagnostics:
+    approval_pass: bool
+    hard_fail_reasons: List[str]
+    distances: Dict[str, float]
+    soft_gate_score: float
+    nearest_gate: str
+
+
 # [V16] SampleMetrics is now an alias for WindowMetrics from src.shared.metrics
 
 
@@ -242,9 +251,30 @@ def _collect_validation_failures_raw(
     trade_count: int,
     entry_signal_rate: float,
     percent_in_market: float,
+    cycle_count: int,
+    invalid_action_rate: float,
     stage_cfg: object,
 ) -> List[ValidationFailure]:
     failures: List[ValidationFailure] = []
+
+    # 0. Cycle Gate (SSOT: cycle_count == 0 is not learnable)
+    if cycle_count <= 0:
+        failures.append(ValidationFailure(
+            code="FAIL_NO_CYCLE",
+            detail="cycle_count=0",
+            distance=1.0,
+            is_hard=True,
+        ))
+
+    # 0.1 Invalid Action Gate (State mismatch)
+    max_invalid_rate = float(getattr(config, "VAL_MAX_INVALID_ACTION_RATE", 0.0))
+    if invalid_action_rate > max_invalid_rate:
+        failures.append(ValidationFailure(
+            code="FAIL_INVALID_ACTION",
+            detail=f"invalid_action_rate={invalid_action_rate:.3f} > {max_invalid_rate:.3f}",
+            distance=float(invalid_action_rate - max_invalid_rate),
+            is_hard=True,
+        ))
 
     # 1. Minimum Activity (Annualized)
     min_tpy = getattr(stage_cfg, "min_trades_per_year", 2.0)
@@ -267,7 +297,10 @@ def _collect_validation_failures_raw(
         ))
 
     # 3. Excess Return PA Gate (Stage Dependent)
-    min_excess = getattr(stage_cfg, "min_excess_return_pa", 0.0)
+    min_excess = getattr(stage_cfg, "min_excess_return_pa", None)
+    if min_excess is None:
+        # Align gate with StageSpec alpha_floor when min_excess_return_pa is not defined.
+        min_excess = getattr(stage_cfg, "alpha_floor", 0.0)
     if excess_return < min_excess:
         denom = max(1.0, abs(min_excess))
         failures.append(ValidationFailure(
@@ -343,6 +376,94 @@ def _collect_validation_failures_raw(
     return failures
 
 
+def _compute_gate_distances(metrics: SampleMetrics, stage_cfg: object) -> Dict[str, float]:
+    distances: Dict[str, float] = {}
+
+    cycle_count = int(getattr(metrics.trades, "cycle_count", 0))
+    invalid_action_rate = float(getattr(metrics.trades, "invalid_action_rate", 0.0))
+    trades_per_year = float(getattr(metrics.trades, "trades_per_year", 0.0))
+    exposure_ratio = float(getattr(metrics.equity, "exposure_ratio", 0.0))
+    excess_return = float(getattr(metrics.equity, "excess_return", 0.0))
+    win_rate = float(getattr(metrics.trades, "win_rate", 0.0))
+    max_drawdown_pct = float(getattr(metrics.equity, "max_drawdown_pct", 0.0))
+    profit_factor = float(getattr(metrics.trades, "profit_factor", 1.0))
+    top1_share = float(getattr(metrics.trades, "top1_share", 0.0))
+    trade_count = int(getattr(metrics.trades, "trade_count", 0))
+    entry_signal_rate = float(getattr(metrics.trades, "entry_signal_rate", 0.0))
+    percent_in_market = float(getattr(metrics.equity, "percent_in_market", exposure_ratio))
+
+    min_tpy = float(getattr(stage_cfg, "min_trades_per_year", 0.0))
+    min_exp = float(getattr(stage_cfg, "min_exposure", config.VAL_MIN_EXPOSURE))
+    min_excess = getattr(stage_cfg, "min_excess_return_pa", None)
+    if min_excess is None:
+        min_excess = getattr(stage_cfg, "alpha_floor", 0.0)
+    min_excess = float(min_excess)
+    max_mdd = float(getattr(stage_cfg, "max_mdd_pct", config.VAL_MAX_MDD_PCT))
+    min_pf = float(getattr(stage_cfg, "min_profit_factor", 1.0))
+    max_invalid_rate = float(getattr(config, "VAL_MAX_INVALID_ACTION_RATE", 0.0))
+
+    distances["FAIL_NO_CYCLE"] = float(max(0, 1 - cycle_count))
+    distances["FAIL_INVALID_ACTION"] = float(max(0.0, invalid_action_rate - max_invalid_rate))
+    distances["FAIL_MIN_TRADES"] = float(max(0.0, min_tpy - trades_per_year))
+    distances["FAIL_LOW_EXPOSURE"] = float(max(0.0, min_exp - exposure_ratio))
+    distances["FAIL_LOW_RETURN"] = float(max(0.0, min_excess - excess_return))
+    distances["FAIL_WINRATE_LOW"] = float(max(0.0, config.VAL_WINRATE_MIN - win_rate))
+    distances["FAIL_WINRATE_HIGH"] = float(max(0.0, win_rate - config.VAL_WINRATE_MAX))
+    distances["FAIL_MDD_BREACH"] = float(max(0.0, max_drawdown_pct - max_mdd))
+    distances["FAIL_PF"] = float(max(0.0, min_pf - profit_factor))
+    distances["FAIL_LUCKY_STRIKE"] = float(max(0.0, top1_share - config.ANTILUCK_TOP1_SHARE_MAX))
+
+    deg_min_trades = float(getattr(config, "SIGNAL_DEGENERATE_MIN_TRADES", 5))
+    deg_min_rate = float(getattr(config, "SIGNAL_DEGENERATE_MIN_ENTRY_RATE", 0.002))
+    deg_min_pct = float(getattr(config, "SIGNAL_DEGENERATE_MIN_PCT_IN_MARKET", 0.01))
+    deg_dist = max(
+        _ratio_below(float(trade_count), deg_min_trades),
+        _ratio_below(entry_signal_rate, deg_min_rate),
+        _ratio_below(percent_in_market, deg_min_pct),
+    )
+    distances["FAIL_SIGNAL_DEGENERATE"] = float(max(0.0, deg_dist))
+
+    return distances
+
+
+def compute_gate_diagnostics(metrics: SampleMetrics) -> GateDiagnostics:
+    curr_stage = getattr(config, "CURRICULUM_CURRENT_STAGE", 1)
+    stage_cfg = config.CURRICULUM_STAGES.get(curr_stage, {})
+
+    failures = collect_validation_failures(metrics)
+    hard_failures = [f.code for f in failures if f.is_hard]
+    approval_pass = len(hard_failures) == 0
+
+    distances = _compute_gate_distances(metrics, stage_cfg)
+    weights = getattr(config, "LEARNING_GATE_DISTANCE_WEIGHTS", {})
+    codes = getattr(config, "LEARNING_GATE_CODES", list(distances.keys()))
+    scale = float(getattr(config, "LEARNING_GATE_SCORE_SCALE", 1.0))
+
+    soft_gate_score = 0.0
+    for code in codes:
+        dist = float(max(0.0, distances.get(code, 0.0)))
+        weight = float(weights.get(code, 1.0))
+        soft_gate_score -= weight * dist
+    soft_gate_score *= scale
+
+    nearest_gate = "PASS"
+    max_distance = 0.0
+    for code, dist in distances.items():
+        if dist > max_distance:
+            max_distance = dist
+            nearest_gate = code
+    if max_distance <= 0.0:
+        nearest_gate = "PASS"
+
+    return GateDiagnostics(
+        approval_pass=approval_pass,
+        hard_fail_reasons=hard_failures,
+        distances=distances,
+        soft_gate_score=float(soft_gate_score),
+        nearest_gate=nearest_gate,
+    )
+
+
 def collect_validation_failures(metrics: SampleMetrics) -> List[ValidationFailure]:
     curr_stage = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
     stage_cfg = config.CURRICULUM_STAGES.get(curr_stage, {})
@@ -357,6 +478,8 @@ def collect_validation_failures(metrics: SampleMetrics) -> List[ValidationFailur
         trade_count=metrics.trades.trade_count,
         entry_signal_rate=metrics.trades.entry_signal_rate,
         percent_in_market=metrics.equity.percent_in_market,
+        cycle_count=getattr(metrics.trades, "cycle_count", 0),
+        invalid_action_rate=getattr(metrics.trades, "invalid_action_rate", 0.0),
         stage_cfg=stage_cfg,
     )
 
@@ -365,6 +488,7 @@ def collect_validation_failures_from_dict(metrics: Dict[str, float]) -> List[Val
     curr_stage = getattr(config, 'CURRICULUM_CURRENT_STAGE', 1)
     stage_cfg = config.CURRICULUM_STAGES.get(curr_stage, {})
     trade_count = int(metrics.get("n_trades", metrics.get("trade_count", 0)))
+    cycle_count = int(metrics.get("cycle_count", trade_count))
     oos_bars = int(metrics.get("oos_bars", 252))
     entry_rate = metrics.get("entry_signal_rate", trade_count / max(1, oos_bars))
     percent_in_market = metrics.get("percent_in_market", metrics.get("exposure_ratio", 0.0))
@@ -379,6 +503,8 @@ def collect_validation_failures_from_dict(metrics: Dict[str, float]) -> List[Val
         trade_count=trade_count,
         entry_signal_rate=float(entry_rate),
         percent_in_market=float(percent_in_market),
+        cycle_count=cycle_count,
+        invalid_action_rate=float(metrics.get("invalid_action_rate", 0.0)),
         stage_cfg=stage_cfg,
     )
 
@@ -508,6 +634,10 @@ def normalize_scores(scores: List[float]) -> List[float]:
 
 
 def is_violation(metrics: SampleMetrics) -> bool:
+    if getattr(metrics.trades, "invalid_action_rate", 0.0) > float(getattr(config, "VAL_MAX_INVALID_ACTION_RATE", 0.0)):
+        return True
+    if getattr(metrics.trades, "cycle_count", metrics.trades.trade_count) <= 0:
+        return True
     if metrics.trades.trade_count < config.VAL_MIN_TRADES:
         return True
     if metrics.equity.max_drawdown_pct > config.VAL_MAX_MDD_PCT:

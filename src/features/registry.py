@@ -60,7 +60,7 @@ def get_registry(registry_path: Optional[str] = None) -> "FeatureRegistry":
                 
                 _registry_instance = FeatureRegistry(registry_path)
                 _registry_instance.initialize()
-                logger.info(f"[Singleton] FeatureRegistry initialized at {registry_path}")
+                logger.info(f"[FeatureRegistry] 초기화 완료: {registry_path}")
     
     return _registry_instance
 
@@ -74,7 +74,7 @@ def inject_registry(registry: "FeatureRegistry") -> None:
     global _registry_instance
     with _registry_lock:
         _registry_instance = registry
-        logger.debug("[Singleton] FeatureRegistry instance injected.")
+        logger.debug("[FeatureRegistry] 인스턴스 주입 완료.")
 
 
 def reset_registry() -> None:
@@ -85,7 +85,7 @@ def reset_registry() -> None:
     global _registry_instance
     with _registry_lock:
         _registry_instance = None
-        logger.warning("[Singleton] FeatureRegistry instance reset. Use only for testing.")
+        logger.warning("[FeatureRegistry] 인스턴스 리셋(테스트 전용).")
 
 
 class FeatureRegistry:
@@ -130,7 +130,7 @@ class FeatureRegistry:
             from src.features.custom.loader import loader as custom_loader
             custom_loader.register_into_registry(self)
         except Exception as e:
-            logger.warning(f"Custom feature registration skipped: {e}")
+            logger.warning(f"[FeatureRegistry] 커스텀 특징 등록 스킵: {e}")
 
     def register(self, metadata: FeatureMetadata, overwrite: bool = False):
         """
@@ -146,10 +146,10 @@ class FeatureRegistry:
         if undefined_fields:
             msg = f"[Genome v2] Feature '{metadata.feature_id}' has undefined semantics: {undefined_fields}"
             if config.STRICT_MODE:
-                logger.error(f"  REJECTED: {msg}. Define State/Transition/Causality before registration.")
+                logger.error(f"[FeatureRegistry] 등록 거절: {msg} (State/Transition/Causality 정의 필요)")
                 raise ValueError(msg)
             else:
-                logger.warning(f"  LACKING_DNA: {msg}. This feature may be retired in future phases.")
+                logger.warning(f"[FeatureRegistry] DNA 부족: {msg} (추후 폐기 가능)")
 
         with self._lock:
             if not overwrite and metadata.feature_id in self._features:
@@ -157,7 +157,7 @@ class FeatureRegistry:
             
             self._features[metadata.feature_id] = metadata
             self._save_to_disk()
-            logger.info(f"Registered feature: {metadata.feature_id} ({metadata.name})")
+            logger.info(f"[FeatureRegistry] 특징 등록: {metadata.feature_id} ({metadata.name})")
 
     def register_runtime(self, metadata: FeatureMetadata, handler_cls: Type, overwrite: bool = False) -> None:
         """
@@ -170,7 +170,7 @@ class FeatureRegistry:
 
             self._features[metadata.feature_id] = metadata
             self._handler_cache[metadata.feature_id] = handler_cls
-            logger.info(f"Registered runtime feature: {metadata.feature_id} ({metadata.name})")
+            logger.info(f"[FeatureRegistry] 런타임 특징 등록: {metadata.feature_id} ({metadata.name})")
 
     def get(self, feature_id: str) -> Optional[FeatureMetadata]:
         if not self._loaded:
@@ -207,7 +207,7 @@ class FeatureRegistry:
                 
             return handler_cls
         except Exception as e:
-            logger.error(f"Failed to compile handler for {feature_id}: {e}")
+            logger.error(f"[FeatureRegistry] 핸들러 컴파일 실패: {feature_id} ({e})")
             return None
 
     def warmup(self):
@@ -218,12 +218,12 @@ class FeatureRegistry:
         if not self._loaded:
             self.initialize()
             
-        logger.info("[Registry] Warming up handlers...")
+        logger.info("[FeatureRegistry] 핸들러 사전 컴파일 시작")
         count = 0
         for feature_id in self._features:
             if self.get_handler(feature_id):
                 count += 1
-        logger.info(f"[Registry] Warmup complete. Compiled {count}/{len(self._features)} handlers.")
+        logger.info(f"[FeatureRegistry] 핸들러 사전 컴파일 완료: {count}/{len(self._features)}")
 
     def list_all(self) -> List[FeatureMetadata]:
         if not self._loaded:
@@ -238,7 +238,7 @@ class FeatureRegistry:
     def _load_from_disk(self):
         if not os.path.exists(self.registry_path):
             self._features = {}
-            logger.warning(f"Registry file not found at {self.registry_path}. Starting empty.")
+            logger.warning(f"[FeatureRegistry] 레지스트리 파일 없음: {self.registry_path} (빈 상태로 시작)")
             return
 
         try:
@@ -256,10 +256,10 @@ class FeatureRegistry:
                 meta = FeatureMetadata(**item)
                 self._features[meta.feature_id] = meta
                 
-            logger.debug(f"Loaded {len(self._features)} features from registry.")
+            logger.debug(f"[FeatureRegistry] 로드 완료: {len(self._features)}개")
             
         except Exception as e:
-            logger.error(f"Failed to load registry: {e}")
+            logger.error(f"[FeatureRegistry] 로드 실패: {e}")
             raise e
 
     def _save_to_disk(self):
@@ -278,7 +278,7 @@ class FeatureRegistry:
             with open(self.registry_path, 'w', encoding='utf-8') as f:
                 json.dump(serializable_data, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            logger.error(f"Failed to save registry: {e}")
+            logger.error(f"[FeatureRegistry] 저장 실패: {e}")
             raise e
 
     def __getstate__(self):

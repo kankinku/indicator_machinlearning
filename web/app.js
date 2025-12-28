@@ -110,9 +110,9 @@ const app = {
     },
 
     renderSystemStatus: function (data) {
-        const statusEl = document.getElementById('system-monitor-section');
-        if (!statusEl) return;
-        statusEl.style.display = 'block';
+        const rowEl = document.getElementById('dash-top-row');
+        if (!rowEl) return;
+        rowEl.style.display = 'flex';
 
         const c = data.curriculum;
         const e = data.epsilon;
@@ -156,24 +156,18 @@ const app = {
     },
 
     renderDiagnostics: function (data) {
-        const section = document.getElementById('diag-section');
-        if (!section) return;
-
         const summary = data.summary;
         if (!summary || summary.status === "UNKNOWN") {
-            section.style.display = 'none';
             return;
         }
 
-        section.style.display = 'block';
-
         const statusEl = document.getElementById('diag-status');
-        statusEl.textContent = summary.status;
-
-        // Clean class list and add new status
-        statusEl.className = 'status-badge';
-        const cleanStatus = summary.status.toLowerCase().replace(/[^a-z0-9_]/g, '');
-        statusEl.classList.add(`status-${cleanStatus}`);
+        if (statusEl) {
+            statusEl.textContent = summary.status;
+            statusEl.className = 'status-badge';
+            const cleanStatus = summary.status.toLowerCase().replace(/[^a-z0-9_]/g, '');
+            statusEl.classList.add(`status-${cleanStatus}`);
+        }
 
         document.getElementById('diag-pass-rate').textContent = (summary.pass_rate * 100).toFixed(1) + '%';
         document.getElementById('diag-rej-rate').textContent = (summary.rej_rate * 100).toFixed(1) + '%';
@@ -183,30 +177,23 @@ const app = {
             : '0%';
         document.getElementById('diag-sim-rate').textContent = simRate;
 
-        // Render Taxonomy Bars
+        // Render Taxonomy Horizontal Pills
         const container = document.getElementById('diag-taxonomy-bars');
-        container.innerHTML = '';
-
-        if (summary.taxonomy) {
-            // Sort taxonomy by count descending
-            const entries = Object.entries(summary.taxonomy).sort((a, b) => b[1] - a[1]);
-            entries.forEach(([issue, count]) => {
-                const totalRej = Object.values(summary.taxonomy).reduce((a, b) => a + b, 0);
-                const barPct = totalRej > 0 ? (count / totalRej) * 100 : 0;
-
-                const item = document.createElement('div');
-                item.className = 'tax-item';
-                item.innerHTML = `
-                    <div class="tax-row">
-                        <span class="tax-label">${issue.replace('FAIL_', '').replace('_', ' ')}</span>
-                        <span class="tax-count">${count}</span>
-                    </div>
-                    <div class="tax-bar-bg">
-                        <div class="tax-bar-fill" style="width: ${barPct}%"></div>
-                    </div>
-                `;
-                container.appendChild(item);
-            });
+        if (container) {
+            container.innerHTML = '';
+            if (summary.taxonomy) {
+                const entries = Object.entries(summary.taxonomy).sort((a, b) => b[1] - a[1]);
+                entries.forEach(([issue, count]) => {
+                    const pill = document.createElement('div');
+                    pill.className = 'tax-pill';
+                    const displayLabel = issue.replace(/_/g, ' ');
+                    pill.innerHTML = `
+                        <span class="tax-pill-name">${displayLabel}</span>
+                        <span class="tax-pill-val">${count}</span>
+                    `;
+                    container.appendChild(pill);
+                });
+            }
         }
     },
 
@@ -821,7 +808,7 @@ const app = {
         if (title) title.textContent = `${model.origin} Strategy`;
 
         // Clear previous results
-        ['m-total-return', 'm-entry-signals', 'm-trades', 'm-winrate', 'm-mdd'].forEach(id => {
+        ['m-total-return', 'm-entry-signals', 'm-trades', 'm-winrate', 'm-mdd', 'm-pf', 'm-tpy'].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.textContent = '-';
         });
@@ -933,6 +920,8 @@ const app = {
         document.getElementById('m-trades').textContent = metrics.trade_count;
         document.getElementById('m-winrate').textContent = (metrics.win_rate * 100).toFixed(1) + '%';
         document.getElementById('m-mdd').textContent = metrics.mdd_pct.toFixed(2) + '%';
+        document.getElementById('m-pf').textContent = metrics.profit_factor.toFixed(2);
+        document.getElementById('m-tpy').textContent = metrics.trades_per_year.toFixed(1);
 
         // Gate Status UI
         const gateEl = document.getElementById('model-gate-status');

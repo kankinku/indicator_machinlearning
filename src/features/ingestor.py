@@ -53,11 +53,11 @@ class CodeIngestor:
                 tags=[]
             )
             
-            logger.info(f"Successfully ingested feature: {feature_id}")
+            logger.info(f"[Feature] 인제스트 완료: {feature_id}")
             return metadata
             
         except Exception as e:
-            logger.error(f"Failed to ingest snippet for {name}: {e}")
+            logger.error(f"[Feature] 인제스트 실패: {name} ({e})")
             return None
 
     def _validate_syntax(self, code: str):

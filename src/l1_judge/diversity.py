@@ -1,6 +1,6 @@
 from __future__ import annotations
 import numpy as np
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from src.contracts import PolicySpec
 from src.config import config
 from src.shared.logger import get_logger
@@ -61,11 +61,40 @@ def calculate_param_similarity(p1: PolicySpec, p2: PolicySpec) -> float:
     # 유사도 = 1 - 평균 거리
     return max(0.0, 1.0 - avg_dist)
 
+def compute_robustness_score(candidate: Any, stage_cfg: object) -> float:
+    window_results = getattr(candidate, "window_results", []) or []
+    if not window_results:
+        return 0.0
+
+    alpha_floor = float(getattr(stage_cfg, "alpha_floor", -10.0))
+    consistency = np.mean([1.0 if w.avg_alpha >= alpha_floor else 0.0 for w in window_results])
+    violation_rate = np.mean([w.violation_rate for w in window_results])
+    return float(consistency - violation_rate)
+
+
+def compute_selection_score(candidate: Any, gate_diag: object, stage_cfg: object) -> float:
+    reward_breakdown = getattr(candidate, "reward_breakdown", None)
+    reward_total = None
+    if isinstance(reward_breakdown, dict):
+        reward_total = reward_breakdown.get("total")
+    performance = float(reward_total if reward_total is not None else getattr(candidate, "score", 0.0))
+    progress = float(getattr(gate_diag, "soft_gate_score", 0.0))
+    robustness = compute_robustness_score(candidate, stage_cfg)
+
+    w_perf = float(getattr(config, "SELECTION_W_PERFORMANCE", 1.0))
+    w_prog = float(getattr(config, "SELECTION_W_PROGRESS", 1.0))
+    w_rob = float(getattr(config, "SELECTION_W_ROBUSTNESS", 1.0))
+
+    return (w_perf * performance) + (w_prog * progress) + (w_rob * robustness)
+
+
 def select_diverse_top_k(
     candidates: List[Any], # List[ModuleResult] or List[ExperimentResult]
     k: int,
     jaccard_th: float = 0.7,
     param_th: float = 0.1, # Not used as similarity but distance if we want
+    gate_diag_map: Optional[Dict[str, object]] = None,
+    seed: Optional[List[Any]] = None,
 ) -> Tuple[List[Any], Dict[str, Any]]:
     """
     유사도 제약을 고려하여 상위 K개를 선택합니다.
@@ -74,46 +103,83 @@ def select_diverse_top_k(
     if not candidates:
         return [], {"collision_count": 0, "avg_jaccard": 0.0}
         
-    # [vAlpha+] Sort by Economic Quality (AOS) if available, otherwise raw score
-    # We use a blend to ensure we don't completely ignore high score strategies with low AOS (novelty)
-    def selection_sort_key(x):
-        aos = getattr(x, 'aos_score', 0.1) # Small default for novelty
-        return (x.score * (0.5 + 0.5 * aos))
-        
-    sorted_candidates = sorted(candidates, key=selection_sort_key, reverse=True)
-    
-    selected = []
+    from src.l1_judge.evaluator import compute_gate_diagnostics
+
+    stage_id = getattr(config, "CURRICULUM_CURRENT_STAGE", 1)
+    stage_cfg = config.CURRICULUM_STAGES.get(stage_id, {})
+    diversity_weight = float(getattr(config, "SELECTION_W_DIVERSITY", 0.0))
+
+    selected = list(seed or [])
+    if len(selected) >= k:
+        return selected[:k], {"collision_count": 0, "avg_jaccard": 0.0, "collision_rate": 0.0}
+
+    base_scores: Dict[int, float] = {}
+    for cand in candidates:
+        metrics = getattr(getattr(cand, "best_sample", None), "metrics", None)
+        if metrics is None:
+            base_scores[id(cand)] = float(getattr(cand, "score", 0.0))
+            continue
+
+        gate_diag = None
+        if gate_diag_map:
+            policy = getattr(cand, "policy_spec", getattr(cand, "policy", None))
+            if policy is not None:
+                gate_diag = gate_diag_map.get(policy.spec_id)
+        if gate_diag is None:
+            gate_diag = compute_gate_diagnostics(metrics)
+
+        base_scores[id(cand)] = compute_selection_score(cand, gate_diag, stage_cfg)
+
+    remaining = [c for c in candidates if c not in selected]
     collision_count = 0
     all_jaccards = []
     
-    for cand in sorted_candidates:
-        if len(selected) >= k:
-            break
-            
-        p_cand = getattr(cand, 'policy_spec', getattr(cand, 'policy', None))
-        is_too_similar = False
-        
-        for sel in selected:
-            p_sel = getattr(sel, 'policy_spec', getattr(sel, 'policy', None))
-            
-            if p_cand and p_sel:
+    while remaining and len(selected) < k:
+        best_idx = None
+        best_score = -float("inf")
+
+        for idx, cand in enumerate(remaining):
+            p_cand = getattr(cand, "policy_spec", getattr(cand, "policy", None))
+            if p_cand is None:
+                continue
+
+            is_too_similar = False
+            max_jaccard = 0.0
+
+            for sel in selected:
+                p_sel = getattr(sel, "policy_spec", getattr(sel, "policy", None))
+                if p_sel is None:
+                    continue
+
                 jaccard = calculate_genome_similarity(p_cand, p_sel)
                 all_jaccards.append(jaccard)
-                
+                max_jaccard = max(max_jaccard, jaccard)
+
                 if jaccard > jaccard_th:
                     param_sim = calculate_param_similarity(p_cand, p_sel)
-                    if param_sim > (1.0 - param_th): 
+                    if param_sim > (1.0 - param_th):
                         is_too_similar = True
                         collision_count += 1
                         break
-        
-        if not is_too_similar:
-            selected.append(cand)
+
+            if is_too_similar:
+                continue
+
+            diversity_bonus = diversity_weight * (1.0 - max_jaccard) if selected else 0.0
+            effective_score = base_scores.get(id(cand), 0.0) + diversity_bonus
+            if effective_score > best_score:
+                best_score = effective_score
+                best_idx = idx
+
+        if best_idx is None:
+            break
+
+        selected.append(remaining.pop(best_idx))
             
     stats = {
         "collision_count": collision_count,
         "avg_jaccard": np.mean(all_jaccards) if all_jaccards else 0.0,
-        "collision_rate": collision_count / len(sorted_candidates) if sorted_candidates else 0
+        "collision_rate": collision_count / len(candidates) if candidates else 0
     }
     
     return selected, stats

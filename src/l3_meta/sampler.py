@@ -28,7 +28,7 @@ class DiversitySampler:
             compatibility = ontology.check_compatibility(feature_ids)
             
             if compatibility < -0.3: # Strong conflict threshold
-                logger.debug(f"  [Ontology] REJECTED {cand.spec_id[:8]}: Conflict score {compatibility:.2f}")
+                logger.debug(f"[Ontology] 거절 {cand.spec_id[:8]}: 충돌 점수 {compatibility:.2f}")
                 continue
                 
             # 2. Diversity Check (Jaccard)
@@ -71,7 +71,7 @@ def sample_with_diversity(
         attempts += 1
         
     if len(final_policies) < n_jobs:
-        logger.warning(f"Only managed to find {len(final_policies)} diverse policies after {attempts} attempts.")
+        logger.warning(f"[Sampler] 다양 정책 부족: {len(final_policies)}개 (시도 {attempts}회)")
         # Fill rest with regular proposals if we must
         needed = n_jobs - len(final_policies)
         final_policies.extend([propose_fn(regime, history) for _ in range(needed)])
