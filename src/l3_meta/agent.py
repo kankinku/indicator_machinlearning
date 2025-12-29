@@ -26,6 +26,7 @@ if config.D3QN_ENABLED:
 from src.l3_meta.curriculum_controller import get_curriculum_controller, CurriculumController
 from src.l3_meta.analyst import get_indicator_analyst
 from src.shared.hashing import generate_policy_id
+from src.shared.constraints import compute_entry_rate_constraints
 
 logger = get_logger("meta.agent")
 
@@ -478,6 +479,7 @@ class MetaAgent:
         [V17] Build LogicTree structure based on Action and Regime.
         """
         from src.shared.logic_tree import LogicTree, ConditionNode, LogicalOpNode, mutate_tree, asdict
+        stage_id = int(getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
 
         def _is_false_tree(tree_dict: Optional[Dict[str, Any]]) -> bool:
             if not tree_dict:
@@ -496,15 +498,41 @@ class MetaAgent:
         def _build_exit_node(
             candidates: List[ConditionNode],
             q_bias: str,
+            stage_value: int,
         ) -> ConditionNode:
+            q_bounds_cfg = getattr(config, "EXIT_QUANTILE_BOUNDS_BY_STAGE", {}) or {}
+            q_bounds = q_bounds_cfg.get(stage_value)
+
+            def _parse_quantile_value(raw_val: Any) -> Optional[float]:
+                if isinstance(raw_val, (int, float)):
+                    return float(raw_val)
+                if isinstance(raw_val, str):
+                    val = raw_val.strip().lower()
+                    if val.startswith("[q") and val.endswith("]"):
+                        try:
+                            return float(val[2:-1])
+                        except ValueError:
+                            return None
+                return None
+
             if candidates:
                 base = random.choice(candidates)
                 exit_op = "<" if base.op in (">", ">=") else ">"
+                exit_value = base.value if base.value else "[q0.5]"
+                if q_bounds:
+                    q_min = float(q_bounds.get("min", 0.2))
+                    q_max = float(q_bounds.get("max", 0.8))
+                    q_min = max(0.01, min(q_min, 0.99))
+                    q_max = max(q_min, min(q_max, 0.99))
+                    parsed = _parse_quantile_value(exit_value)
+                    if parsed is None or parsed < q_min or parsed > q_max:
+                        q_val = round(random.uniform(q_min, q_max), 2)
+                        exit_value = f"[q{q_val}]"
                 return ConditionNode(
                     feature_key=base.feature_key,
                     column_ref=base.column_ref,
                     op=exit_op,
-                    value=base.value if base.value else "[q0.5]",
+                    value=exit_value,
                 )
 
             fallback_features = self.registry.list_all() if hasattr(self.registry, "list_all") else []
@@ -523,7 +551,14 @@ class MetaAgent:
                 exit_weights = [0.2, 0.6, 0.2]
             else:
                 exit_weights = [0.34, 0.32, 0.34]
-            q_val = random.choices(exit_quantiles, weights=exit_weights, k=1)[0]
+            if q_bounds:
+                q_min = float(q_bounds.get("min", 0.2))
+                q_max = float(q_bounds.get("max", 0.8))
+                q_min = max(0.01, min(q_min, 0.99))
+                q_max = max(q_min, min(q_max, 0.99))
+                q_val = round(random.uniform(q_min, q_max), 2)
+            else:
+                q_val = random.choices(exit_quantiles, weights=exit_weights, k=1)[0]
             exit_op = ">" if random.random() > 0.5 else "<"
             return ConditionNode(
                 feature_key=feat.feature_id,
@@ -531,6 +566,86 @@ class MetaAgent:
                 op=exit_op,
                 value=f"[q{q_val}]",
             )
+
+        def _build_timing_tree(
+            candidates: List[ConditionNode],
+            q_bias: str,
+        ) -> ConditionNode | LogicalOpNode:
+            if not candidates:
+                return ConditionNode(feature_key="TRUE", op="==", value=1.0)
+
+            timing_quantiles = [0.2, 0.3, 0.7, 0.8]
+            if q_bias == "tail":
+                timing_weights = [0.35, 0.15, 0.15, 0.35]
+            elif q_bias == "center":
+                timing_weights = [0.25, 0.25, 0.25, 0.25]
+            else:
+                timing_weights = [0.3, 0.2, 0.2, 0.3]
+
+            timing_nodes: List[ConditionNode] = []
+            for node in candidates:
+                q_val = random.choices(timing_quantiles, weights=timing_weights, k=1)[0]
+                timing_op = ">" if random.random() > 0.5 else "<"
+                timing_nodes.append(ConditionNode(
+                    feature_key=node.feature_key,
+                    column_ref=node.column_ref,
+                    op=timing_op,
+                    value=f"[q{q_val}]",
+                ))
+
+            if len(timing_nodes) > 1:
+                return LogicalOpNode(op="and", children=timing_nodes[:2])
+            return timing_nodes[0]
+
+        def _build_hold_tree(
+            candidates: List[ConditionNode],
+            q_bias: str,
+            hold_type: str,
+        ) -> ConditionNode | LogicalOpNode:
+            if not candidates:
+                fallback_features = self.registry.list_all() if hasattr(self.registry, "list_all") else []
+                if not fallback_features:
+                    return ConditionNode(feature_key="TRUE", op="==", value=1.0)
+                from src.contracts import ColumnRef
+                feat = random.choice(fallback_features)
+                meta = self.registry.get(feat.feature_id)
+                outputs = meta.outputs if meta else {"value": "value"}
+                key = "value" if "value" in outputs else list(outputs.keys())[0]
+                candidates = [ConditionNode(
+                    feature_key=feat.feature_id,
+                    column_ref=ColumnRef(feature_id=feat.feature_id, output_key=key),
+                    op=">",
+                    value="[q0.5]",
+                )]
+
+            if hold_type == "short":
+                quantiles = [0.2, 0.3, 0.7, 0.8]
+                op_join = "or"
+            else:
+                quantiles = [0.4, 0.5, 0.6]
+                op_join = "and"
+
+            if q_bias == "tail":
+                weights = [0.35, 0.15, 0.15, 0.35] if len(quantiles) == 4 else [0.3, 0.4, 0.3]
+            elif q_bias == "center":
+                weights = [0.25, 0.25, 0.25, 0.25] if len(quantiles) == 4 else [0.2, 0.6, 0.2]
+            else:
+                weights = [0.3, 0.2, 0.2, 0.3] if len(quantiles) == 4 else [0.34, 0.32, 0.34]
+
+            hold_nodes: List[ConditionNode] = []
+            for node in candidates[:2]:
+                q_val = random.choices(quantiles, weights=weights, k=1)[0]
+                hold_op = ">" if random.random() > 0.5 else "<"
+                hold_nodes.append(ConditionNode(
+                    feature_key=node.feature_key,
+                    column_ref=node.column_ref,
+                    op=hold_op,
+                    value=f"[q{q_val}]",
+                ))
+
+            if len(hold_nodes) > 1:
+                return LogicalOpNode(op=op_join, children=hold_nodes)
+            return hold_nodes[0]
         
         # [EVOLVE] Logic: Mutate existing elite tree
         if action_name == "EVOLVE":
@@ -543,11 +658,30 @@ class MetaAgent:
                     mutated_entry = mutate_tree(entry_tree, self.registry, action_type=action_type)
                     exit_tree_dict = parent.logic_trees.get("exit")
                     if _is_false_tree(exit_tree_dict):
-                        exit_node = _build_exit_node(mutated_entry.get_condition_nodes(), q_bias="center")
+                        exit_node = _build_exit_node(
+                            mutated_entry.get_condition_nodes(),
+                            q_bias="center",
+                            stage_value=stage_id,
+                        )
                         exit_tree_dict = asdict(exit_node)
+                    timing_tree_dict = parent.logic_trees.get("timing") if parent.logic_trees else None
+                    if _is_false_tree(timing_tree_dict):
+                        timing_root = _build_timing_tree(mutated_entry.get_condition_nodes(), q_bias="center")
+                        timing_tree_dict = asdict(timing_root)
+                    hold_short_dict = parent.logic_trees.get("hold_short") if parent.logic_trees else None
+                    if _is_false_tree(hold_short_dict):
+                        hold_short_root = _build_hold_tree(mutated_entry.get_condition_nodes(), q_bias="center", hold_type="short")
+                        hold_short_dict = asdict(hold_short_root)
+                    hold_long_dict = parent.logic_trees.get("hold_long") if parent.logic_trees else None
+                    if _is_false_tree(hold_long_dict):
+                        hold_long_root = _build_hold_tree(mutated_entry.get_condition_nodes(), q_bias="center", hold_type="long")
+                        hold_long_dict = asdict(hold_long_root)
                     return {
                         "entry": asdict(mutated_entry.root),
                         "exit": exit_tree_dict,
+                        "timing": timing_tree_dict,
+                        "hold_short": hold_short_dict,
+                        "hold_long": hold_long_dict,
                     }
 
         # [Genome v2] Profile to Market Question Mapping
@@ -575,11 +709,40 @@ class MetaAgent:
         }
         
         subset_size, q_bias = profile_info.get(action_name, (2, "center"))
-        stage_id = int(getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
         stage_cfg = getattr(config, "CURRICULUM_STAGES", {}).get(stage_id)
         if stage_cfg:
             min_terms, max_terms = getattr(stage_cfg, "and_terms_range", (1, subset_size))
             subset_size = max(min_terms, min(subset_size, max_terms))
+            stage_bias = getattr(stage_cfg, "quantile_bias", None)
+            if stage_bias:
+                q_bias = stage_bias
+
+        constraints = compute_entry_rate_constraints(stage_id)
+        bounds_max = float(constraints.get("entry_rate_bounds_max", 0.0))
+        required_rate = float(constraints.get("required_entry_rate", 0.0))
+        density_ratio = required_rate / bounds_max if bounds_max > 0.0 else 0.0
+        density_ratio = max(0.0, min(density_ratio, 2.0))
+
+        q_bounds_cfg = getattr(config, "PREFILTER_QUANTILE_RANGE_BY_STAGE", {}) or {}
+        stage_q_bounds = q_bounds_cfg.get(stage_id) or {"min": 0.1, "max": 0.9}
+        q_min = float(stage_q_bounds.get("min", 0.1))
+        q_max = float(stage_q_bounds.get("max", 0.9))
+        q_min = max(0.01, min(q_min, 0.99))
+        q_max = max(q_min, min(q_max, 0.99))
+
+        if density_ratio >= 0.8:
+            subset_size = min(subset_size, 2)
+            q_bias = "center"
+            q_min = max(q_min, 0.3)
+            q_max = min(q_max, 0.7)
+        elif density_ratio >= 0.6:
+            subset_size = min(subset_size, 3)
+            q_bias = "center"
+            q_min = max(q_min, 0.2)
+            q_max = min(q_max, 0.8)
+
+        if q_max < q_min:
+            q_min, q_max = q_max, q_min
         target_questions = PROFILE_TO_QUESTIONS.get(action_name, ["TREND_CONFIRMATION"])
         
         # [Genome v2] Combinator Mode: Pick features that answer the questions
@@ -629,9 +792,29 @@ class MetaAgent:
         # [V18] Build Entry Tree (Flat AND for now) with ColumnRef
         from src.contracts import ColumnRef
         quantiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-        if q_bias == "center": w = [0.05, 0.05, 0.2, 0.2, 0.2, 0.2, 0.05, 0.05, 0.05]
-        elif q_bias == "tail": w = [0.3, 0.15, 0.05, 0.0, 0.0, 0.0, 0.05, 0.15, 0.3]
-        else: w = [0.1, 0.1, 0.1, 0.1, 0.2, 0.1, 0.1, 0.1, 0.1]
+        if stage_id >= 3:
+            quantiles = [0.05] + quantiles + [0.95]
+        quantiles = [q for q in quantiles if q_min <= q <= q_max]
+        if not quantiles:
+            quantiles = [0.5]
+
+        def _weights_for_quantiles(values, bias):
+            if not values:
+                return []
+            mid = (len(values) - 1) / 2.0
+            weights = []
+            for idx, _ in enumerate(values):
+                dist = abs(idx - mid) / max(mid, 1.0)
+                if bias == "tail":
+                    weight = 0.2 + dist * 0.6
+                elif bias == "center":
+                    weight = 0.6 - dist * 0.4
+                else:
+                    weight = 0.4
+                weights.append(max(weight, 0.05))
+            return weights
+
+        w = _weights_for_quantiles(quantiles, q_bias)
         
         entry_nodes = []
         for feat in selected_features:
@@ -661,9 +844,18 @@ class MetaAgent:
             entry_root = ConditionNode(feature_key="TRUE", op="==", value=1.0)
             
         # Build Simple Exit Tree
-        exit_node = _build_exit_node(entry_nodes, q_bias)
+        exit_node = _build_exit_node(entry_nodes, q_bias, stage_value=stage_id)
+        timing_root = _build_timing_tree(entry_nodes, q_bias)
+        hold_short_root = _build_hold_tree(entry_nodes, q_bias, hold_type="short")
+        hold_long_root = _build_hold_tree(entry_nodes, q_bias, hold_type="long")
         
-        return {"entry": asdict(entry_root), "exit": asdict(exit_node)}
+        return {
+            "entry": asdict(entry_root),
+            "exit": asdict(exit_node),
+            "timing": asdict(timing_root),
+            "hold_short": asdict(hold_short_root),
+            "hold_long": asdict(hold_long_root),
+        }
 
     def _sync_genome_from_trees(self, logic_trees: Dict[str, Dict[str, Any]], action_name: str, regime: RegimeState) -> Dict[str, Any]:
         """
@@ -695,7 +887,13 @@ class MetaAgent:
         [V14] Managed Rule Generation using Profile-driven Bias.
         """
         if not genome:
-            return {"entry": "False", "exit": "True"}
+            return {
+                "entry": "False",
+                "exit": "True",
+                "timing": "True",
+                "hold_short": "False",
+                "hold_long": "False",
+            }
             
         # Extract meta provided by _construct_genome_from_action
         meta = genome.get("__meta__", {})
@@ -748,7 +946,78 @@ class MetaAgent:
             col_exit = f"{exit_fid}__" + exit_fid.split('_')[1].lower() if '_' in exit_fid else exit_fid
             exit_rule = f"`{col_exit}` > [q0.5]" if q_bias == "tail" else f"`{col_exit}` < [q0.3]"
 
-        return {"entry": entry_rule, "exit": exit_rule}
+        timing_rule = "True"
+        if selected_fids:
+            timing_terms = []
+            timing_quantiles = [0.2, 0.3, 0.7, 0.8]
+            if q_bias == "tail":
+                timing_weights = [0.35, 0.15, 0.15, 0.35]
+            elif q_bias == "center":
+                timing_weights = [0.25, 0.25, 0.25, 0.25]
+            else:
+                timing_weights = [0.3, 0.2, 0.2, 0.3]
+            for fid in selected_fids[: min(2, len(selected_fids))]:
+                op = ">" if random.random() > 0.5 else "<"
+                q = random.choices(timing_quantiles, weights=timing_weights, k=1)[0]
+                meta = self.registry.get(fid)
+                if meta:
+                    outputs = meta.outputs or {"value": "value"}
+                    key = "value" if "value" in outputs else list(outputs.keys())[0]
+                    suffix = outputs[key]
+                    col_name = f"{fid}__{suffix}"
+                else:
+                    col_name = fid
+                timing_terms.append(f"`{col_name}` {op} [q{q}]")
+            if timing_terms:
+                timing_rule = " and ".join(timing_terms)
+
+        hold_short_rule = "False"
+        if selected_fids:
+            hold_terms = []
+            hold_quantiles = [0.2, 0.3, 0.7, 0.8]
+            hold_weights = [0.25, 0.25, 0.25, 0.25]
+            for fid in selected_fids[: min(2, len(selected_fids))]:
+                op = ">" if random.random() > 0.5 else "<"
+                q = random.choices(hold_quantiles, weights=hold_weights, k=1)[0]
+                meta = self.registry.get(fid)
+                if meta:
+                    outputs = meta.outputs or {"value": "value"}
+                    key = "value" if "value" in outputs else list(outputs.keys())[0]
+                    suffix = outputs[key]
+                    col_name = f"{fid}__{suffix}"
+                else:
+                    col_name = fid
+                hold_terms.append(f"`{col_name}` {op} [q{q}]")
+            if hold_terms:
+                hold_short_rule = " or ".join(hold_terms)
+
+        hold_long_rule = "False"
+        if selected_fids:
+            hold_terms = []
+            hold_quantiles = [0.4, 0.5, 0.6]
+            hold_weights = [0.2, 0.6, 0.2]
+            for fid in selected_fids[: min(2, len(selected_fids))]:
+                op = ">" if random.random() > 0.5 else "<"
+                q = random.choices(hold_quantiles, weights=hold_weights, k=1)[0]
+                meta = self.registry.get(fid)
+                if meta:
+                    outputs = meta.outputs or {"value": "value"}
+                    key = "value" if "value" in outputs else list(outputs.keys())[0]
+                    suffix = outputs[key]
+                    col_name = f"{fid}__{suffix}"
+                else:
+                    col_name = fid
+                hold_terms.append(f"`{col_name}` {op} [q{q}]")
+            if hold_terms:
+                hold_long_rule = " and ".join(hold_terms)
+
+        return {
+            "entry": entry_rule,
+            "exit": exit_rule,
+            "timing": timing_rule,
+            "hold_short": hold_short_rule,
+            "hold_long": hold_long_rule,
+        }
             
 
 
@@ -823,17 +1092,51 @@ class MetaAgent:
         # ========================================
         # These are completely independent of strategy type - pure evolution
         
+        stage_id = int(getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+        rr_min_map = getattr(config, "RISK_RR_MIN_BY_STAGE", {}) or {}
+        horizon_min_map = getattr(config, "RISK_HORIZON_MIN_BY_STAGE", {}) or {}
+        rr_min = float(rr_min_map.get(stage_id, 0.0)) if rr_min_map else 0.0
+        horizon_min = int(horizon_min_map.get(stage_id, 0)) if horizon_min_map else 0
+        max_attempts = int(getattr(config, "RISK_SAMPLE_MAX_ATTEMPTS", 6)) or 1
+
         if risk_profile:
-            k_up = random.uniform(*risk_profile.k_up_range)
-            k_down = random.uniform(*risk_profile.k_down_range)
-            horizon = random.randint(*risk_profile.horizon_range)
+            k_up_min, k_up_max = risk_profile.k_up_range
+            k_down_min, k_down_max = risk_profile.k_down_range
+            h_min, h_max = risk_profile.horizon_range
             risk_profile_id = risk_profile.profile_id
         else:
             # Fallback to full range if profile is missing
-            k_up = random.uniform(config.RISK_K_UP_MIN, config.RISK_K_UP_MAX)
-            k_down = random.uniform(config.RISK_K_DOWN_MIN, config.RISK_K_DOWN_MAX)
-            horizon = random.randint(config.RISK_HORIZON_MIN, config.RISK_HORIZON_MAX)
+            k_up_min, k_up_max = config.RISK_K_UP_MIN, config.RISK_K_UP_MAX
+            k_down_min, k_down_max = config.RISK_K_DOWN_MIN, config.RISK_K_DOWN_MAX
+            h_min, h_max = config.RISK_HORIZON_MIN, config.RISK_HORIZON_MAX
             risk_profile_id = "DEFAULT"
+
+        if horizon_min:
+            h_min = max(h_min, horizon_min)
+        if h_min > h_max:
+            h_min = h_max
+
+        k_up = k_down = horizon = None
+        for _ in range(max_attempts):
+            k_up = random.uniform(k_up_min, k_up_max)
+            k_down = random.uniform(k_down_min, k_down_max)
+            horizon = random.randint(h_min, h_max)
+            rr = k_up / k_down if k_down > 0 else 1.0
+            if rr_min and rr < rr_min:
+                continue
+            break
+
+        if k_up is None or k_down is None or horizon is None:
+            k_up = random.uniform(k_up_min, k_up_max)
+            k_down = random.uniform(k_down_min, k_down_max)
+            horizon = random.randint(h_min, h_max)
+
+        risk_reward_ratio = k_up / k_down if k_down > 0 else 1.0
+        if rr_min and risk_reward_ratio < rr_min:
+            target_up = rr_min * k_down
+            if target_up <= k_up_max:
+                k_up = max(k_up, target_up)
+                risk_reward_ratio = k_up / k_down if k_down > 0 else 1.0
         
         # ========================================
         # 2. Derived Parameters (Based on sampled values)

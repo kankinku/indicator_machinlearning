@@ -166,7 +166,7 @@ class AutoTuner:
         
         if is_rigid:
             # 원인 A: 필터/게이트 과보수 (Pass Rate Too Low)
-            if current.pass_rate_s1 < 0.10 or current.pass_rate_s2 < 0.05:
+            if self._is_pass_rate_too_low():
                 return "PASS_RATE_TOO_LOW"
             
             # 원인 B: 유전적 다양성 붕괴
@@ -189,6 +189,18 @@ class AutoTuner:
             return "COLLAPSE"
 
         return "HEALTHY"
+
+    def _is_pass_rate_too_low(self) -> bool:
+        consecutive = max(1, int(getattr(config, "AUTOTUNE_PASS_RATE_CONSECUTIVE", 1)))
+        if len(self.history) < consecutive:
+            return False
+        min_s1 = float(getattr(config, "AUTOTUNE_PASS_RATE_MIN_S1", 0.10))
+        min_s2 = float(getattr(config, "AUTOTUNE_PASS_RATE_MIN_S2", 0.05))
+        recent = self.history[-consecutive:]
+        return all(
+            (state.pass_rate_s1 < min_s1 or state.pass_rate_s2 < min_s2)
+            for state in recent
+        )
 
     def _apply_intervention(self, cause: str, batch_id: int):
         plan_id = f"INT-{batch_id}-{cause[:4]}"

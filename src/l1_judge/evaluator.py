@@ -239,6 +239,10 @@ def _ratio_above(value: float, maximum: float) -> float:
         return 0.0
     return max(0.0, (value - maximum) / maximum)
 
+def _count_per_year(count: int, bars_total: int) -> float:
+    years = bars_total / 252.0 if bars_total > 0 else 1.0
+    return float(count) / years if years > 0 else 0.0
+
 
 def _collect_validation_failures_raw(
     trades_per_year: float,
@@ -253,9 +257,13 @@ def _collect_validation_failures_raw(
     percent_in_market: float,
     cycle_count: int,
     invalid_action_rate: float,
+    entry_count: int,
+    exit_count: int,
+    bars_total: int,
     stage_cfg: object,
 ) -> List[ValidationFailure]:
     failures: List[ValidationFailure] = []
+    stage_id = int(getattr(stage_cfg, "stage_id", getattr(config, "CURRICULUM_CURRENT_STAGE", 1)))
 
     # 0. Cycle Gate (SSOT: cycle_count == 0 is not learnable)
     if cycle_count <= 0:
@@ -276,13 +284,48 @@ def _collect_validation_failures_raw(
             is_hard=True,
         ))
 
-    # 1. Minimum Activity (Annualized)
-    min_tpy = getattr(stage_cfg, "min_trades_per_year", 2.0)
-    if trades_per_year < min_tpy:
+    # 1. CMDP Activity Constraints (Annualized)
+    min_entries = getattr(stage_cfg, "min_entries_per_year", None)
+    if min_entries is None:
+        min_entries = getattr(stage_cfg, "min_trades_per_year", 2.0)
+    max_entries = getattr(stage_cfg, "max_entries_per_year", None)
+    min_flips = getattr(stage_cfg, "min_flips_per_year", None)
+    max_flips = getattr(stage_cfg, "max_flips_per_year", None)
+
+    entries_per_year = _count_per_year(int(entry_count), int(bars_total))
+    flips_per_year = _count_per_year(int(entry_count) + int(exit_count), int(bars_total))
+
+    if min_entries and entries_per_year < float(min_entries):
         failures.append(ValidationFailure(
             code="FAIL_MIN_TRADES",
-            detail=f"{trades_per_year:.1f} < {min_tpy}",
-            distance=_ratio_below(trades_per_year, min_tpy),
+            detail=f"{entries_per_year:.1f} < {min_entries}",
+            distance=_ratio_below(entries_per_year, float(min_entries)),
+            is_hard=True,
+        ))
+    if max_entries and entries_per_year > float(max_entries):
+        failures.append(ValidationFailure(
+            code="FAIL_MAX_TRADES",
+            detail=f"{entries_per_year:.1f} > {max_entries}",
+            distance=_ratio_above(entries_per_year, float(max_entries)),
+            is_hard=True,
+        ))
+
+    if min_flips is None and min_entries:
+        min_flips = float(min_entries) * 2.0
+    if max_flips is None and max_entries:
+        max_flips = float(max_entries) * 2.0
+    if min_flips and flips_per_year < float(min_flips):
+        failures.append(ValidationFailure(
+            code="FAIL_MIN_FLIPS",
+            detail=f"{flips_per_year:.1f} < {min_flips}",
+            distance=_ratio_below(flips_per_year, float(min_flips)),
+            is_hard=(stage_id >= 3),
+        ))
+    if max_flips and flips_per_year > float(max_flips):
+        failures.append(ValidationFailure(
+            code="FAIL_MAX_FLIPS",
+            detail=f"{flips_per_year:.1f} > {max_flips}",
+            distance=_ratio_above(flips_per_year, float(max_flips)),
             is_hard=True,
         ))
 
@@ -389,10 +432,31 @@ def _compute_gate_distances(metrics: SampleMetrics, stage_cfg: object) -> Dict[s
     profit_factor = float(getattr(metrics.trades, "profit_factor", 1.0))
     top1_share = float(getattr(metrics.trades, "top1_share", 0.0))
     trade_count = int(getattr(metrics.trades, "trade_count", 0))
+    entry_count = int(getattr(metrics.trades, "entry_count", trade_count))
+    exit_count = int(getattr(metrics.trades, "exit_count", trade_count))
     entry_signal_rate = float(getattr(metrics.trades, "entry_signal_rate", 0.0))
     percent_in_market = float(getattr(metrics.equity, "percent_in_market", exposure_ratio))
 
-    min_tpy = float(getattr(stage_cfg, "min_trades_per_year", 0.0))
+    bars_total = int(getattr(metrics, "bars_total", 0))
+    entries_per_year = _count_per_year(entry_count, bars_total)
+    flips_per_year = _count_per_year(entry_count + exit_count, bars_total)
+
+    min_entries = getattr(stage_cfg, "min_entries_per_year", None)
+    if min_entries is None:
+        min_entries = getattr(stage_cfg, "min_trades_per_year", 0.0)
+    min_entries = float(min_entries or 0.0)
+    max_entries = getattr(stage_cfg, "max_entries_per_year", None)
+    max_entries = float(max_entries) if max_entries is not None else 0.0
+
+    min_flips = getattr(stage_cfg, "min_flips_per_year", None)
+    if min_flips is None and min_entries > 0.0:
+        min_flips = min_entries * 2.0
+    min_flips = float(min_flips or 0.0)
+    max_flips = getattr(stage_cfg, "max_flips_per_year", None)
+    if max_flips is None and max_entries > 0.0:
+        max_flips = max_entries * 2.0
+    max_flips = float(max_flips) if max_flips is not None else 0.0
+
     min_exp = float(getattr(stage_cfg, "min_exposure", config.VAL_MIN_EXPOSURE))
     min_excess = getattr(stage_cfg, "min_excess_return_pa", None)
     if min_excess is None:
@@ -404,7 +468,10 @@ def _compute_gate_distances(metrics: SampleMetrics, stage_cfg: object) -> Dict[s
 
     distances["FAIL_NO_CYCLE"] = float(max(0, 1 - cycle_count))
     distances["FAIL_INVALID_ACTION"] = float(max(0.0, invalid_action_rate - max_invalid_rate))
-    distances["FAIL_MIN_TRADES"] = float(max(0.0, min_tpy - trades_per_year))
+    distances["FAIL_MIN_TRADES"] = float(max(0.0, min_entries - entries_per_year))
+    distances["FAIL_MAX_TRADES"] = float(max(0.0, entries_per_year - max_entries)) if max_entries > 0.0 else 0.0
+    distances["FAIL_MIN_FLIPS"] = float(max(0.0, min_flips - flips_per_year)) if min_flips > 0.0 else 0.0
+    distances["FAIL_MAX_FLIPS"] = float(max(0.0, flips_per_year - max_flips)) if max_flips > 0.0 else 0.0
     distances["FAIL_LOW_EXPOSURE"] = float(max(0.0, min_exp - exposure_ratio))
     distances["FAIL_LOW_RETURN"] = float(max(0.0, min_excess - excess_return))
     distances["FAIL_WINRATE_LOW"] = float(max(0.0, config.VAL_WINRATE_MIN - win_rate))
@@ -435,7 +502,9 @@ def compute_gate_diagnostics(metrics: SampleMetrics) -> GateDiagnostics:
     approval_pass = len(hard_failures) == 0
 
     distances = _compute_gate_distances(metrics, stage_cfg)
-    weights = getattr(config, "LEARNING_GATE_DISTANCE_WEIGHTS", {})
+    weights = dict(getattr(config, "LEARNING_GATE_DISTANCE_WEIGHTS", {}))
+    if int(getattr(stage_cfg, "stage_id", curr_stage)) < 3:
+        weights["FAIL_MIN_FLIPS"] = 0.0
     codes = getattr(config, "LEARNING_GATE_CODES", list(distances.keys()))
     scale = float(getattr(config, "LEARNING_GATE_SCORE_SCALE", 1.0))
 
@@ -480,6 +549,9 @@ def collect_validation_failures(metrics: SampleMetrics) -> List[ValidationFailur
         percent_in_market=metrics.equity.percent_in_market,
         cycle_count=getattr(metrics.trades, "cycle_count", 0),
         invalid_action_rate=getattr(metrics.trades, "invalid_action_rate", 0.0),
+        entry_count=getattr(metrics.trades, "entry_count", metrics.trades.trade_count),
+        exit_count=getattr(metrics.trades, "exit_count", metrics.trades.trade_count),
+        bars_total=getattr(metrics, "bars_total", 0),
         stage_cfg=stage_cfg,
     )
 
@@ -492,6 +564,8 @@ def collect_validation_failures_from_dict(metrics: Dict[str, float]) -> List[Val
     oos_bars = int(metrics.get("oos_bars", 252))
     entry_rate = metrics.get("entry_signal_rate", trade_count / max(1, oos_bars))
     percent_in_market = metrics.get("percent_in_market", metrics.get("exposure_ratio", 0.0))
+    entry_count = int(metrics.get("entry_count", trade_count))
+    exit_count = int(metrics.get("exit_count", trade_count))
     return _collect_validation_failures_raw(
         trades_per_year=float(metrics.get("trades_per_year", 0.0)),
         exposure_ratio=float(metrics.get("exposure_ratio", percent_in_market)),
@@ -505,6 +579,9 @@ def collect_validation_failures_from_dict(metrics: Dict[str, float]) -> List[Val
         percent_in_market=float(percent_in_market),
         cycle_count=cycle_count,
         invalid_action_rate=float(metrics.get("invalid_action_rate", 0.0)),
+        entry_count=entry_count,
+        exit_count=exit_count,
+        bars_total=oos_bars,
         stage_cfg=stage_cfg,
     )
 

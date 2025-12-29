@@ -118,8 +118,17 @@ def _run_experiment_core(
     - FEATURE_MISSING 조기 감지 및 명시적 REJECT
     """
     # 1. Evaluate Signals from Rules
+    from src.shared.backtest import derive_trade_params
+    tp_pct, sl_pct, horizon = derive_trade_params(risk_budget)
     evaluator = RuleEvaluator()
-    entry_sig, exit_sig, complexity = evaluator.evaluate_signals(X_features, policy_spec)
+    entry_sig, exit_sig, complexity, act_sig, hold_short_sig, hold_long_sig = evaluator.evaluate_signals(
+        X_features,
+        policy_spec,
+        close_prices=df["close"],
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        max_hold_bars=horizon,
+    )
     
     # [V18] FEATURE_MISSING 감지: complexity=-1.0은 LogicTree 매칭 실패 마커
     if complexity < 0:
@@ -171,8 +180,33 @@ def _run_experiment_core(
         }
     
     # 2. Run Deterministic Backtest
-    from src.shared.backtest import derive_trade_params
-    tp_pct, sl_pct, horizon = derive_trade_params(risk_budget)
+    stage_id = int(getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+    buckets = getattr(config, "HOLD_DURATION_BUCKETS_BY_STAGE", {}).get(stage_id)
+    if not buckets:
+        buckets = getattr(config, "HOLD_DURATION_BUCKETS_BY_STAGE", {}).get(1, {})
+
+    def _pair(key: str, fallback: tuple[int, int]) -> tuple[int, int]:
+        raw = buckets.get(key, fallback)
+        if isinstance(raw, dict):
+            min_v = int(raw.get("min", fallback[0]))
+            max_v = int(raw.get("max", fallback[1]))
+        else:
+            min_v = int(raw[0]) if isinstance(raw, (list, tuple)) else fallback[0]
+            max_v = int(raw[1]) if isinstance(raw, (list, tuple)) else fallback[1]
+        if max_v < min_v:
+            max_v = min_v
+        return min_v, max_v
+
+    short_min, short_max = _pair("short", (1, 5))
+    medium_min, medium_max = _pair("medium", (5, 20))
+    long_min, long_max = _pair("long", (20, 60))
+    short_mask = hold_short_sig.astype(bool).values
+    long_mask = hold_long_sig.astype(bool).values & ~short_mask
+    hold_min = np.where(short_mask, short_min, np.where(long_mask, long_min, medium_min))
+    hold_max = np.where(short_mask, short_max, np.where(long_mask, long_max, medium_max))
+    hold_min_bars = pd.Series(hold_min, index=df.index)
+    hold_max_bars = pd.Series(hold_max, index=df.index)
+
     bt_engine = DeterministicBacktestEngine()
     bt_result = bt_engine.run(
         df["close"],
@@ -181,12 +215,19 @@ def _run_experiment_core(
         tp_pct=tp_pct,
         sl_pct=sl_pct,
         max_hold_bars=horizon,
+        hold_min_bars=hold_min_bars,
+        hold_max_bars=hold_max_bars,
+        benchmark_mode=getattr(config, "EVAL_BENCHMARK_MODE", "bh"),
+        benchmark_return_pct=float(getattr(config, "EVAL_BENCHMARK_RETURN_PCT", 0.0)),
     )
     
     # 3. Format results for ledger
     results_df = pd.DataFrame({
         "entry_sig": entry_sig,
         "exit_sig": exit_sig,
+        "act_sig": act_sig,
+        "hold_short_sig": hold_short_sig,
+        "hold_long_sig": hold_long_sig,
         "pred": entry_sig, # For compatibility with V12/V14 evaluation orchestrator
         "pos": [0] * len(df) # Logic moved to engine, but kept for schema
     }, index=df.index)
@@ -205,6 +246,10 @@ def _run_experiment_core(
         "cycle_count": cycle_stats.get("cycle_count", 0),
         "entry_count": cycle_stats.get("entry_count", 0),
         "exit_count": cycle_stats.get("exit_count", 0),
+        "act_count": int(act_sig.astype(bool).sum()),
+        "act_rate": float(act_sig.astype(bool).mean()),
+        "hold_short_rate": float(hold_short_sig.astype(bool).mean()),
+        "hold_long_rate": float(hold_long_sig.astype(bool).mean()),
         "win_rate": bt_result.win_rate,
         "total_return_pct": bt_result.total_return,
         "mdd_pct": bt_result.mdd,

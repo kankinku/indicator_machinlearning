@@ -25,6 +25,7 @@ from src.l1_judge.evaluator import (
     stable_hash,
     validate_sample,
     collect_validation_failures,
+    compute_gate_diagnostics,
 )
 from src.evaluation.real_evaluator import RealEvaluator
 from src.evaluation.fast_filter import FastFilter
@@ -38,8 +39,180 @@ from src.l3_meta.reward_shaper import get_reward_shaper
 from src.shared.event_bus import record_event
 from src.shared.caching import get_signal_cache, get_backtest_cache
 from src.shared.observability import build_episode_summary, log_episode
+from src.shared.constraints import compute_entry_rate_constraints
 
 logger = get_logger("orchestration.evaluation")
+
+
+def _parse_quantile_value(value: object) -> Optional[float]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text.startswith("[q") or not text.endswith("]"):
+        return None
+    try:
+        return float(text[2:-1])
+    except ValueError:
+        return None
+
+
+def prefilter_policies_by_entry_rate(
+    policies: List[PolicySpec],
+    df: pd.DataFrame,
+    stage_id: Optional[int] = None,
+) -> Tuple[List[PolicySpec], Dict[str, Any]]:
+    if not policies:
+        return [], {
+            "total": 0,
+            "kept": 0,
+            "rejected_low": 0,
+            "rejected_high": 0,
+            "rejected_empty": 0,
+            "min_rate": 0.0,
+            "max_rate": 1.0,
+            "mean_rate": 0.0,
+            "reject_reason_counts": {},
+        }
+
+    stage_id = int(stage_id or getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+    stage_constraints = compute_entry_rate_constraints(stage_id)
+    bounds = getattr(config, "ENTRY_HIT_RATE_BOUNDS_BY_STAGE", {}) or {}
+    stage_bounds = bounds.get(stage_id) or {}
+    min_rate = float(stage_bounds.get("min", 0.0))
+    max_rate = float(stage_bounds.get("max", 1.0))
+    min_rate_effective = min_rate
+    if getattr(config, "ENTRY_RATE_DYNAMIC_MIN_ENABLED", False):
+        recommended_min = float(stage_constraints.get("recommended_min_rate", 0.0))
+        min_rate_effective = max(min_rate, recommended_min)
+    if not stage_constraints.get("feasibility_ok", True) and str(
+        getattr(config, "ENTRY_RATE_CONSTRAINT_POLICY", "refactor")
+    ).lower() == "refactor":
+        logger.warning(
+            "[Stage Constraints] 불가능한 제약: required=%.6f max=%.6f margin=%.2f",
+            float(stage_constraints.get("required_entry_rate", 0.0)),
+            float(stage_constraints.get("entry_rate_bounds_max", 0.0)),
+            float(stage_constraints.get("feasibility_margin", 0.0)),
+        )
+
+    q_bounds_cfg = getattr(config, "PREFILTER_QUANTILE_RANGE_BY_STAGE", {}) or {}
+    q_bounds = q_bounds_cfg.get(stage_id) or {"min": 0.0, "max": 1.0}
+    q_min = float(q_bounds.get("min", 0.0))
+    q_max = float(q_bounds.get("max", 1.0))
+
+    stage_cfg = getattr(config, "CURRICULUM_STAGES", {}).get(stage_id)
+    max_terms = None
+    if stage_cfg:
+        and_terms = getattr(stage_cfg, "and_terms_range", None)
+        if and_terms:
+            max_terms = int(and_terms[1])
+
+    def _analyze_entry_tree(policy: PolicySpec) -> Dict[str, Any]:
+        info = {"and_terms": 0, "extreme_q": False}
+        if not getattr(policy, "logic_trees", None):
+            return info
+        entry_tree = policy.logic_trees.get("entry")
+        if not entry_tree:
+            return info
+        try:
+            from src.shared.logic_tree import LogicTree
+            tree = LogicTree.from_dict(entry_tree)
+            conds = tree.get_condition_nodes() if tree else []
+        except Exception:
+            return info
+        info["and_terms"] = len(conds)
+        for cond in conds:
+            q_val = _parse_quantile_value(cond.value)
+            if q_val is None:
+                continue
+            if q_val <= q_min or q_val >= q_max:
+                info["extreme_q"] = True
+                break
+        return info
+
+    # Stage 1 prefilter: entry signal rate
+    from src.orchestration.policy_evaluator import RuleEvaluator
+    from src.orchestration.parallel_manager import get_parallel_pool
+
+    df_local = df.copy()
+    df_local.columns = [c.lower() for c in df_local.columns]
+    df_values = df_local.values
+    df_columns = df_local.columns.tolist()
+    df_index = df_local.index
+    chunk_size = getattr(config, "PARALLEL_CHUNK_SIZE", 10)
+
+    def process_chunk(chunk: List[PolicySpec], values, columns, index, stage_value):
+        config.CURRICULUM_CURRENT_STAGE = int(stage_value)
+        evaluator = RuleEvaluator()
+        chunk_signals = []
+        for p in chunk:
+            X = _generate_features_cached(values, columns, index, p.feature_genome)
+            entry_sig, _, _, _, _, _ = evaluator.evaluate_signals(X, p)
+            chunk_signals.append(entry_sig)
+        return chunk_signals
+
+    chunks = [policies[i:i + chunk_size] for i in range(0, len(policies), chunk_size)]
+    chunked_signals = get_parallel_pool()(
+        delayed(process_chunk)(c, df_values, df_columns, df_index, stage_id)
+        for c in chunks
+    )
+    all_signals = [sig for chunk in chunked_signals for sig in chunk]
+
+    kept: List[PolicySpec] = []
+    reject_reason_counts: Dict[str, int] = {}
+    rejected_low = 0
+    rejected_high = 0
+    rejected_empty = 0
+    hit_rates: List[float] = []
+
+    for policy, sig in zip(policies, all_signals):
+        total = int(sig.size) if sig is not None else 0
+        if total <= 0:
+            rate = 0.0
+        else:
+            rate = float(np.mean(sig.astype(bool).values))
+        hit_rates.append(rate)
+
+        rejected = False
+        reasons: List[str] = []
+        if total <= 0:
+            rejected = True
+            rejected_empty += 1
+            reasons.append("HIT_RATE_EMPTY")
+        elif rate < min_rate_effective:
+            rejected = True
+            rejected_low += 1
+            reasons.append("HIT_RATE_TOO_LOW")
+        elif rate > max_rate:
+            rejected = True
+            rejected_high += 1
+            reasons.append("HIT_RATE_TOO_HIGH")
+
+        tree_info = _analyze_entry_tree(policy)
+        if max_terms is not None and tree_info["and_terms"] > max_terms:
+            reasons.append("AND_DEPTH_TOO_HIGH")
+        if tree_info["extreme_q"]:
+            reasons.append("EXTREME_Q_TOO_HIGH")
+
+        if rejected:
+            for reason in reasons:
+                reject_reason_counts[reason] = reject_reason_counts.get(reason, 0) + 1
+        else:
+            kept.append(policy)
+
+    stats = {
+        "total": len(policies),
+        "kept": len(kept),
+        "rejected_low": rejected_low,
+        "rejected_high": rejected_high,
+        "rejected_empty": rejected_empty,
+        "min_rate": min_rate,
+        "min_rate_effective": min_rate_effective,
+        "max_rate": max_rate,
+        "mean_rate": float(np.mean(hit_rates)) if hit_rates else 0.0,
+        "reject_reason_counts": reject_reason_counts,
+        "stage_constraints": stage_constraints,
+    }
+    return kept, stats
 
 
 class OperationalQACollector:
@@ -348,22 +521,87 @@ def _get_cached_signals(
     features_df: pd.DataFrame,
     policy_sig: str,
     signal_cache: object,
-) -> Tuple[pd.Series, pd.Series, float]:
+    close_prices: Optional[pd.Series] = None,
+    tp_pct: Optional[float] = None,
+    sl_pct: Optional[float] = None,
+    max_hold_bars: Optional[int] = None,
+) -> Tuple[pd.Series, pd.Series, float, pd.Series, pd.Series, pd.Series]:
     logic_sig = calculate_sha256({
         "policy_sig": policy_sig,
         "logic_trees": policy_spec.logic_trees,
         "decision_rules": policy_spec.decision_rules,
     })
-    cache_key = signal_cache.make_key(features_df, {"logic_sig": logic_sig})
+    trade_sig = calculate_sha256({
+        "tp_pct": tp_pct,
+        "sl_pct": sl_pct,
+        "max_hold_bars": max_hold_bars,
+        "forced_exit_gate": bool(getattr(config, "POLICY_STATE_GATE_FORCED_EXIT", True)),
+    })
+    cache_key = signal_cache.make_key(features_df, {"logic_sig": logic_sig, "trade_sig": trade_sig})
     cached = signal_cache.get(cache_key)
-    if cached is not None:
-        return cached
+    if cached is not None and isinstance(cached, tuple):
+        if len(cached) == 6:
+            entry_sig, exit_sig, third, fourth, fifth, sixth = cached
+            if isinstance(third, pd.Series) and isinstance(sixth, (float, int)):
+                # Backward compat: cached in (entry, exit, act, hold_short, hold_long, complexity)
+                return entry_sig, exit_sig, float(sixth), third, fourth, fifth
+            return entry_sig, exit_sig, float(third), fourth, fifth, sixth
+        if len(cached) == 4:
+            entry_sig, exit_sig, act_sig, complexity = cached
+            hold_short_sig = pd.Series(False, index=entry_sig.index)
+            hold_long_sig = pd.Series(False, index=entry_sig.index)
+            return entry_sig, exit_sig, float(complexity), act_sig, hold_short_sig, hold_long_sig
 
     from src.orchestration.policy_evaluator import RuleEvaluator
     evaluator = RuleEvaluator()
-    entry_sig, exit_sig, complexity = evaluator.evaluate_signals(features_df, policy_spec)
-    signal_cache.set(cache_key, (entry_sig, exit_sig, complexity))
-    return entry_sig, exit_sig, complexity
+    entry_sig, exit_sig, complexity, act_sig, hold_short_sig, hold_long_sig = evaluator.evaluate_signals(
+        features_df,
+        policy_spec,
+        close_prices=close_prices,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        max_hold_bars=max_hold_bars,
+    )
+    signal_cache.set(cache_key, (entry_sig, exit_sig, complexity, act_sig, hold_short_sig, hold_long_sig))
+    return entry_sig, exit_sig, float(complexity), act_sig, hold_short_sig, hold_long_sig
+
+
+def _build_hold_duration_series(
+    index: pd.Index,
+    stage_id: int,
+    hold_short_sig: pd.Series,
+    hold_long_sig: pd.Series,
+) -> Tuple[pd.Series, pd.Series]:
+    buckets = getattr(config, "HOLD_DURATION_BUCKETS_BY_STAGE", {}).get(stage_id)
+    if not buckets:
+        buckets = getattr(config, "HOLD_DURATION_BUCKETS_BY_STAGE", {}).get(1, {})
+
+    def _pair(key: str, fallback: Tuple[int, int]) -> Tuple[int, int]:
+        raw = buckets.get(key, fallback)
+        if isinstance(raw, dict):
+            min_v = int(raw.get("min", fallback[0]))
+            max_v = int(raw.get("max", fallback[1]))
+        else:
+            min_v = int(raw[0]) if isinstance(raw, (list, tuple)) else fallback[0]
+            max_v = int(raw[1]) if isinstance(raw, (list, tuple)) else fallback[1]
+        if max_v < min_v:
+            max_v = min_v
+        return min_v, max_v
+
+    short_min, short_max = _pair("short", (1, 5))
+    medium_min, medium_max = _pair("medium", (5, 20))
+    long_min, long_max = _pair("long", (20, 60))
+
+    short_mask = hold_short_sig.astype(bool).values
+    long_mask = hold_long_sig.astype(bool).values & ~short_mask
+
+    min_arr = np.where(short_mask, short_min, np.where(long_mask, long_min, medium_min))
+    max_arr = np.where(short_mask, short_max, np.where(long_mask, long_max, medium_max))
+
+    return (
+        pd.Series(min_arr, index=index),
+        pd.Series(max_arr, index=index),
+    )
 
 
 def _evaluate_policy_windows(
@@ -410,6 +648,8 @@ def _evaluate_policy_windows(
             except (TypeError, ValueError):
                 base_tp = None
         base_h = risk_budget.get("horizon")
+        from src.shared.backtest import derive_trade_params
+        base_tp_pct, base_sl_pct, base_horizon = derive_trade_params(risk_budget)
 
         tp_dist, sl_dist, h_dist = get_risk_distributions(
             template_id=policy_spec.template_id,
@@ -454,11 +694,15 @@ def _evaluate_policy_windows(
                 continue
 
             X_window = X_full.loc[window_df.index]
-            entry_sig, exit_sig, complexity = _get_cached_signals(
+            entry_sig, exit_sig, complexity, act_sig, hold_short_sig, hold_long_sig = _get_cached_signals(
                 policy_spec=policy_spec,
                 features_df=X_window,
                 policy_sig=policy_sig,
                 signal_cache=signal_cache,
+                close_prices=window_df["close"] if "close" in window_df.columns else None,
+                tp_pct=base_tp_pct,
+                sl_pct=base_sl_pct,
+                max_hold_bars=base_horizon,
             )
             if complexity < 0:
                 err_info = getattr(policy_spec, "_logictree_error", {}) or {}
@@ -484,6 +728,13 @@ def _evaluate_policy_windows(
                 sample_risk = _build_sample_risk_budget(risk_budget, sample.tp_pct, sample.sl_pct, sample.horizon)
                 
                 # [Optimization] Re-use base_signals, only re-run physical backtest
+                hold_min_bars, hold_max_bars = _build_hold_duration_series(
+                    index=window_df.index,
+                    stage_id=stage_id,
+                    hold_short_sig=hold_short_sig,
+                    hold_long_sig=hold_long_sig,
+                )
+
                 evaluator = RealEvaluator(cost_bps=cost_bps)
                 metrics, bt = evaluator.evaluate(
                     df=window_df,
@@ -491,7 +742,10 @@ def _evaluate_policy_windows(
                     exit_signals=exit_sig,
                     risk_budget=sample_risk,
                     target_regime=regime_id,
-                    complexity_score=complexity
+                    complexity_score=complexity,
+                    act_signals=act_sig,
+                    hold_min_bars=hold_min_bars,
+                    hold_max_bars=hold_max_bars,
                 )
 
                 # Alpha = Strat ROI - Bench ROI
@@ -512,7 +766,8 @@ def _evaluate_policy_windows(
                 )
 
                 if not passed:
-                    sample_score = float(config.EVAL_SCORE_MIN)
+                    gate_diag = compute_gate_diagnostics(metrics)
+                    sample_score = float(gate_diag.soft_gate_score)
                     violation = True
                 else:
                     sample_score = score_sample(metrics)
@@ -836,6 +1091,7 @@ def evaluate_stage(
             reward_breakdown=res.reward_breakdown,
             eval_score=res.score,
             module_key=res.module_key,
+            batch_id=None,
         )
         log_episode(summary)
 
@@ -848,6 +1104,7 @@ def evaluate_v12_batch(
     regime_id: str,
     n_jobs: int,
     stage_id: Optional[int] = None,
+    prefiltered: bool = False,
 ) -> Tuple[List[EvaluationResult], dict]:
     """
     V12-BT Batch Evaluation Orchestrator
@@ -858,6 +1115,14 @@ def evaluate_v12_batch(
 
     stage_id = int(stage_id or getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
     config.CURRICULUM_CURRENT_STAGE = stage_id
+
+    prefilter_stats = None
+    if not prefiltered and getattr(config, "ENTRY_HIT_RATE_FILTER_ENABLED", False):
+        kept, stats = prefilter_policies_by_entry_rate(policies, df, stage_id=stage_id)
+        prefilter_stats = stats
+        policies = kept
+        if not policies:
+            return [], {"status": "HIT_RATE_EMPTY", "prefilter": prefilter_stats}
 
     # 0. Prepare Data for Workers (numpy-only to avoid massive serialization)
     df_values = df.values
@@ -882,7 +1147,7 @@ def evaluate_v12_batch(
         for p in chunk:
             X = _generate_features_cached(values, columns, index, p.feature_genome)
             # Stage 1 Optimization: Skip backtest engine, just get entry signal
-            entry_sig, _, _ = evaluator.evaluate_signals(X, p)
+            entry_sig, _, _, _, _, _ = evaluator.evaluate_signals(X, p)
             signals.append(entry_sig)
         return signals
 
@@ -945,6 +1210,10 @@ def evaluate_v12_batch(
         stage_id=stage_id,
         feature_map=None,
     )
+    if prefilter_stats is not None:
+        if not isinstance(diagnostic_status, dict):
+            diagnostic_status = {"status": str(diagnostic_status)}
+        diagnostic_status["prefilter"] = prefilter_stats
     
     # 3. Handle Filtered (Give them base scores/ModuleResults)
     promoted_map = {res.policy_spec.template_id: res for res in promoted_results}

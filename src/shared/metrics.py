@@ -29,6 +29,12 @@ class TradeStats:
     exit_count: int = 0
     invalid_action_count: int = 0
     invalid_action_rate: float = 0.0
+    ignored_action_count: int = 0
+    ignored_action_rate: float = 0.0
+    cost_enter: int = 0
+    cost_flip: int = 0
+    act_count: int = 0
+    act_rate: float = 0.0
 
 @dataclass
 class EquityStats:
@@ -146,6 +152,7 @@ def compute_trades_stats(trade_returns: np.ndarray, bars_total: int) -> TradeSta
     # Annualized Trades
     years = bars_total / 252.0 if bars_total > 0 else 1.0
     trades_per_year = tc / years if years > 0 else 0.0
+    act_rate = float(tc / max(1, bars_total))
     
     return TradeStats(
         trade_count=tc,
@@ -162,6 +169,10 @@ def compute_trades_stats(trade_returns: np.ndarray, bars_total: int) -> TradeSta
         cycle_count=int(tc),
         entry_count=int(tc),
         exit_count=int(tc),
+        cost_enter=int(tc),
+        cost_flip=int(tc * 2),
+        act_count=int(tc),
+        act_rate=act_rate,
     )
 
 def compute_equity_stats(
@@ -340,6 +351,14 @@ def metrics_to_legacy_dict(agg: AggregateMetrics) -> Dict[str, Any]:
         "cycle_count": int(np.sum([w.trades.cycle_count for w in agg.window_results])) if agg.window_results else 0,
         "invalid_action_count": int(np.sum([w.trades.invalid_action_count for w in agg.window_results])) if agg.window_results else 0,
         "invalid_action_rate": np.mean([w.trades.invalid_action_rate for w in agg.window_results]) if agg.window_results else 0.0,
+        "ignored_action_count": int(np.sum([w.trades.ignored_action_count for w in agg.window_results])) if agg.window_results else 0,
+        "ignored_action_rate": np.mean([w.trades.ignored_action_rate for w in agg.window_results]) if agg.window_results else 0.0,
+        "entry_count": int(np.sum([w.trades.entry_count for w in agg.window_results])) if agg.window_results else 0,
+        "exit_count": int(np.sum([w.trades.exit_count for w in agg.window_results])) if agg.window_results else 0,
+        "cost_enter": int(np.sum([w.trades.cost_enter for w in agg.window_results])) if agg.window_results else 0,
+        "cost_flip": int(np.sum([w.trades.cost_flip for w in agg.window_results])) if agg.window_results else 0,
+        "act_count": int(np.sum([w.trades.act_count for w in agg.window_results])) if agg.window_results else 0,
+        "act_rate": np.mean([w.trades.act_rate for w in agg.window_results]) if agg.window_results else 0.0,
     }
     
     # Add oos_bars (sum of all windows)

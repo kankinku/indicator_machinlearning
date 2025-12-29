@@ -117,6 +117,7 @@ def _batch_stats(batches: List[Dict[str, Any]]) -> Dict[str, Any]:
     reward_var = [float(b.get("reward_variance", 0.0)) for b in batches]
     agent_exit = [float(b.get("agent_exit_ratio_mean", 0.0)) for b in batches]
     cycle_medians = [float(b.get("cycle_count_hist", {}).get("median", 0.0)) for b in batches]
+    act_rate_means = [float(b.get("act_rate_summary", {}).get("mean", 0.0)) for b in batches]
 
     fail_counts = Counter()
     nearest_counts = Counter()
@@ -137,6 +138,7 @@ def _batch_stats(batches: List[Dict[str, Any]]) -> Dict[str, Any]:
         "reward_variance": _summary_stats(reward_var),
         "agent_exit_ratio_mean": _summary_stats(agent_exit),
         "cycle_count_median": _summary_stats(cycle_medians),
+        "act_rate_mean": _summary_stats(act_rate_means),
         "gate_fail_reasons": dict(fail_counts),
         "nearest_gate_counts": dict(nearest_counts),
         "batches_with_performance_summary": int(perf_summary.get("with_perf", 0)),

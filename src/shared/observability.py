@@ -12,6 +12,7 @@ import numpy as np
 from src.config import config
 from src.shared.event_bus import record_event
 from src.shared.logger import get_logger
+from src.shared.constraints import compute_entry_rate_constraints
 
 logger = get_logger("shared.observability")
 
@@ -234,6 +235,7 @@ def build_episode_summary(
     reward_breakdown: Optional[Dict[str, Any]],
     eval_score: float,
     module_key: str,
+    batch_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     total_bars = int(getattr(metrics, "bars_total", 0) or 0)
     trades = []
@@ -255,6 +257,10 @@ def build_episode_summary(
 
     gate = compute_gate_status(metrics)
 
+    failure_codes = list(gate.get("failure_codes", []))
+    if module_key in ("ERROR", "FEATURE_MISSING", "INVALID_SPEC"):
+        failure_codes.append("FAIL_RUNTIME")
+
     reward_total = eval_score
     reward_components = {
         "return_component": 0.0,
@@ -263,6 +269,9 @@ def build_episode_summary(
         "frequency_component": 0.0,
         "gate_component": 0.0,
     }
+    soft_gate_score = float(gate.get("soft_gate_score", 0.0))
+    rejection_reason = None
+    rejection_distance = None
     if reward_breakdown:
         reward_total = float(reward_breakdown.get("total", eval_score))
         reward_components["return_component"] = float(reward_breakdown.get("return_component", 0.0))
@@ -271,8 +280,14 @@ def build_episode_summary(
         )
         reward_components["cost_component"] = float(reward_breakdown.get("cost_survival_component", 0.0))
         reward_components["frequency_component"] = float(reward_breakdown.get("trades_component", 0.0))
+        rejection_reason = reward_breakdown.get("rejection_reason")
+        rejection_distance = reward_breakdown.get("distance_score")
         if reward_breakdown.get("is_rejected"):
-            reward_components["gate_component"] = reward_total
+            reward_total = float(reward_total + soft_gate_score)
+            reward_components["gate_component"] = float(soft_gate_score)
+    elif not gate.get("gate_pass", True):
+        reward_total = float(reward_total + soft_gate_score)
+        reward_components["gate_component"] = float(soft_gate_score)
 
     equity = getattr(metrics, "equity", None)
     trades_stats = getattr(metrics, "trades", None)
@@ -284,6 +299,7 @@ def build_episode_summary(
         "vol_pct": _safe_float(getattr(equity, "vol_pct", None)),
         "exposure_ratio": _safe_float(getattr(equity, "exposure_ratio", None)),
         "percent_in_market": _safe_float(getattr(equity, "percent_in_market", None)),
+        "benchmark_return_pct": _safe_float(getattr(equity, "benchmark_roi_pct", None)),
         "excess_return": _safe_float(getattr(equity, "excess_return", None)),
         "win_rate": _safe_float(getattr(trades_stats, "win_rate", None)),
         "profit_factor": _safe_float(getattr(trades_stats, "profit_factor", None)),
@@ -302,8 +318,30 @@ def build_episode_summary(
         else:
             cycle_zero_reason = "NO_REENTRY_WINDOW"
 
+    idle_ratio = 0.0
+    if total_bars > 0:
+        idle_ratio = float(stats["flat_bars"]) / float(total_bars)
+
+    invalid_action_events = []
+    invalid_action_reason_counts: Dict[str, int] = {}
+    invalid_action_first_index = None
+    ignored_action_events = []
+    ignored_action_reason_counts: Dict[str, int] = {}
+    ignored_action_first_index = None
+    if bt_result is not None:
+        invalid_action_events = list(getattr(bt_result, "invalid_action_events", []) or [])
+        invalid_action_reason_counts = dict(getattr(bt_result, "invalid_action_reason_counts", {}) or {})
+        invalid_action_first_index = getattr(bt_result, "invalid_action_first_index", None)
+        ignored_action_events = list(getattr(bt_result, "ignored_action_events", []) or [])
+        ignored_action_reason_counts = dict(getattr(bt_result, "ignored_action_reason_counts", {}) or {})
+        ignored_action_first_index = getattr(bt_result, "ignored_action_first_index", None)
+
+    if stats["trade_count"] == 0 and entry_rate == 0.0:
+        failure_codes.append("FAIL_NO_ENTRY")
+
     return {
         "timestamp": time.time(),
+        "batch_id": batch_id,
         "policy_id": policy_id,
         "stage": stage,
         "module_key": module_key,
@@ -311,23 +349,39 @@ def build_episode_summary(
         "cycle_count": stats["cycle_count"],
         "entry_count": stats["entry_count"],
         "exit_count": stats["exit_count"],
+        "cost_enter": stats["entry_count"],
+        "cost_flip": stats["entry_count"] + stats["exit_count"],
+        "act_count": int(getattr(metrics.trades, "act_count", 0)),
+        "act_rate": float(getattr(metrics.trades, "act_rate", 0.0)),
         "avg_hold_bars": stats["avg_hold_bars"],
         "p95_hold_bars": stats["p95_hold_bars"],
         "flat_bars": stats["flat_bars"],
         "avg_flat_gap": stats["avg_flat_gap"],
+        "idle_ratio": idle_ratio,
         "reentry_gaps": stats["reentry_gaps"],
         "entry_signal_rate": entry_rate,
         "invalid_action_count": int(getattr(metrics.trades, "invalid_action_count", 0)),
         "invalid_action_rate": float(getattr(metrics.trades, "invalid_action_rate", 0.0)),
+        "invalid_action_events": invalid_action_events,
+        "invalid_action_reason_counts": invalid_action_reason_counts,
+        "invalid_action_first_index": invalid_action_first_index,
+        "ignored_action_count": int(getattr(metrics.trades, "ignored_action_count", 0)),
+        "ignored_action_rate": float(getattr(metrics.trades, "ignored_action_rate", 0.0)),
+        "ignored_action_events": ignored_action_events,
+        "ignored_action_reason_counts": ignored_action_reason_counts,
+        "ignored_action_first_index": ignored_action_first_index,
         "exit_reason_ratio": stats["exit_reason_ratio"],
         "cycle_zero_reason": cycle_zero_reason,
         "one_shot_hold": one_shot_hold,
         "classification_tags": tags,
         "reward_total": reward_total,
         "reward_components": reward_components,
+        "rejection_reason": rejection_reason,
+        "rejection_distance": rejection_distance,
         "reward_breakdown": reward_breakdown or {},
         "performance": performance,
         "gate": gate,
+        "failure_codes": sorted(set(failure_codes)),
         "cycle_metadata": [c.to_dict() for c in cycles],
         "eval_score": float(eval_score),
     }
@@ -364,6 +418,73 @@ def _summary_stats(values: List[float]) -> Dict[str, float]:
     }
 
 
+def _parse_dist_range(dist_id: str, prefix: str) -> Optional[Tuple[float, float]]:
+    if not dist_id or not isinstance(dist_id, str):
+        return None
+    if not dist_id.startswith(prefix):
+        return None
+    parts = dist_id.split("_")
+    if len(parts) < 3:
+        return None
+    try:
+        low = float(parts[1])
+        high = float(parts[2])
+    except (TypeError, ValueError):
+        return None
+    if low > high:
+        low, high = high, low
+    return low, high
+
+
+def _risk_params_from_module_key(module_key: str) -> Optional[Dict[str, float]]:
+    if not module_key or not isinstance(module_key, str):
+        return None
+    parts = module_key.split("|")
+    if len(parts) < 5:
+        return None
+    tp_range = _parse_dist_range(parts[2], "tp_")
+    sl_range = _parse_dist_range(parts[3], "sl_")
+    h_range = _parse_dist_range(parts[4], "h_")
+    if not tp_range or not sl_range or not h_range:
+        return None
+    tp_mid = (tp_range[0] + tp_range[1]) / 2.0
+    sl_mid = (sl_range[0] + sl_range[1]) / 2.0
+    h_mid = (h_range[0] + h_range[1]) / 2.0
+    rr_mid = tp_mid / sl_mid if sl_mid > 0 else 0.0
+    return {
+        "tp_mid": tp_mid,
+        "sl_mid": sl_mid,
+        "h_mid": h_mid,
+        "rr_mid": rr_mid,
+    }
+
+
+def _bucket_topk(values: List[float], k: int = 3, precision: int = 3) -> List[Dict[str, Any]]:
+    if not values:
+        return []
+    counts: Dict[float, int] = {}
+    for val in values:
+        key = round(float(val), precision)
+        counts[key] = counts.get(key, 0) + 1
+    ranked = sorted(
+        [{"value": key, "count": count} for key, count in counts.items()],
+        key=lambda item: item["count"],
+        reverse=True,
+    )
+    return ranked[:k]
+
+
+def _correlation(values_x: List[float], values_y: List[float]) -> Dict[str, Any]:
+    if not values_x or not values_y:
+        return {"value": 0.0, "status": "empty"}
+    if len(values_x) != len(values_y) or len(values_x) < 2:
+        return {"value": 0.0, "status": "insufficient"}
+    x = np.array(values_x, dtype=float)
+    y = np.array(values_y, dtype=float)
+    if np.std(x) == 0.0 or np.std(y) == 0.0:
+        return {"value": 0.0, "status": "constant"}
+    return {"value": float(np.corrcoef(x, y)[0, 1]), "status": "ok"}
+
 def build_batch_report(
     batch_id: int,
     summaries: List[Dict[str, Any]],
@@ -371,10 +492,28 @@ def build_batch_report(
     cycle_counts = [int(s.get("cycle_count", 0)) for s in summaries]
     trade_counts = [int(s.get("trade_count", 0)) for s in summaries]
     avg_hold_bars = [float(s.get("avg_hold_bars", 0.0)) for s in summaries]
+    p95_hold_bars = [float(s.get("p95_hold_bars", 0.0)) for s in summaries]
+    idle_ratios = [float(s.get("idle_ratio", 0.0)) for s in summaries]
     invalid_action_rates = [float(s.get("invalid_action_rate", 0.0)) for s in summaries]
+    invalid_action_counts = [int(s.get("invalid_action_count", 0)) for s in summaries]
+    ignored_action_rates = [float(s.get("ignored_action_rate", 0.0)) for s in summaries]
+    ignored_action_counts = [int(s.get("ignored_action_count", 0)) for s in summaries]
+    act_rates = [float(s.get("act_rate", 0.0)) for s in summaries]
+    act_rate_summary = _summary_stats(act_rates)
     gate_pass_rate = float(np.mean([1.0 if s.get("gate", {}).get("gate_pass") else 0.0 for s in summaries])) if summaries else 0.0
     reward_scores = [float(s.get("reward_total", s.get("eval_score", 0.0))) for s in summaries]
     reward_variance = float(np.var(reward_scores)) if reward_scores else 0.0
+    reward_std = float(np.std(reward_scores)) if reward_scores else 0.0
+    rounded_scores = [round(float(s), 6) for s in reward_scores]
+    reward_unique_count = len(set(rounded_scores)) if rounded_scores else 0
+    fixed_penalty_ratio = 0.0
+    fixed_penalty_top_value = None
+    if rounded_scores:
+        counts: Dict[float, int] = {}
+        for val in rounded_scores:
+            counts[val] = counts.get(val, 0) + 1
+        fixed_penalty_ratio = max(counts.values()) / len(rounded_scores)
+        fixed_penalty_top_value = max(counts.items(), key=lambda kv: kv[1])[0]
     soft_gate_scores = [float(s.get("gate", {}).get("soft_gate_score", 0.0)) for s in summaries]
     one_shot_hold_rate = float(np.mean([1.0 if s.get("one_shot_hold") else 0.0 for s in summaries])) if summaries else 0.0
     agent_exit_ratios = [float(s.get("exit_reason_ratio", {}).get("AGENT_EXIT", 0.0)) for s in summaries]
@@ -395,14 +534,39 @@ def build_batch_report(
     single_trade_exit_ratio = {k: (v / len(single_trade) if single_trade else 0.0) for k, v in single_trade_exit_sum.items()}
 
     fail_reason_counts: Dict[str, int] = {}
+    reject_reason_counts: Dict[str, int] = {}
+    reject_distances: List[float] = []
     nearest_gate_counts: Dict[str, int] = {}
     no_cycle_fails = 0
     distance_values: List[float] = []
+    failure_code_counts: Dict[str, int] = {}
+    failure_taxonomy_counts: Dict[str, int] = {
+        "FAIL_INVALID_ACTION": 0,
+        "FAIL_GATE": 0,
+        "FAIL_RISK": 0,
+        "FAIL_NO_ENTRY": 0,
+        "FAIL_RUNTIME": 0,
+    }
+    invalid_reason_counts: Dict[str, int] = {}
+    ignored_reason_counts: Dict[str, int] = {}
+    invalid_first_indices: List[int] = []
     for s in summaries:
         gate = s.get("gate", {})
         fail_reason = gate.get("fail_reason", "PASS")
         if fail_reason != "PASS":
             fail_reason_counts[fail_reason] = fail_reason_counts.get(fail_reason, 0) + 1
+        for code in s.get("failure_codes", []) or []:
+            failure_code_counts[code] = failure_code_counts.get(code, 0) + 1
+            if code == "FAIL_INVALID_ACTION":
+                failure_taxonomy_counts["FAIL_INVALID_ACTION"] += 1
+            elif code == "FAIL_RUNTIME":
+                failure_taxonomy_counts["FAIL_RUNTIME"] += 1
+            elif code == "FAIL_NO_ENTRY":
+                failure_taxonomy_counts["FAIL_NO_ENTRY"] += 1
+            elif code == "FAIL_MDD_BREACH":
+                failure_taxonomy_counts["FAIL_RISK"] += 1
+            else:
+                failure_taxonomy_counts["FAIL_GATE"] += 1
         hard_reasons = gate.get("hard_fail_reasons", [])
         if "FAIL_NO_CYCLE" in hard_reasons or fail_reason == "FAIL_NO_CYCLE":
             no_cycle_fails += 1
@@ -410,6 +574,57 @@ def build_batch_report(
         nearest_gate = gate.get("nearest_gate", "PASS")
         if nearest_gate != "PASS":
             nearest_gate_counts[nearest_gate] = nearest_gate_counts.get(nearest_gate, 0) + 1
+        for reason, count in (s.get("invalid_action_reason_counts", {}) or {}).items():
+            invalid_reason_counts[reason] = invalid_reason_counts.get(reason, 0) + int(count)
+        for reason, count in (s.get("ignored_action_reason_counts", {}) or {}).items():
+            ignored_reason_counts[reason] = ignored_reason_counts.get(reason, 0) + int(count)
+        first_idx = s.get("invalid_action_first_index", None)
+        if first_idx is not None:
+            invalid_first_indices.append(int(first_idx))
+        rej_reason = s.get("rejection_reason")
+        if rej_reason:
+            reject_reason_counts[rej_reason] = reject_reason_counts.get(rej_reason, 0) + 1
+            rej_dist = s.get("rejection_distance")
+            if isinstance(rej_dist, (int, float)):
+                reject_distances.append(float(rej_dist))
+
+    risk_params_all: List[Dict[str, float]] = []
+    risk_params_low_return: List[Dict[str, float]] = []
+    risk_params_pf: List[Dict[str, float]] = []
+    for s in summaries:
+        params = _risk_params_from_module_key(str(s.get("module_key", "")))
+        if not params:
+            continue
+        risk_params_all.append(params)
+        codes = set(s.get("failure_codes", []) or [])
+        if "FAIL_LOW_RETURN" in codes:
+            risk_params_low_return.append(params)
+        if "FAIL_PF" in codes:
+            risk_params_pf.append(params)
+
+    def _risk_param_summary(items: List[Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+        tp_vals = [p["tp_mid"] for p in items if "tp_mid" in p]
+        sl_vals = [p["sl_mid"] for p in items if "sl_mid" in p]
+        h_vals = [p["h_mid"] for p in items if "h_mid" in p]
+        rr_vals = [p["rr_mid"] for p in items if "rr_mid" in p]
+        return {
+            "tp_mid": _summary_stats(tp_vals),
+            "sl_mid": _summary_stats(sl_vals),
+            "h_mid": _summary_stats(h_vals),
+            "rr_mid": _summary_stats(rr_vals),
+        }
+
+    def _risk_param_topk(items: List[Dict[str, float]]) -> Dict[str, List[Dict[str, Any]]]:
+        tp_vals = [p["tp_mid"] for p in items if "tp_mid" in p]
+        sl_vals = [p["sl_mid"] for p in items if "sl_mid" in p]
+        h_vals = [p["h_mid"] for p in items if "h_mid" in p]
+        rr_vals = [p["rr_mid"] for p in items if "rr_mid" in p]
+        return {
+            "tp_mid": _bucket_topk(tp_vals),
+            "sl_mid": _bucket_topk(sl_vals),
+            "h_mid": _bucket_topk(h_vals, precision=1),
+            "rr_mid": _bucket_topk(rr_vals),
+        }
 
     top_k = int(getattr(config, "OBS_BATCH_TOP_K", 5))
     eligible = [s for s in summaries if int(s.get("cycle_count", 0)) > 0]
@@ -446,6 +661,7 @@ def build_batch_report(
         "trades_per_year",
         "expectancy",
         "reward_risk",
+        "benchmark_return_pct",
         "excess_return",
     ]
     performance_summary: Dict[str, Dict[str, float]] = {}
@@ -477,24 +693,143 @@ def build_batch_report(
             "nearest_gate": gate.get("nearest_gate", "PASS"),
         })
 
+    gate_flags = []
+    valid_flags = []
+    selected_flags = []
+    selection_perf = []
+    selection_progress = []
+    selection_robust = []
+    selection_score = []
+    entry_rates = []
+    hold_bars = []
+    for s in summaries:
+        status = s.get("selection_status", {}) or {}
+        gate_flags.append(bool(status.get("gate_pass", s.get("gate", {}).get("gate_pass", False))))
+        valid_flags.append(bool(status.get("valid", False)))
+        selected_flags.append(bool(status.get("selected", False)))
+
+        components = s.get("selection_components", {}) or {}
+        selection_perf.append(float(components.get("performance", s.get("reward_total", s.get("eval_score", 0.0)))))
+        selection_progress.append(float(components.get("progress", s.get("gate", {}).get("soft_gate_score", 0.0))))
+        selection_robust.append(float(components.get("robustness", 0.0)))
+        selection_score.append(float(components.get("selection_score", s.get("reward_total", s.get("eval_score", 0.0)))))
+
+        entry_rates.append(float(s.get("entry_signal_rate", 0.0)))
+        hold_bars.append(float(s.get("avg_hold_bars", 0.0)))
+
+    gate_pass_count = int(sum(1 for v in gate_flags if v))
+    valid_count = int(sum(1 for v in valid_flags if v))
+    selected_count = int(sum(1 for v in selected_flags if v))
+    valid_rate = float(valid_count / len(summaries)) if summaries else 0.0
+    valid_not_gate_pass = int(sum(1 for g, v in zip(gate_flags, valid_flags) if v and not g))
+    selected_not_valid = int(sum(1 for v, s in zip(valid_flags, selected_flags) if s and not v))
+    gate_pass_not_selected = int(sum(1 for g, s in zip(gate_flags, selected_flags) if g and not s))
+
+    correlation_report = {
+        "trades_count_vs_total_score": _correlation(trade_counts, selection_score),
+        "trades_count_vs_performance": _correlation(trade_counts, selection_perf),
+        "entry_signal_rate_vs_trades_count": _correlation(entry_rates, trade_counts),
+        "hold_bars_vs_trades_count": _correlation(hold_bars, trade_counts),
+        "gate_valid_selected": {
+            "gate_pass_count": gate_pass_count,
+            "valid_count": valid_count,
+            "selected_count": selected_count,
+            "valid_not_gate_pass": valid_not_gate_pass,
+            "selected_not_valid": selected_not_valid,
+            "gate_pass_not_selected": gate_pass_not_selected,
+            "valid_subset_gate_pass": valid_not_gate_pass == 0,
+            "selected_subset_valid": selected_not_valid == 0,
+        },
+    }
+
+    invalid_reason_topk = sorted(
+        [{"reason": k, "count": v} for k, v in invalid_reason_counts.items()],
+        key=lambda item: item["count"],
+        reverse=True,
+    )[:3]
+    ignored_reason_topk = sorted(
+        [{"reason": k, "count": v} for k, v in ignored_reason_counts.items()],
+        key=lambda item: item["count"],
+        reverse=True,
+    )[:3]
+
+    reward_collapse = {
+        "reward_std": reward_std,
+        "reward_unique_count": reward_unique_count,
+        "fixed_penalty_ratio": fixed_penalty_ratio,
+        "fixed_penalty_top_value": fixed_penalty_top_value,
+        "std_below_min": reward_std < float(getattr(config, "REWARD_COLLAPSE_STD_MIN", 0.0)),
+        "unique_below_min": reward_unique_count < int(getattr(config, "REWARD_COLLAPSE_UNIQUE_MIN", 0)),
+        "fixed_ratio_above_max": fixed_penalty_ratio > float(getattr(config, "REWARD_COLLAPSE_FIXED_RATIO_MAX", 1.0)),
+    }
+    reward_collapse["collapsed"] = (
+        reward_collapse["std_below_min"]
+        or reward_collapse["unique_below_min"]
+        or reward_collapse["fixed_ratio_above_max"]
+    )
+    if reward_collapse["collapsed"]:
+        failure_taxonomy_counts["COLLAPSED"] = 1
+
+    stage_id = int(getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+    stage_constraints = compute_entry_rate_constraints(stage_id, observed_act_rate=act_rate_summary.get("mean"))
+
     return {
         "timestamp": time.time(),
         "batch_id": batch_id,
         "episode_count": len(summaries),
         "gate_pass_rate": gate_pass_rate,
+        "gate_pass_count": gate_pass_count,
+        "valid_count": valid_count,
+        "valid_rate": valid_rate,
+        "selected_count": selected_count,
         "reward_variance": reward_variance,
+        "reward_std": reward_std,
+        "reward_unique_count": reward_unique_count,
+        "fixed_penalty_ratio": fixed_penalty_ratio,
+        "fixed_penalty_top_value": fixed_penalty_top_value,
         "cycle_count_hist": _histogram(cycle_counts, config.OBS_CYCLE_COUNT_BINS),
         "trade_count_hist": _histogram(trade_counts, config.OBS_TRADE_COUNT_BINS),
         "avg_hold_bars_hist": _histogram([int(v) for v in avg_hold_bars], config.OBS_HOLD_BARS_BINS),
+        "p95_hold_bars_mean": float(np.mean(p95_hold_bars)) if p95_hold_bars else 0.0,
+        "entry_signal_rate_mean": float(np.mean(entry_rates)) if entry_rates else 0.0,
+        "idle_ratio_mean": float(np.mean(idle_ratios)) if idle_ratios else 0.0,
         "no_cycle_fail_rate": float(no_cycle_fails / len(summaries)) if summaries else 0.0,
         "gate_fail_reasons": fail_reason_counts,
+        "fail_reason_distribution": failure_code_counts,
+        "reject_reason_distribution": reject_reason_counts,
+        "reject_distance_stats": {
+            "mean": float(np.mean(reject_distances)) if reject_distances else 0.0,
+            "p50": float(np.percentile(reject_distances, 50)) if reject_distances else 0.0,
+            "p90": float(np.percentile(reject_distances, 90)) if reject_distances else 0.0,
+        },
+        "failure_taxonomy_counts": failure_taxonomy_counts,
         "distance_to_pass_hist": _histogram([int(v) for v in distance_values], config.OBS_TRADE_COUNT_BINS),
         "distance_to_pass_mean": float(np.mean(distance_values)) if distance_values else 0.0,
+        "invalid_action_count_total": int(sum(invalid_action_counts)),
         "invalid_action_rate_mean": float(np.mean(invalid_action_rates)) if invalid_action_rates else 0.0,
         "invalid_action_rate_p90": float(np.percentile(invalid_action_rates, 90)) if invalid_action_rates else 0.0,
+        "invalid_reason_topk": invalid_reason_topk,
+        "ignored_action_count_total": int(sum(ignored_action_counts)),
+        "ignored_action_rate_mean": float(np.mean(ignored_action_rates)) if ignored_action_rates else 0.0,
+        "ignored_action_rate_p90": float(np.percentile(ignored_action_rates, 90)) if ignored_action_rates else 0.0,
+        "ignored_reason_topk": ignored_reason_topk,
+        "invalid_first_occurrence_step": int(min(invalid_first_indices)) if invalid_first_indices else None,
+        "act_rate_summary": act_rate_summary,
         "soft_gate_score_mean": float(np.mean(soft_gate_scores)) if soft_gate_scores else 0.0,
         "soft_gate_score_p10": float(np.percentile(soft_gate_scores, 10)) if soft_gate_scores else 0.0,
         "soft_gate_score_p90": float(np.percentile(soft_gate_scores, 90)) if soft_gate_scores else 0.0,
+        "progress_score_mean": float(np.mean(soft_gate_scores)) if soft_gate_scores else 0.0,
+        "reward_collapse": reward_collapse,
+        "stage_constraints": stage_constraints,
+        "risk_param_summary": {
+            "overall": _risk_param_summary(risk_params_all),
+            "fail_low_return": _risk_param_summary(risk_params_low_return),
+            "fail_pf": _risk_param_summary(risk_params_pf),
+        },
+        "risk_param_topk": {
+            "fail_low_return": _risk_param_topk(risk_params_low_return),
+            "fail_pf": _risk_param_topk(risk_params_pf),
+        },
         "one_shot_hold_rate": one_shot_hold_rate,
         "single_trade_rate": single_trade_rate,
         "single_trade_entry_rate_mean": single_trade_entry_rate_mean,
@@ -510,6 +845,13 @@ def build_batch_report(
         "topk_performance_summary": topk_performance_summary,
         "topk_performance": topk_performance,
         "nearest_gate_counts": nearest_gate_counts,
+        "selection_component_summary": {
+            "performance": _summary_stats(selection_perf),
+            "progress": _summary_stats(selection_progress),
+            "robustness": _summary_stats(selection_robust),
+            "selection_score": _summary_stats(selection_score),
+        },
+        "correlation_report": correlation_report,
     }
 
 
@@ -561,6 +903,32 @@ def log_batch(report: Dict[str, Any]) -> None:
         _write_jsonl(target, report)
     except Exception as exc:
         _log_observability_error("batch_log", exc, {"batch_id": report.get("batch_id")})
+
+
+def log_invalid_actions(batch_id: int, summaries: List[Dict[str, Any]]) -> None:
+    try:
+        target = Path(config.OBSERVABILITY_DIR) / "invalid_action_events.jsonl"
+        for summary in summaries:
+            events = summary.get("invalid_action_events") or []
+            ignored_events = summary.get("ignored_action_events") or []
+            if not events:
+                events = []
+            payload_base = {
+                "timestamp": time.time(),
+                "batch_id": batch_id,
+                "policy_id": summary.get("policy_id"),
+                "module_key": summary.get("module_key"),
+            }
+            for event in events:
+                payload = dict(payload_base)
+                payload.update({"event": event, "event_type": "invalid"})
+                _write_jsonl(target, payload)
+            for event in ignored_events:
+                payload = dict(payload_base)
+                payload.update({"event": event, "event_type": "ignored"})
+                _write_jsonl(target, payload)
+    except Exception as exc:
+        _log_observability_error("invalid_action_log", exc, {"batch_id": batch_id})
 
 
 def load_recent_batch_reports(limit: int) -> List[Dict[str, Any]]:

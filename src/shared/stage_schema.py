@@ -35,10 +35,16 @@ class StageSpec:
     # 4.1 Rejection & Signal Degeneracy Control
     reject_base_penalty: float = -30.0
     signal_degeneracy_mode: str = "soft" # "soft" (penalty) or "hard" (rejection)
-    
+
     # 5. Diagnostic Rules
     rejection_rate_range: Tuple[float, float] = (0.3, 0.9)
     min_pass_rate: float = 0.05
+
+    # 6. CMDP Constraints (Entry/Flip bounds)
+    min_entries_per_year: Optional[float] = None
+    max_entries_per_year: Optional[float] = None
+    min_flips_per_year: Optional[float] = None
+    max_flips_per_year: Optional[float] = None
 
     def to_dict(self) -> Dict:
         return {k: v for k, v in self.__dict__.items()}

@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 from src.shared.logger import get_logger
+from src.config import config
 
 logger = get_logger("backtest.engine")
 
@@ -22,11 +23,20 @@ class BacktestResult:
     avg_trade_return: float
     trades_per_year: float = 0.0
     excess_return: float = 0.0
+    benchmark_return: float = 0.0
     complexity_penalty: float = 0.0
     trade_returns: List[float] = None
     invalid_action_count: int = 0
     invalid_action_rate: float = 0.0
+    ignored_action_count: int = 0
+    ignored_action_rate: float = 0.0
     total_action_bars: int = 0
+    invalid_action_events: Optional[List[Dict[str, object]]] = None
+    invalid_action_reason_counts: Optional[Dict[str, int]] = None
+    invalid_action_first_index: Optional[int] = None
+    ignored_action_events: Optional[List[Dict[str, object]]] = None
+    ignored_action_reason_counts: Optional[Dict[str, int]] = None
+    ignored_action_first_index: Optional[int] = None
 
 class DeterministicBacktestEngine:
     """
@@ -51,6 +61,10 @@ class DeterministicBacktestEngine:
         tp_pct: Optional[float] = None,
         sl_pct: Optional[float] = None,
         max_hold_bars: Optional[int] = None,
+        hold_min_bars: Optional[pd.Series] = None,
+        hold_max_bars: Optional[pd.Series] = None,
+        benchmark_mode: Optional[str] = None,
+        benchmark_return_pct: Optional[float] = None,
     ) -> BacktestResult:
         if close_prices.empty:
             return self._empty_result()
@@ -69,8 +83,68 @@ class DeterministicBacktestEngine:
         entry_idx = None
         entry_price = None
         hold_bars = 0
+        current_min_hold = 0
+        current_max_hold = max_hold_bars
         invalid_action_count = 0
+        ignored_action_count = 0
         total_action_bars = 0
+        invalid_action_events: List[Dict[str, object]] = []
+        invalid_action_reason_counts: Dict[str, int] = {}
+        invalid_action_first_index: Optional[int] = None
+        ignored_action_events: List[Dict[str, object]] = []
+        ignored_action_reason_counts: Dict[str, int] = {}
+        ignored_action_first_index: Optional[int] = None
+        max_invalid_events = int(getattr(config, "INVALID_ACTION_MAX_EVENTS", 5))
+
+        def _record_invalid(reason: str, state_value: int, idx: int, entry: bool, exit: bool) -> None:
+            nonlocal invalid_action_count, invalid_action_first_index
+            invalid_action_count += 1
+            invalid_action_reason_counts[reason] = invalid_action_reason_counts.get(reason, 0) + 1
+            if invalid_action_first_index is None:
+                invalid_action_first_index = int(idx)
+            if len(invalid_action_events) >= max_invalid_events:
+                return
+            position_state = "LONG" if state_value == 1 else "FLAT"
+            allowed = ["HOLD", "EXIT_LONG"] if state_value == 1 else ["HOLD", "ENTER_LONG"]
+            action = "CONFLICT_ENTRY_EXIT"
+            if reason == "FLAT_EXIT":
+                action = "EXIT_LONG"
+            elif reason == "LONG_ENTER":
+                action = "ENTER_LONG"
+            invalid_action_events.append({
+                "step_index": int(idx),
+                "position_state_before": position_state,
+                "action_chosen": action,
+                "allowed_actions_in_state": allowed,
+                "invalid_reason_code": reason,
+                "entry_signal": bool(entry),
+                "exit_signal": bool(exit),
+            })
+
+        def _record_ignored(reason: str, state_value: int, idx: int, entry: bool, exit: bool) -> None:
+            nonlocal ignored_action_count, ignored_action_first_index
+            ignored_action_count += 1
+            ignored_action_reason_counts[reason] = ignored_action_reason_counts.get(reason, 0) + 1
+            if ignored_action_first_index is None:
+                ignored_action_first_index = int(idx)
+            if len(ignored_action_events) >= max_invalid_events:
+                return
+            position_state = "LONG" if state_value == 1 else "FLAT"
+            allowed = ["HOLD", "EXIT_LONG"] if state_value == 1 else ["HOLD", "ENTER_LONG"]
+            action = "CONFLICT_ENTRY_EXIT"
+            if reason == "IGNORED_FLAT_EXIT":
+                action = "EXIT_LONG"
+            elif reason == "IGNORED_LONG_ENTER":
+                action = "ENTER_LONG"
+            ignored_action_events.append({
+                "step_index": int(idx),
+                "position_state_before": position_state,
+                "action_chosen": action,
+                "allowed_actions_in_state": allowed,
+                "ignored_reason_code": reason,
+                "entry_signal": bool(entry),
+                "exit_signal": bool(exit),
+            })
         
         # State Machine Loop
         # Action set (long-only): HOLD / ENTER_LONG / EXIT_LONG
@@ -80,21 +154,35 @@ class DeterministicBacktestEngine:
 
             if raw_entry or raw_exit:
                 total_action_bars += 1
-            if raw_entry and raw_exit:
-                invalid_action_count += 1
+
+            conflict = raw_entry and raw_exit
+            invalid_reason = None
+            ignored_reason = None
+            if conflict:
+                invalid_reason = "CONFLICT_ENTRY_EXIT"
+            elif raw_entry and state == 1:
+                ignored_reason = "IGNORED_LONG_ENTER"
+            elif raw_exit and state == 0:
+                ignored_reason = "IGNORED_FLAT_EXIT"
+            if invalid_reason:
+                _record_invalid(invalid_reason, state, i, raw_entry, raw_exit)
+            if ignored_reason:
+                _record_ignored(ignored_reason, state, i, raw_entry, raw_exit)
 
             # State-gated actions (signals themselves are not actions).
-            entry_action = raw_entry and state == 0
-            exit_action = raw_exit and state == 1
+            entry_action = raw_entry and state == 0 and not conflict
+            exit_action = raw_exit and state == 1 and not conflict
 
             # 1. State: LONG -> Check EXIT
             if state == 1:
-                if exit_action:
+                if exit_action and hold_bars >= int(current_min_hold or 0):
                     self._record_trade(trades, prices, entry_idx, i, dates, "AGENT_EXIT")
                     state = 0
                     entry_idx = None
                     entry_price = None
                     hold_bars = 0
+                    current_min_hold = 0
+                    current_max_hold = max_hold_bars
                 else:
                     hold_bars += 1
                     if entry_price is not None:
@@ -104,18 +192,24 @@ class DeterministicBacktestEngine:
                             entry_idx = None
                             entry_price = None
                             hold_bars = 0
+                            current_min_hold = 0
+                            current_max_hold = max_hold_bars
                         elif sl_pct is not None and prices[i] <= entry_price * (1.0 - sl_pct):
                             self._record_trade(trades, prices, entry_idx, i, dates, "SL")
                             state = 0
                             entry_idx = None
                             entry_price = None
                             hold_bars = 0
-                        elif max_hold_bars is not None and hold_bars >= max_hold_bars:
+                            current_min_hold = 0
+                            current_max_hold = max_hold_bars
+                        elif current_max_hold is not None and hold_bars >= int(current_max_hold):
                             self._record_trade(trades, prices, entry_idx, i, dates, "HORIZON")
                             state = 0
                             entry_idx = None
                             entry_price = None
                             hold_bars = 0
+                            current_min_hold = 0
+                            current_max_hold = max_hold_bars
             
             # 2. State: FLAT -> Check ENTRY
             elif state == 0:
@@ -124,6 +218,22 @@ class DeterministicBacktestEngine:
                     entry_idx = i
                     entry_price = prices[i]
                     hold_bars = 0
+                    current_min_hold = 0
+                    current_max_hold = max_hold_bars
+                    if hold_min_bars is not None:
+                        try:
+                            current_min_hold = int(hold_min_bars.iloc[i])
+                        except Exception:
+                            current_min_hold = 0
+                    if hold_max_bars is not None:
+                        try:
+                            current_max_hold = int(hold_max_bars.iloc[i])
+                        except Exception:
+                            current_max_hold = max_hold_bars
+                    if current_min_hold < 0:
+                        current_min_hold = 0
+                    if current_max_hold is not None and current_max_hold < current_min_hold:
+                        current_max_hold = current_min_hold
             
             positions[i] = state
             
@@ -174,13 +284,26 @@ class DeterministicBacktestEngine:
         exposure = float(np.mean(positions))
         
         bh_return = (prices[-1]/prices[0] - 1.0) * 100.0
-        excess_return = total_return - bh_return
+        if benchmark_mode:
+            from src.shared.benchmark import compute_benchmark_return, compute_excess_return
+            bench_ret = compute_benchmark_return(
+                prices=close_prices,
+                exposure_ratio=exposure,
+                mode=benchmark_mode,
+                fixed_return_pct=float(benchmark_return_pct or 0.0),
+            )
+            excess_return = compute_excess_return(total_return, bench_ret)
+        else:
+            bench_ret = bh_return
+            excess_return = total_return - bh_return
         
         avg_trade_return = float(np.mean(trade_returns) * 100.0) if trade_count > 0 else 0.0
         
         invalid_action_rate = 0.0
+        ignored_action_rate = 0.0
         if total_action_bars > 0:
             invalid_action_rate = float(invalid_action_count / total_action_bars)
+            ignored_action_rate = float(ignored_action_count / total_action_bars)
 
         return BacktestResult(
             dates=[d.strftime("%Y-%m-%d") for d in dates],
@@ -195,10 +318,19 @@ class DeterministicBacktestEngine:
             avg_trade_return=avg_trade_return,
             trades_per_year=trades_per_year,
             excess_return=excess_return,
+            benchmark_return=bench_ret,
             trade_returns=trade_returns.tolist(),
             invalid_action_count=invalid_action_count,
             invalid_action_rate=invalid_action_rate,
+            ignored_action_count=ignored_action_count,
+            ignored_action_rate=ignored_action_rate,
             total_action_bars=total_action_bars,
+            invalid_action_events=invalid_action_events,
+            invalid_action_reason_counts=invalid_action_reason_counts,
+            invalid_action_first_index=invalid_action_first_index,
+            ignored_action_events=ignored_action_events,
+            ignored_action_reason_counts=ignored_action_reason_counts,
+            ignored_action_first_index=ignored_action_first_index,
         )
 
     def _record_trade(self, trades, prices, entry_idx, exit_idx, dates, exit_reason: str):
@@ -240,5 +372,13 @@ class DeterministicBacktestEngine:
             trade_returns=[],
             invalid_action_count=0,
             invalid_action_rate=0.0,
+            ignored_action_count=0,
+            ignored_action_rate=0.0,
             total_action_bars=0,
+            invalid_action_events=[],
+            invalid_action_reason_counts={},
+            invalid_action_first_index=None,
+            ignored_action_events=[],
+            ignored_action_reason_counts={},
+            ignored_action_first_index=None,
         )

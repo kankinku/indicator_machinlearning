@@ -115,6 +115,9 @@ class BaseConfig:
     PARALLEL_BATCH_SIZE: int = field(
         default_factory=lambda: int(os.getenv("PARALLEL_BATCH_SIZE", "0"))
     )
+    BATCH_POLICY_COUNT: int = field(
+        default_factory=lambda: int(os.getenv("BATCH_POLICY_COUNT", "0"))
+    )
     PARALLEL_CHUNK_SIZE: int = field(
         default_factory=lambda: int(os.getenv("PARALLEL_CHUNK_SIZE", "10"))
     )
@@ -178,6 +181,32 @@ class BaseConfig:
     # ----------------------------------------
     # Observability
     # ----------------------------------------
+    ACT_TIMING_ENABLED: bool = True
+    ACT_TIMING_FALLBACK_STRIDE: int = 4
+    POLICY_STATE_GATE_ENABLED: bool = True
+    POLICY_STATE_GATE_FORCED_EXIT: bool = True
+    HOLD_DURATION_BUCKETS_BY_STAGE: Dict[int, Dict[str, Dict[str, int]]] = field(default_factory=lambda: {
+        1: {
+            "short": {"min": 1, "max": 5},
+            "medium": {"min": 5, "max": 20},
+            "long": {"min": 20, "max": 60},
+        },
+        2: {
+            "short": {"min": 1, "max": 8},
+            "medium": {"min": 8, "max": 30},
+            "long": {"min": 30, "max": 80},
+        },
+        3: {
+            "short": {"min": 1, "max": 10},
+            "medium": {"min": 10, "max": 50},
+            "long": {"min": 50, "max": 120},
+        },
+        4: {
+            "short": {"min": 1, "max": 15},
+            "medium": {"min": 15, "max": 80},
+            "long": {"min": 80, "max": 200},
+        },
+    })
     OBS_BATCH_TOP_K: int = 5
     OBS_DEADLOCK_WINDOW: int = 20
     OBS_DEADLOCK_MEDIAN_CYCLES_MAX: float = 1.0
@@ -189,10 +218,54 @@ class BaseConfig:
     OBS_RARE_SIGNAL_ENTRY_RATE_MAX: float = 0.001
     OBS_OVERFILTER_ENTRY_RATE_MAX: float = 0.002
     OBS_OVERFILTER_COMPLEXITY_MIN: float = 4.0
+    INVALID_ACTION_MAX_EVENTS: int = 5
     OBS_TRADE_COUNT_BINS: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 5, 10, 20, 50, 100])
     OBS_CYCLE_COUNT_BINS: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 5, 10, 20, 50, 100])
     OBS_HOLD_BARS_BINS: List[int] = field(default_factory=lambda: [0, 1, 2, 5, 10, 20, 50, 100, 200, 500])
     OBS_REENTRY_GAP_BINS: List[int] = field(default_factory=lambda: [0, 1, 2, 5, 10, 20, 50, 100, 200, 500])
+    REWARD_COLLAPSE_STD_MIN: float = 1e-4
+    REWARD_COLLAPSE_UNIQUE_MIN: int = 3
+    REWARD_COLLAPSE_FIXED_RATIO_MAX: float = 0.6
+    REWARD_COLLAPSE_TREND_WINDOW: int = 5
+    REWARD_COLLAPSE_TREND_MIN_COUNT: int = 3
+    ENTRY_HIT_RATE_FILTER_ENABLED: bool = True
+    TRADING_DAYS_PER_YEAR: float = 252.0
+    DECISION_STEPS_PER_DAY: float = 1.0
+    ENTRY_EFFECTIVE_OPPORTUNITY_FACTOR_DEFAULT: float = 1.0
+    ENTRY_EFFECTIVE_OPPORTUNITY_FACTOR_MIN: float = 0.01
+    ENTRY_EFFECTIVE_OPPORTUNITY_FACTOR_MAX: float = 1.0
+    ENTRY_EFFECTIVE_OPPORTUNITY_FACTOR_DELTA_WARN: float = 0.2
+    ENTRY_EFFECTIVE_OPPORTUNITY_FACTOR_BY_STAGE: Dict[int, float] = field(default_factory=lambda: {
+        1: 1.0,
+        2: 1.0,
+        3: 1.0,
+        4: 1.0,
+    })
+    ENTRY_RATE_SAFETY_MARGIN: float = 1.2
+    ENTRY_RATE_DYNAMIC_MIN_ENABLED: bool = True
+    ENTRY_RATE_MIN_SCALE: float = 0.8
+    ENTRY_RATE_CONSTRAINT_POLICY: str = "refactor"  # refactor | auto_adjust_bounds | auto_adjust_min_entries
+    ENTRY_HIT_RATE_BOUNDS_BY_STAGE: Dict[int, Dict[str, float]] = field(default_factory=lambda: {
+        1: {"min": 0.005, "max": 0.05},
+        2: {"min": 0.003, "max": 0.04},
+        3: {"min": 0.001, "max": 0.06},
+        4: {"min": 0.001, "max": 0.08},
+    })
+    PREFILTER_TARGET_KEEP: int = 8
+    PREFILTER_MIN_KEEP: int = 4
+    PREFILTER_MAX_ATTEMPTS: int = 80
+    PREFILTER_QUANTILE_RANGE_BY_STAGE: Dict[int, Dict[str, float]] = field(default_factory=lambda: {
+        1: {"min": 0.1, "max": 0.9},
+        2: {"min": 0.1, "max": 0.9},
+        3: {"min": 0.05, "max": 0.95},
+        4: {"min": 0.05, "max": 0.95},
+    })
+    EXIT_QUANTILE_BOUNDS_BY_STAGE: Dict[int, Dict[str, float]] = field(default_factory=lambda: {
+        1: {"min": 0.3, "max": 0.7},
+        2: {"min": 0.3, "max": 0.7},
+        3: {"min": 0.2, "max": 0.8},
+        4: {"min": 0.2, "max": 0.8},
+    })
 
     # ----------------------------------------
     # Stage Auto-Promotion/Demotion (Batch-based)
@@ -203,20 +276,31 @@ class BaseConfig:
     STAGE_AUTO_MIN_BATCH_INTERVAL: int = 2
     STAGE_AUTO_PROMOTION_RULES: Dict[int, Dict[str, Any]] = field(default_factory=lambda: {
         1: {
+            "min_valid_rate": 0.1,
+            "min_gate_pass_rate": 0.05,
+            "min_median_trade": 5.0,
+            "max_reward_collapse": 0.0,
             "min_median_cycle": 1.0,
             "max_no_cycle_fail_rate": 0.6,
             "min_reward_variance": 1e-4,
             "nearest_gate_not_in": ["FAIL_NO_CYCLE"],
         },
         2: {
+            "min_valid_rate": 0.1,
+            "min_gate_pass_rate": 0.05,
+            "min_median_trade": 5.0,
+            "max_reward_collapse": 0.0,
             "min_agent_exit_ratio": 0.05,
             "max_invalid_action_rate": 0.05,
             "max_median_hold_bars": 200.0,
         },
         3: {
+            "min_valid_rate": 0.1,
+            "min_gate_pass_rate": 0.05,
+            "min_median_trade": 5.0,
+            "max_reward_collapse": 0.0,
             "min_median_cycle": 2.0,
             "min_cost_component_mean": 0.05,
-            "min_gate_pass_rate": 0.01,
             "max_distance_to_pass_mean": 5.0,
             "min_wf_pass_rate": 0.2,
         },
@@ -262,6 +346,15 @@ class BaseConfig:
         "min_diversity_mean": 0.2,
         "max_nearest_gate_ratio": 0.8,
     })
+    FAILURE_MODE_STOP_RULES: Dict[str, float] = field(default_factory=lambda: {
+        "max_trade_median": 5.0,
+        "max_topk_trade": 5.0,
+        "min_topk_low_trade_ratio": 0.5,
+    })
+    FAILURE_MODE_REFACTOR_RULES: Dict[str, float] = field(default_factory=lambda: {
+        "min_gate_pass_rate": 0.05,
+    })
+    FAILURE_MODE_TREND_WINDOW: int = 5
 
     # ----------------------------------------
     # Eval Harness (Regression Scenarios)
@@ -327,6 +420,7 @@ class BaseConfig:
         "FAIL_LUCKY_STRIKE": -15.0,
         "FAIL_SIGNAL_DEGENERATE": -8.0,
     })
+    REJECT_REASON_DISTANCE_SCALE: float = 0.75
     REJECT_DISTANCE_PENALTY_WEIGHTS: dict = field(default_factory=lambda: {
         "FAIL_MIN_TRADES": -12.0,
         "FAIL_LOW_EXPOSURE": -10.0,
@@ -338,6 +432,7 @@ class BaseConfig:
         "FAIL_LUCKY_STRIKE": -12.0,
         "FAIL_SIGNAL_DEGENERATE": -10.0,
     })
+    REJECT_DISTANCE_PENALTY_POWER: float = 1.1
     REJECT_SCORE_FLOOR: float = -200.0 # [V18] Extended floor to avoid clipping
     REJECT_SOFT_PENALTY_SCALE: float = 0.5
     REJECT_NEAR_PASS_MAX_FAILURES: int = 2
@@ -437,6 +532,17 @@ class BaseConfig:
     RISK_HORIZON_MIN: int = 3
     RISK_HORIZON_MAX: int = 30
     RISK_EST_DAILY_VOL: float = 0.015
+    RISK_RR_MIN_BY_STAGE: Dict[int, float] = field(default_factory=lambda: {
+        2: 1.1,
+        3: 1.2,
+        4: 1.3,
+    })
+    RISK_HORIZON_MIN_BY_STAGE: Dict[int, int] = field(default_factory=lambda: {
+        2: 5,
+        3: 6,
+        4: 7,
+    })
+    RISK_SAMPLE_MAX_ATTEMPTS: int = 6
     
     MAX_LEVERAGE_MIN: float = 0.5
     MAX_LEVERAGE_MAX: float = 1.5
@@ -457,7 +563,7 @@ class BaseConfig:
     EVAL_MIN_WINDOW_BARS: int = 120
     EVAL_LOWER_QUANTILE: float = 0.2
     # Benchmark for excess return calculation (alpha = total_return - benchmark)
-    EVAL_BENCHMARK_MODE: str = "fixed"  # "fixed" | "bh"
+    EVAL_BENCHMARK_MODE: str = "exposure"  # "fixed" | "bh" | "exposure" | "cash" | "exposure_fixed"
     EVAL_BENCHMARK_RETURN_PCT: float = 15.0
 
     EVAL_FAST_LOOKBACK_BARS: int = 600
@@ -577,6 +683,9 @@ class BaseConfig:
         "FAIL_NO_CYCLE",
         "FAIL_INVALID_ACTION",
         "FAIL_MIN_TRADES",
+        "FAIL_MAX_TRADES",
+        "FAIL_MIN_FLIPS",
+        "FAIL_MAX_FLIPS",
         "FAIL_LOW_EXPOSURE",
         "FAIL_LOW_RETURN",
         "FAIL_WINRATE_LOW",
@@ -590,6 +699,9 @@ class BaseConfig:
         "FAIL_NO_CYCLE": 1.0,
         "FAIL_INVALID_ACTION": 1.0,
         "FAIL_MIN_TRADES": 1.0,
+        "FAIL_MAX_TRADES": 1.0,
+        "FAIL_MIN_FLIPS": 1.0,
+        "FAIL_MAX_FLIPS": 1.0,
         "FAIL_LOW_EXPOSURE": 1.0,
         "FAIL_LOW_RETURN": 1.0,
         "FAIL_WINRATE_LOW": 1.0,
@@ -638,6 +750,9 @@ class BaseConfig:
     AUTOTUNE_HISTORY_SIZE: int = 20         # 분석할 최근 배치 수
     AUTOTUNE_RIGID_THRESHOLD: float = 0.05  # 5% 미만 개선 시 정체로 판단
     AUTOTUNE_PASS_RATE_TARGET: float = 0.15 # 목표 통과율 (Stage 2)
+    AUTOTUNE_PASS_RATE_MIN_S1: float = 0.10
+    AUTOTUNE_PASS_RATE_MIN_S2: float = 0.05
+    AUTOTUNE_PASS_RATE_CONSECUTIVE: int = 3
     AUTOTUNE_DIVERSITY_TARGET: float = 0.4  # 목표 Jaccard 거리 (평균)
     AUTOTUNE_INTERVENTION_M_BATCHES: int = 10 # 개입 효과 검증 기간
     
@@ -662,7 +777,11 @@ class BaseConfig:
             min_trades_per_year=2.0,    # [V18] Relaxed (4 -> 2) to help unblock learning
             max_mdd_pct=50.0,           # [V12.3] Relaxed MDD (40 -> 50)
             min_profit_factor=0.8,      # [V18] Relaxed (1.0 -> 0.8)
-            and_terms_range=(1, 1),
+            min_entries_per_year=2.0,
+            max_entries_per_year=300.0,
+            min_flips_per_year=4.0,
+            max_flips_per_year=600.0,
+            and_terms_range=(1, 2),
             quantile_bias="center",
             wf_splits=3,
             wf_gate_mode="soft",
@@ -678,13 +797,17 @@ class BaseConfig:
             min_trades_per_year=8.0,
             max_mdd_pct=25.0,
             min_profit_factor=1.1,
-            and_terms_range=(1, 2),
-            quantile_bias="spread",
+            min_entries_per_year=8.0,
+            max_entries_per_year=250.0,
+            min_flips_per_year=16.0,
+            max_flips_per_year=500.0,
+            and_terms_range=(2, 3),
+            quantile_bias="center",
             wf_splits=3,
             wf_gate_mode="soft",
             exploration_slot=0.2,
             reject_base_penalty=-30.0,
-            signal_degeneracy_mode="soft"
+            signal_degeneracy_mode="hard"
         ),
         3: StageSpec(
             stage_id=3,
@@ -694,7 +817,11 @@ class BaseConfig:
             min_trades_per_year=12.0,
             max_mdd_pct=15.0,
             min_profit_factor=1.3,
-            and_terms_range=(2, 3),
+            min_entries_per_year=12.0,
+            max_entries_per_year=200.0,
+            min_flips_per_year=24.0,
+            max_flips_per_year=400.0,
+            and_terms_range=(3, 4),
             quantile_bias="tail",
             wf_splits=5,
             wf_gate_mode="hard",
@@ -710,7 +837,11 @@ class BaseConfig:
             min_trades_per_year=15.0,
             max_mdd_pct=12.0,
             min_profit_factor=1.5,
-            and_terms_range=(2, 3),
+            min_entries_per_year=15.0,
+            max_entries_per_year=180.0,
+            min_flips_per_year=30.0,
+            max_flips_per_year=360.0,
+            and_terms_range=(3, 4),
             quantile_bias="tail",
             wf_splits=5,
             wf_gate_mode="hard",
@@ -725,7 +856,18 @@ class BaseConfig:
     # [V14] Failure Taxonomy Tree
     # Categories: SIGNAL, EDGE, RISK, COMPLEXITY, DATA
     FAILURE_TAXONOMY: dict = field(default_factory=lambda: {
-        "SIGNAL_ISSUE": ["FAIL_NO_CYCLE", "FAIL_INVALID_ACTION", "FAIL_MIN_TRADES", "FAIL_LOW_EXPOSURE", "FAIL_ZERO_EXPOSURE", "FAIL_OVER_EXPOSURE", "FAIL_SIGNAL_DEGENERATE"],
+        "SIGNAL_ISSUE": [
+            "FAIL_NO_CYCLE",
+            "FAIL_INVALID_ACTION",
+            "FAIL_MIN_TRADES",
+            "FAIL_MAX_TRADES",
+            "FAIL_MIN_FLIPS",
+            "FAIL_MAX_FLIPS",
+            "FAIL_LOW_EXPOSURE",
+            "FAIL_ZERO_EXPOSURE",
+            "FAIL_OVER_EXPOSURE",
+            "FAIL_SIGNAL_DEGENERATE",
+        ],
         "EDGE_ISSUE": ["FAIL_LOW_RETURN", "FAIL_NEG_ALPHA", "FAIL_PF", "FAIL_WINRATE_LOW", "FAIL_WINRATE_HIGH"],
         "RISK_ISSUE": ["FAIL_MDD_BREACH", "FAIL_LUCKY_STRIKE", "FAIL_WORST_WINDOW"],
         "COMPLEXITY_ISSUE": ["FAIL_COMPLEXITY_HIGH", "FAIL_AST_DEPTH"],

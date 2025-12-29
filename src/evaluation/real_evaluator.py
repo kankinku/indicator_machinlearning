@@ -25,7 +25,10 @@ class RealEvaluator:
         exit_signals: pd.Series,
         risk_budget: Dict[str, Any],
         target_regime: Optional[str] = None,
-        complexity_score: float = 0.0
+        complexity_score: float = 0.0,
+        act_signals: Optional[pd.Series] = None,
+        hold_min_bars: Optional[pd.Series] = None,
+        hold_max_bars: Optional[pd.Series] = None
     ) -> Tuple[SampleMetrics, Any]:
         """
         Runs the backtest and computes unified metrics.
@@ -38,6 +41,10 @@ class RealEvaluator:
             tp_pct=tp_pct,
             sl_pct=sl_pct,
             max_hold_bars=horizon,
+            hold_min_bars=hold_min_bars,
+            hold_max_bars=hold_max_bars,
+            benchmark_mode=getattr(config, "EVAL_BENCHMARK_MODE", "bh"),
+            benchmark_return_pct=float(getattr(config, "EVAL_BENCHMARK_RETURN_PCT", 0.0)),
         )
         
         trade_returns = np.array(bt_result.trade_returns)
@@ -46,13 +53,7 @@ class RealEvaluator:
         equity = np.array(bt_result.equity_curve) / 100.0 + 1.0
         full_returns = np.diff(equity) / equity[:-1]
         
-        # Benchmark ROI
-        bench_mode = getattr(config, "EVAL_BENCHMARK_MODE", "bh")
-        if bench_mode == "fixed":
-            bench_ret = float(getattr(config, "EVAL_BENCHMARK_RETURN_PCT", 0.0))
-        else:
-            bench_ret = (df["close"].iloc[-1] / df["close"].iloc[0] - 1.0) * 100.0 if not df.empty else 0.0
-        
+        bench_ret = float(getattr(bt_result, "benchmark_return", 0.0))
         metrics = compute_sample_metrics(
             trade_returns=trade_returns,
             trade_count=bt_result.trade_count,
@@ -67,6 +68,7 @@ class RealEvaluator:
         metrics.equity.exposure_ratio = float(bt_result.exposure)
         metrics.equity.percent_in_market = float(bt_result.exposure)
         metrics.equity.total_return_pct = float(bt_result.total_return)
+        metrics.equity.benchmark_roi_pct = float(bench_ret)
         metrics.equity.excess_return = float(bt_result.excess_return)
 
         # Signal degeneracy metrics.
@@ -86,6 +88,16 @@ class RealEvaluator:
         metrics.trades.exit_count = int(stats["exit_count"])
         metrics.trades.invalid_action_count = int(getattr(bt_result, "invalid_action_count", 0))
         metrics.trades.invalid_action_rate = float(getattr(bt_result, "invalid_action_rate", 0.0))
+        metrics.trades.ignored_action_count = int(getattr(bt_result, "ignored_action_count", 0))
+        metrics.trades.ignored_action_rate = float(getattr(bt_result, "ignored_action_rate", 0.0))
+        metrics.trades.cost_enter = int(stats["entry_count"])
+        metrics.trades.cost_flip = int(stats["entry_count"] + stats["exit_count"])
+        if act_signals is not None:
+            act_count = int(act_signals.astype(bool).sum())
+        else:
+            act_count = int((entry_signals.astype(bool) | exit_signals.astype(bool)).sum())
+        metrics.trades.act_count = act_count
+        metrics.trades.act_rate = float(act_count / max(1, len(df)))
         
         return metrics, bt_result
 

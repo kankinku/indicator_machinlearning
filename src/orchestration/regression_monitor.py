@@ -30,6 +30,20 @@ class RegressionReport:
     evidence: Dict[str, Any]
 
 
+@dataclass
+class FailureModeDecision:
+    action: str
+    reasons: List[str]
+    metrics: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "action": self.action,
+            "reasons": self.reasons,
+            "metrics": self.metrics,
+        }
+
+
 class RegressionMonitor:
     """
     Batch-level regression detector with evidence bundles.
@@ -61,6 +75,111 @@ class RegressionMonitor:
         self._log_incident(report)
         return report
 
+    def classify_failure_mode(
+        self,
+        batch_report: Dict[str, Any],
+        history: List[Dict[str, Any]],
+    ) -> FailureModeDecision:
+        stop_cfg = getattr(config, "FAILURE_MODE_STOP_RULES", {}) or {}
+        refactor_cfg = getattr(config, "FAILURE_MODE_REFACTOR_RULES", {}) or {}
+        deadlock_cfg = getattr(config, "REGRESSION_R1_DEADLOCK", {}) or {}
+        trend_window = int(getattr(config, "FAILURE_MODE_TREND_WINDOW", 5))
+
+        trade_median = float(batch_report.get("trade_count_hist", {}).get("median", 0.0))
+        topk = batch_report.get("topk_performance", []) or []
+        max_trade_median = float(stop_cfg.get("max_trade_median", 0.0))
+        max_topk_trade = float(stop_cfg.get("max_topk_trade", max_trade_median))
+        min_topk_low_ratio = float(stop_cfg.get("min_topk_low_trade_ratio", 1.0))
+
+        topk_low = [t for t in topk if float(t.get("trade_count", 0)) <= max_topk_trade]
+        topk_low_ratio = float(len(topk_low) / len(topk)) if topk else 0.0
+
+        reasons: List[str] = []
+        action = "continue"
+
+        prefilter = batch_report.get("policy_prefilter", {}) or {}
+        attempts_total = int(prefilter.get("attempts_total", 0) or 0)
+        kept_total = int(prefilter.get("kept_total", 0) or 0)
+        min_keep = int(prefilter.get("min_keep", 0) or 0)
+        max_attempts = int(prefilter.get("max_attempts", 0) or 0)
+        prefilter_stuck = max_attempts > 0 and attempts_total >= max_attempts and kept_total < min_keep
+        stage_constraints = batch_report.get("stage_constraints", {}) or {}
+        policy_mode = str(getattr(config, "ENTRY_RATE_CONSTRAINT_POLICY", "refactor")).lower()
+        constraints_infeasible = bool(stage_constraints) and not bool(stage_constraints.get("feasibility_ok", True))
+
+        if prefilter_stuck:
+            action = "refactor"
+            reasons.append("prefilter_stuck")
+        elif policy_mode == "refactor" and constraints_infeasible:
+            action = "refactor"
+            reasons.append("stage_constraints_infeasible")
+        elif max_trade_median > 0 and trade_median <= max_trade_median and topk_low_ratio >= min_topk_low_ratio:
+            action = "stop"
+            reasons.append(f"trade_median={trade_median:.2f} <= {max_trade_median:.2f}")
+            reasons.append(f"topk_low_trade_ratio={topk_low_ratio:.2f} >= {min_topk_low_ratio:.2f}")
+        else:
+            gate_pass_rate = float(batch_report.get("gate_pass_rate", 0.0))
+            median_cycle = float(batch_report.get("cycle_count_hist", {}).get("median", 0.0))
+            reward_var = float(batch_report.get("reward_variance", 0.0))
+            is_deadlock = (
+                median_cycle <= float(deadlock_cfg.get("max_median_cycle", 1.0))
+                and reward_var <= float(deadlock_cfg.get("max_reward_variance", 1e-4))
+                and gate_pass_rate <= float(deadlock_cfg.get("max_gate_pass_rate", 0.01))
+            )
+            if is_deadlock:
+                action = "refactor"
+                reasons.append("deadlock_r1")
+            else:
+                collapse_trend = batch_report.get("reward_collapse_trend", {}) or {}
+                collapse_flag = bool(collapse_trend.get("collapsed", False))
+                if collapse_flag:
+                    action = "refactor"
+                    reasons.append("reward_collapse_trend")
+                else:
+                    min_gate_pass = float(refactor_cfg.get("min_gate_pass_rate", 0.0))
+                    gate_stats = batch_report.get("correlation_report", {}).get("gate_valid_selected", {}) or {}
+                    if gate_pass_rate >= min_gate_pass and (
+                        int(gate_stats.get("valid_not_gate_pass", 0)) > 0
+                        or int(gate_stats.get("selected_not_valid", 0)) > 0
+                        or int(gate_stats.get("gate_pass_not_selected", 0)) > 0
+                    ):
+                        action = "refactor"
+                        reasons.append("gate_valid_selected_mismatch")
+
+        trends = self._compute_trends(batch_report, history[-trend_window:] if history else [])
+        metrics = {
+            "trade_median": trade_median,
+            "topk_low_trade_ratio": topk_low_ratio,
+            "gate_pass_rate": float(batch_report.get("gate_pass_rate", 0.0)),
+            "valid_rate": float(batch_report.get("valid_rate", 0.0)),
+            "selection_score_mean": float(
+                batch_report.get("selection_component_summary", {}).get("selection_score", {}).get("mean", 0.0)
+            ),
+            "prefilter_kept": kept_total,
+            "prefilter_attempts": attempts_total,
+            "reward_collapse_count": int(batch_report.get("reward_collapse_trend", {}).get("count", 0) or 0),
+            "stage_feasibility_ok": bool(stage_constraints.get("feasibility_ok", True)) if stage_constraints else True,
+            "stage_feasibility_margin": float(stage_constraints.get("feasibility_margin", 0.0)) if stage_constraints else 0.0,
+            "trends": trends,
+        }
+
+        return FailureModeDecision(action=action, reasons=reasons or ["no_failure"], metrics=metrics)
+
+    def log_failure_mode(self, decision: FailureModeDecision, batch_report: Dict[str, Any]) -> None:
+        payload = {
+            "timestamp": time.time(),
+            "batch_id": int(batch_report.get("batch_id", 0)),
+            "stage": int(getattr(config, "CURRICULUM_CURRENT_STAGE", 1)),
+            "decision": decision.to_dict(),
+        }
+        try:
+            path = self.incident_dir / "failure_mode_decisions.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload) + "\n")
+        except Exception as exc:
+            self._log_error("log_failure_mode", exc, {"batch_id": batch_report.get("batch_id")})
+
     def _detect_signals(
         self,
         batch_report: Dict[str, Any],
@@ -74,6 +193,8 @@ class RegressionMonitor:
         signals.append(r2)
         r3 = self._check_invalid_action(batch_report)
         signals.append(r3)
+        r5 = self._check_reward_collapse(batch_report, history)
+        signals.append(r5)
         r4 = self._check_selection_distortion(batch_report, diversity_info or {}, history)
         signals.append(r4)
         return signals
@@ -108,6 +229,18 @@ class RegressionMonitor:
         triggered = invalid_rate >= float(cfg.get("min_invalid_action_rate", 0.1))
         detail = f"invalid_action_rate={invalid_rate:.3f}"
         return RegressionSignal(code="R3_INVALID_ACTION", triggered=triggered, detail=detail)
+
+    def _check_reward_collapse(
+        self,
+        report: Dict[str, Any],
+        history: List[Dict[str, Any]],
+    ) -> RegressionSignal:
+        trend = report.get("reward_collapse_trend", {}) or {}
+        collapsed = bool(trend.get("collapsed", False))
+        window = int(trend.get("window", 0) or 0)
+        count = int(trend.get("count", 0) or 0)
+        detail = f"collapsed={collapsed}, window={window}, count={count}"
+        return RegressionSignal(code="R5_REWARD_COLLAPSE", triggered=collapsed, detail=detail)
 
     def _check_selection_distortion(
         self,
@@ -230,6 +363,27 @@ class RegressionMonitor:
                 "avg_jaccard": float(diversity_info.get("avg_jaccard", 0.0)),
                 "collision_rate": float(diversity_info.get("collision_rate", 0.0)),
             },
+        }
+
+    def _compute_trends(
+        self,
+        batch_report: Dict[str, Any],
+        history: List[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        if not history:
+            return {"valid_rate_delta": 0.0, "selection_score_delta": 0.0}
+        prev_valid = [float(h.get("valid_rate", 0.0)) for h in history]
+        prev_sel = [
+            float(h.get("selection_component_summary", {}).get("selection_score", {}).get("mean", 0.0))
+            for h in history
+        ]
+        valid_delta = float(batch_report.get("valid_rate", 0.0)) - float(np.mean(prev_valid)) if prev_valid else 0.0
+        sel_delta = float(
+            batch_report.get("selection_component_summary", {}).get("selection_score", {}).get("mean", 0.0)
+        ) - float(np.mean(prev_sel)) if prev_sel else 0.0
+        return {
+            "valid_rate_delta": valid_delta,
+            "selection_score_delta": sel_delta,
         }
 
     def _log_incident(self, report: RegressionReport) -> None:

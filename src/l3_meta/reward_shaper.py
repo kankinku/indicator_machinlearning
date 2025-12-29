@@ -175,12 +175,23 @@ class RewardShaper:
         is_rejected = len(hard_failures) > 0
         rejection_reason = hard_failures[0].code if hard_failures else None
 
-        reason_penalties = getattr(config, "REJECT_REASON_PENALTIES", {})
-        distance_weights = getattr(config, "REJECT_DISTANCE_PENALTY_WEIGHTS", {})
+        reason_penalties = dict(getattr(config, "REJECT_REASON_PENALTIES", {}))
+        distance_weights = dict(getattr(config, "REJECT_DISTANCE_PENALTY_WEIGHTS", {}))
+        if current_stage < 3:
+            # Stage2 이하에서는 flip 부족을 정보용으로만 남기고 점수 패널티는 제거한다.
+            reason_penalties["FAIL_MIN_FLIPS"] = 0.0
+            distance_weights["FAIL_MIN_FLIPS"] = 0.0
         failure_codes = [f.code for f in failures]
         distance_score = float(sum(f.distance for f in failures))
-        reason_penalty_total = float(sum(reason_penalties.get(code, 0.0) for code in failure_codes))
-        distance_penalty_total = float(sum(distance_weights.get(f.code, 0.0) * f.distance for f in failures))
+        reason_distance_scale = float(getattr(config, "REJECT_REASON_DISTANCE_SCALE", 1.0))
+        distance_power = float(getattr(config, "REJECT_DISTANCE_PENALTY_POWER", 1.0))
+        reason_penalty_total = 0.0
+        distance_penalty_total = 0.0
+        for failure in failures:
+            base_penalty = float(reason_penalties.get(failure.code, 0.0))
+            dist = float(failure.distance)
+            reason_penalty_total += base_penalty * (1.0 + (reason_distance_scale * dist))
+            distance_penalty_total += float(distance_weights.get(failure.code, 0.0)) * (dist ** distance_power)
 
         # [3] REJECTED 처리 - 분해된 패널티 적용
         # ================================================

@@ -36,7 +36,13 @@ from src.l3_meta.detectors.regime import RegimeDetector
 from src.l3_meta.curriculum_controller import get_curriculum_controller
 from src.l3_meta.epsilon_manager import get_epsilon_manager
 from src.l3_meta.reward_shaper import get_reward_shaper
-from src.orchestration.evaluation import evaluate_stage, evaluate_v12_batch, persist_best_samples, ModuleResult
+from src.orchestration.evaluation import (
+    evaluate_stage,
+    evaluate_v12_batch,
+    persist_best_samples,
+    ModuleResult,
+    prefilter_policies_by_entry_rate,
+)
 from src.data.loader import DataLoader
 from src.contracts import PolicySpec
 from src.shared.instrumentation import get_instrumentation
@@ -44,6 +50,7 @@ from src.shared.observability import (
     build_episode_summary,
     build_batch_report,
     log_batch,
+    log_invalid_actions,
     load_recent_batch_reports,
     detect_deadlock,
 )
@@ -311,10 +318,15 @@ def infinite_loop(
     # 병렬 설정
     n_jobs = config.PARALLEL_BATCH_SIZE or multiprocessing.cpu_count()
     parallel_mode = config.PARALLEL_ENABLED
+    policy_batch_size = int(getattr(config, "BATCH_POLICY_COUNT", 0))
+    if policy_batch_size <= 0:
+        policy_batch_size = n_jobs
     
     # D3QN 모드 확인
     d3qn_mode = config.D3QN_ENABLED
-    logger.info(f">>> [시스템] 병렬 모드: {parallel_mode} | 워커: {n_jobs} | D3QN: {d3qn_mode}")
+    logger.info(
+        f">>> [시스템] 병렬 모드: {parallel_mode} | 워커: {n_jobs} | 정책: {policy_batch_size} | D3QN: {d3qn_mode}"
+    )
     
     # [V11] Curriculum Controller 초기화
     curriculum = get_curriculum_controller() if config.CURRICULUM_ENABLED else None
@@ -392,7 +404,7 @@ def infinite_loop(
         # [V16] Deterministic Batch Seed
         # Formula: Base Seed (e.g. 2025) + Batch Index
         batch_seed = 2025 + batch_idx
-        instrumentation.start_batch(batch_idx, batch_seed, n_jobs)
+        instrumentation.start_batch(batch_idx, batch_seed, policy_batch_size)
 
         # Defaults for batch-level reporting to avoid undefined vars
         policies = []
@@ -425,31 +437,119 @@ def infinite_loop(
             # ========================================
             # C-1. 병렬 실행 모드
             # ========================================
-            logger.info(f"  >>> [병렬] 정책 생성 {n_jobs}개 (레짐: {regime.label})")
+            logger.info(f"  >>> [병렬] 정책 생성 {policy_batch_size}개 (레짐: {regime.label})")
             
             # 1. 정책 배치 생성 (Diversity-aware Batch)
-            policies = agent.propose_batch(regime, history, n_jobs, seed=batch_seed)
+            policies = agent.propose_batch(regime, history, policy_batch_size, seed=batch_seed)
+
+            prefilter_stats = None
+            if getattr(config, "ENTRY_HIT_RATE_FILTER_ENABLED", False):
+                target_keep = int(getattr(config, "PREFILTER_TARGET_KEEP", policy_batch_size))
+                if target_keep <= 0:
+                    target_keep = policy_batch_size
+                min_keep = int(getattr(config, "PREFILTER_MIN_KEEP", 0))
+                max_attempts = int(getattr(config, "PREFILTER_MAX_ATTEMPTS", 0))
+
+                kept: List[PolicySpec] = []
+                reject_reason_counts = {}
+                attempts_total = 0
+                total_seen = 0
+                mean_rate_sum = 0.0
+                last_bounds = {}
+
+                while attempts_total < max_attempts and len(kept) < target_keep:
+                    needed = target_keep - len(kept)
+                    batch_need = min(needed, policy_batch_size)
+                    candidates = agent.propose_batch(
+                        regime,
+                        history,
+                        batch_need,
+                        seed=batch_seed + attempts_total,
+                    )
+                    attempts_total += len(candidates)
+
+                    kept_batch, stats = prefilter_policies_by_entry_rate(
+                        candidates,
+                        df,
+                        stage_id=current_stage,
+                    )
+                    total_seen += int(stats.get("total", 0))
+                    mean_rate_sum += float(stats.get("mean_rate", 0.0)) * float(stats.get("total", 0))
+                    last_bounds = {
+                        "min_rate": stats.get("min_rate"),
+                        "max_rate": stats.get("max_rate"),
+                    }
+                    kept.extend(kept_batch)
+                    for reason, count in (stats.get("reject_reason_counts") or {}).items():
+                        reject_reason_counts[reason] = reject_reason_counts.get(reason, 0) + int(count)
+
+                prefilter_stats = {
+                    "attempts_total": attempts_total,
+                    "kept_total": len(kept),
+                    "target_keep": target_keep,
+                    "min_keep": min_keep,
+                    "max_attempts": max_attempts,
+                    "reject_reason_counts": reject_reason_counts,
+                    "mean_rate": (mean_rate_sum / total_seen) if total_seen > 0 else 0.0,
+                    "min_rate": last_bounds.get("min_rate", 0.0),
+                    "max_rate": last_bounds.get("max_rate", 1.0),
+                }
+
+                if len(kept) >= min_keep:
+                    policies = kept[:target_keep]
+                else:
+                    diagnostic_status = {"status": "PREFILTER_STUCK", "prefilter": prefilter_stats}
+                    policies = []
+                    results = []
+                    valid_results = []
+                    diverse_results = []
+                    batch_rewards = []
             
             # 2. 병렬 평가 (V14 Optimized)
             logger.info(f"  >>> [평가] 배치 평가 {len(policies)}개 (병렬)")
             s2_start = time.time()
-            results, diagnostic_status = evaluate_v12_batch(
-                policies,
-                df,
-                regime.label,
-                n_jobs,
-                stage_id=current_stage,
-            )
+            if policies:
+                results, diagnostic_status = evaluate_v12_batch(
+                    policies,
+                    df,
+                    regime.label,
+                    n_jobs,
+                    stage_id=current_stage,
+                    prefiltered=bool(prefilter_stats),
+                )
+                if prefilter_stats and isinstance(diagnostic_status, dict):
+                    diagnostic_status["prefilter"] = prefilter_stats
             s2_duration = time.time() - s2_start
             
+            from src.l1_judge.evaluator import compute_gate_diagnostics
+
+            def _is_execution_success(res: ModuleResult) -> bool:
+                if not res.best_sample or not res.best_sample.metrics:
+                    return False
+                if res.module_key in ("ERROR", "FEATURE_MISSING", "INVALID_SPEC"):
+                    return False
+                if getattr(res.best_sample.metrics, "is_rejected", False):
+                    return False
+                return True
+
+            gate_diag_by_id = {}
+            learning_candidates = []
+            for res in results:
+                if not _is_execution_success(res):
+                    continue
+                metrics = res.best_sample.metrics
+                gate_diag = compute_gate_diagnostics(metrics)
+                gate_diag_by_id[res.policy_spec.spec_id] = gate_diag
+                learning_candidates.append(res)
+
+            valid_results = [
+                r for r in learning_candidates
+                if gate_diag_by_id.get(r.policy_spec.spec_id)
+                and gate_diag_by_id[r.policy_spec.spec_id].approval_pass
+            ]
+
             # [V19] Minimum Valid Strategy Safeguard
-            valid_count = len([
-                r for r in results
-                if r.best_sample
-                and r.best_sample.metrics
-                and not r.best_sample.metrics.is_rejected
-                and getattr(r.best_sample.metrics.trades, "cycle_count", 0) > 0
-            ])
+            valid_count = len(valid_results)
             if valid_count < 1:
                 logger.warning("!!! [치명] 유효 전략 없음. 액션 공간이 비활성일 수 있음.")
                 # Emergency: Force high exploration next batch if complete failure
@@ -465,8 +565,6 @@ def infinite_loop(
                      diagnostic_status['status'] = "COLLAPSED"
 
             # Instrument Stage 2 (Detailed)
-            p_rate = valid_count / len(results) if results else 0
-            instrumentation.record_stage2(s2_duration, p_rate)
             
             # [V14] Self-Healing: 진단 결과에 따라 정책 조정 (Epsilon 재가열 등)
             agent.adjust_policy(diagnostic_status)
@@ -474,49 +572,35 @@ def infinite_loop(
             # [V15] Auto-Tuning (Reward Weights, etc.)
             from src.l3_meta.auto_tuner import get_auto_tuner
             tuner = get_auto_tuner()
-            tuner.process_diagnostics(diagnostic_status, {})
+            extra_info = {"batch_id": batch_idx}
+            current_metrics = getattr(instrumentation, "current_metrics", None)
+            if current_metrics is not None:
+                extra_info["pass_rate_s1"] = float(getattr(current_metrics, "pass_rate_s1", 0.0))
+                extra_info["pass_rate_s2"] = float(getattr(current_metrics, "pass_rate_s2", 0.0))
+                extra_info["exception_count"] = int(sum(getattr(current_metrics, "exceptions", {}).values()))
+            tuner.process_diagnostics(diagnostic_status, extra_info)
 
             # 3. [V11.3] Diversity Selection & Persistence
             from src.l1_judge.diversity import select_diverse_top_k
-            from src.l1_judge.evaluator import compute_gate_diagnostics
-
-            gate_diag_by_id = {}
-            learning_candidates = []
-            for res in results:
-                if not res.best_sample or not res.best_sample.metrics:
-                    continue
-                metrics = res.best_sample.metrics
-                if getattr(metrics.trades, "cycle_count", 0) <= 0:
-                    continue
-                gate_diag = compute_gate_diagnostics(metrics)
-                gate_diag_by_id[res.policy_spec.spec_id] = gate_diag
-                learning_candidates.append(res)
-
-            # Succeeded experiments only (Score above min)
-            valid_results = [
-                r for r in learning_candidates
-                if gate_diag_by_id.get(r.policy_spec.spec_id)
-                and gate_diag_by_id[r.policy_spec.spec_id].approval_pass
-            ]
 
             soft_gate_k = int(getattr(config, "SELECTION_SOFT_GATE_TOP_K", 0))
             if soft_gate_k < 0:
                 soft_gate_k = 0
             soft_gate_elites = []
-            if soft_gate_k > 0 and learning_candidates:
+            if soft_gate_k > 0 and valid_results:
                 def _soft_gate_score(res):
                     diag = gate_diag_by_id.get(res.policy_spec.spec_id)
                     return diag.soft_gate_score if diag else float("-inf")
 
                 soft_gate_elites = sorted(
-                    learning_candidates,
+                    valid_results,
                     key=_soft_gate_score,
                     reverse=True,
                 )[:soft_gate_k]
 
             # Diverse selection among learning candidates
             diverse_results, diversity_info = select_diverse_top_k(
-                learning_candidates,
+                valid_results,
                 k=config.DIVERSITY_K,
                 jaccard_th=config.DIVERSITY_JACCARD_TH,
                 param_th=config.DIVERSITY_PARAM_DIST_TH,
@@ -708,9 +792,9 @@ def infinite_loop(
             # ========================================
             # C-2. 순차 실행 모드 (기존 방식)
             # ========================================
-            logger.info(f"  >>> [순차] 실험 시작 {n_jobs}개 (레짐: {regime.label})")
+            logger.info(f"  >>> [순차] 실험 시작 {policy_batch_size}개 (레짐: {regime.label})")
             saved_total, results = _run_batch_sequential(
-                agent, df, regime, history, repo, n_jobs, stage_id=current_stage
+                agent, df, regime, history, repo, policy_batch_size, stage_id=current_stage
             )
             counter += saved_total
             
@@ -728,12 +812,17 @@ def infinite_loop(
                     batch_rewards.append((reward_total, res.policy_spec, m_dict))
             
             policies = [r.policy_spec for r in results]
+            from src.l1_judge.evaluator import compute_gate_diagnostics
             valid_results = [
                 r for r in results
                 if r.best_sample
                 and r.best_sample.metrics
-                and not r.best_sample.metrics.is_rejected
-                and getattr(r.best_sample.metrics.trades, "cycle_count", 0) > 0
+                and r.module_key not in ("ERROR", "FEATURE_MISSING", "INVALID_SPEC")
+            ]
+            valid_results = [
+                r for r in valid_results
+                if not getattr(r.best_sample.metrics, "is_rejected", False)
+                and compute_gate_diagnostics(r.best_sample.metrics).approval_pass
             ]
             diverse_results = list(valid_results)
             diagnostic_status = {"status": "OK"}
@@ -742,6 +831,18 @@ def infinite_loop(
         # ==========================================================================================
         # [V16] BATCH INSTRUMENTATION (Common)
         # ==========================================================================================
+        stage_cfg = config.CURRICULUM_STAGES.get(current_stage, {})
+        from src.l1_judge.diversity import compute_selection_score, compute_robustness_score
+        from src.l1_judge.evaluator import compute_gate_diagnostics
+        valid_ids = {r.policy_spec.spec_id for r in valid_results}
+        selected_ids = {r.policy_spec.spec_id for r in diverse_results}
+        gate_diag_map = {}
+        for res in results:
+            metrics = getattr(getattr(res, "best_sample", None), "metrics", None)
+            if metrics is None:
+                continue
+            gate_diag_map[res.policy_spec.spec_id] = compute_gate_diagnostics(metrics)
+
         episode_summaries = []
         from src.shared.metrics import TradeStats, EquityStats, WindowMetrics
         for res in results:
@@ -758,23 +859,55 @@ def infinite_loop(
                 )
                 bt_result = None
 
-            episode_summaries.append(
-                build_episode_summary(
-                    policy_id=res.policy_spec.spec_id,
-                    stage=res.stage,
-                    metrics=metrics,
-                    bt_result=bt_result,
-                    reward_breakdown=res.reward_breakdown,
-                    eval_score=res.score,
-                    module_key=res.module_key,
-                )
+            summary = build_episode_summary(
+                policy_id=res.policy_spec.spec_id,
+                stage=res.stage,
+                metrics=metrics,
+                bt_result=bt_result,
+                reward_breakdown=res.reward_breakdown,
+                eval_score=res.score,
+                module_key=res.module_key,
+                batch_id=batch_idx,
             )
+
+            policy_id = res.policy_spec.spec_id
+            gate_pass = bool(summary.get("gate", {}).get("gate_pass", False))
+            selection_status = {
+                "gate_pass": gate_pass,
+                "valid": policy_id in valid_ids,
+                "selected": policy_id in selected_ids,
+            }
+
+            performance = float(summary.get("reward_total", summary.get("eval_score", 0.0)))
+            gate_diag = gate_diag_map.get(policy_id)
+            if gate_diag is not None:
+                progress = float(getattr(gate_diag, "soft_gate_score", 0.0))
+                robustness = compute_robustness_score(res, stage_cfg)
+                selection_score = compute_selection_score(res, gate_diag, stage_cfg)
+            else:
+                progress = float(summary.get("gate", {}).get("soft_gate_score", 0.0))
+                robustness = 0.0
+                selection_score = performance
+
+            summary["selection_status"] = selection_status
+            summary["selection_components"] = {
+                "performance": performance,
+                "progress": progress,
+                "robustness": robustness,
+                "selection_score": selection_score,
+            }
+
+            episode_summaries.append(summary)
 
         batch_report = build_batch_report(batch_idx, episode_summaries)
         batch_report["stage_snapshot"] = {
             "stage_id": int(current_stage),
             "source": "curriculum",
         }
+        if isinstance(diagnostic_status, dict):
+            prefilter = diagnostic_status.get("prefilter")
+            if prefilter:
+                batch_report["policy_prefilter"] = prefilter
         if isinstance(diagnostic_status, dict):
             eval_usage = diagnostic_status.get("eval_usage")
             if eval_usage:
@@ -783,7 +916,7 @@ def infinite_loop(
         wf_alpha_min_mean = 0.0
         wf_alpha_std_mean = 0.0
         wf_samples = []
-        stage_cfg = config.CURRICULUM_STAGES.get(config.CURRICULUM_CURRENT_STAGE)
+        stage_cfg = config.CURRICULUM_STAGES.get(config.CURRICULUM_CURRENT_STAGE, {})
         alpha_floor = float(getattr(stage_cfg, "alpha_floor", -10.0)) if stage_cfg else -10.0
         for res in results:
             if not res.window_results:
@@ -807,14 +940,32 @@ def infinite_loop(
         batch_report["diversity_info"] = diversity_info
         history = load_recent_batch_reports(getattr(config, "OBS_DEADLOCK_WINDOW", 20))
         batch_report["deadlock"] = detect_deadlock(history + [batch_report])
-        log_batch(batch_report)
+        collapse_window = int(getattr(config, "REWARD_COLLAPSE_TREND_WINDOW", 5))
+        collapse_min_count = int(getattr(config, "REWARD_COLLAPSE_TREND_MIN_COUNT", 3))
+        collapse_history = (history + [batch_report])[-collapse_window:] if collapse_window > 0 else [batch_report]
+        collapse_count = sum(
+            1 for r in collapse_history if r.get("reward_collapse", {}).get("collapsed", False)
+        )
+        batch_report["reward_collapse_trend"] = {
+            "window": collapse_window,
+            "min_count": collapse_min_count,
+            "count": int(collapse_count),
+            "collapsed": bool(collapse_count >= collapse_min_count),
+        }
+        failure_mode = regression_monitor.classify_failure_mode(batch_report, history)
+        batch_report["failure_mode_decision"] = failure_mode.to_dict()
+        regression_monitor.log_failure_mode(failure_mode, batch_report)
 
         stage_decision = stage_controller.update(batch_report, batch_idx)
+        batch_report["stage_transition"] = stage_decision.to_dict()
         if stage_decision.action in ("promote", "demote"):
             logger.info(
                 f">>> [Stage] {stage_decision.action.upper()} {stage_decision.stage_before} -> {stage_decision.stage_after} | "
                 f"Reasons: {', '.join(stage_decision.reasons) if stage_decision.reasons else 'N/A'}"
             )
+
+        log_invalid_actions(batch_idx, episode_summaries)
+        log_batch(batch_report)
 
         regression_report = regression_monitor.evaluate(
             batch_report=batch_report,
@@ -880,6 +1031,11 @@ def infinite_loop(
             f"[SINGLE] Rate: {batch_report.get('single_trade_rate', 0.0):>5.2f} | "
             f"EntryRate: {batch_report.get('single_trade_entry_rate_mean', 0.0):>6.4f}"
         )
+        decision = batch_report.get("failure_mode_decision", {}) or {}
+        decision_action = decision.get("action", "continue")
+        decision_reasons = decision.get("reasons", [])
+        reasons_str = ", ".join(decision_reasons[:2]) if decision_reasons else "n/a"
+        report.append(f"[DECIS] {decision_action.upper():<9} | {reasons_str}")
 
         perf_summary = batch_report.get("performance_summary", {})
         if perf_summary:

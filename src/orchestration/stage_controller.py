@@ -28,6 +28,23 @@ class StageDecision:
     action: str
     reasons: List[str]
     metrics: Dict[str, Any]
+    promote_ready: bool
+    demote_violation: bool
+    cooldown_active: bool
+    last_change_batch: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "stage_before": self.stage_before,
+            "stage_after": self.stage_after,
+            "action": self.action,
+            "reasons": self.reasons,
+            "metrics": self.metrics,
+            "promote_ready": self.promote_ready,
+            "demote_violation": self.demote_violation,
+            "cooldown_active": self.cooldown_active,
+            "last_change_batch": self.last_change_batch,
+        }
 
 
 class StageController:
@@ -52,16 +69,16 @@ class StageController:
                 action="disabled",
                 reasons=[],
                 metrics=self._extract_metrics(batch_report),
+                promote_ready=False,
+                demote_violation=False,
+                cooldown_active=False,
+                last_change_batch=self.state.last_change_batch,
             )
 
-        if batch_id - self.state.last_change_batch < int(getattr(config, "STAGE_AUTO_MIN_BATCH_INTERVAL", 0)):
-            return StageDecision(
-                stage_before=self.state.current_stage,
-                stage_after=self.state.current_stage,
-                action="cooldown",
-                reasons=[],
-                metrics=self._extract_metrics(batch_report),
-            )
+        if batch_id <= self.state.last_change_batch:
+            self.state.last_change_batch = 0
+            self.state.promote_streak = 0
+            self.state.demote_streak = 0
 
         stage_before = self.state.current_stage
         max_stage = max(config.CURRICULUM_STAGES.keys())
@@ -70,10 +87,26 @@ class StageController:
         demote_rules = getattr(config, "STAGE_AUTO_DEMOTION_RULES", {}).get(stage_before, {})
         promote_rules = getattr(config, "STAGE_AUTO_PROMOTION_RULES", {}).get(stage_before, {})
 
-        demote_triggered, demote_reasons = self._evaluate_rules(batch_report, demote_rules)
-        promote_ready, promote_reasons = self._evaluate_rules(batch_report, promote_rules)
+        promote_ready, promote_reasons = self._evaluate_promote_rules(batch_report, promote_rules)
+        demote_violation, demote_reasons = self._evaluate_demote_rules(batch_report, demote_rules)
 
-        if demote_triggered:
+        cooldown_active = batch_id - self.state.last_change_batch < int(
+            getattr(config, "STAGE_AUTO_MIN_BATCH_INTERVAL", 0)
+        )
+        if cooldown_active:
+            return StageDecision(
+                stage_before=stage_before,
+                stage_after=stage_before,
+                action="cooldown",
+                reasons=[],
+                metrics=self._extract_metrics(batch_report),
+                promote_ready=promote_ready,
+                demote_violation=demote_violation,
+                cooldown_active=True,
+                last_change_batch=self.state.last_change_batch,
+            )
+
+        if demote_violation:
             self.state.demote_streak += 1
         else:
             self.state.demote_streak = 0
@@ -90,7 +123,7 @@ class StageController:
         demote_streak = int(getattr(config, "STAGE_AUTO_DEMOTE_STREAK", 1))
         promote_streak = int(getattr(config, "STAGE_AUTO_PROMOTE_STREAK", 1))
 
-        if demote_triggered and stage_before > min_stage and self.state.demote_streak >= demote_streak:
+        if demote_violation and stage_before > min_stage and self.state.demote_streak >= demote_streak:
             stage_after = stage_before - 1
             action = "demote"
             reasons = demote_reasons
@@ -98,7 +131,7 @@ class StageController:
         elif promote_ready and stage_before < max_stage and self.state.promote_streak >= promote_streak:
             stage_after = stage_before + 1
             action = "promote"
-            reasons = promote_reasons
+            reasons = promote_reasons or ["promote_ready"]
             self._apply_stage_change(stage_after, action, reasons, batch_id)
 
         self._save_state()
@@ -109,7 +142,22 @@ class StageController:
             action=action,
             reasons=reasons,
             metrics=self._extract_metrics(batch_report),
+            promote_ready=promote_ready,
+            demote_violation=demote_violation,
+            cooldown_active=False,
+            last_change_batch=self.state.last_change_batch,
         )
+
+    def _evaluate_promote_rules(self, report: Dict[str, Any], rules: Dict[str, Any]) -> Tuple[bool, List[str]]:
+        return self._evaluate_rules(report, rules)
+
+    def _evaluate_demote_rules(self, report: Dict[str, Any], rules: Dict[str, Any]) -> Tuple[bool, List[str]]:
+        if not rules:
+            return False, []
+        ready, failures = self._evaluate_rules(report, rules)
+        if ready:
+            return False, []
+        return True, failures
 
     def _apply_stage_change(self, stage_after: int, action: str, reasons: List[str], batch_id: int) -> None:
         self.state.current_stage = stage_after
@@ -131,18 +179,28 @@ class StageController:
 
     def _extract_metrics(self, report: Dict[str, Any]) -> Dict[str, Any]:
         cycle_hist = report.get("cycle_count_hist", {})
+        trade_hist = report.get("trade_count_hist", {})
         hold_hist = report.get("avg_hold_bars_hist", {})
         nearest_gate_counts = report.get("nearest_gate_counts", {})
         nearest_gate = self._top_key(nearest_gate_counts)
+        reward_collapse_recent = bool(report.get("reward_collapse", {}).get("collapsed", False))
+        trend = report.get("reward_collapse_trend", {}) or {}
+        reward_collapse = bool(trend.get("collapsed", reward_collapse_recent))
+        reward_collapse_count = int(trend.get("count", 0) or 0)
 
         return {
             "median_cycle": float(cycle_hist.get("median", 0.0)),
+            "median_trade": float(trade_hist.get("median", 0.0)),
             "median_hold_bars": float(hold_hist.get("median", 0.0)),
             "no_cycle_fail_rate": float(report.get("no_cycle_fail_rate", 0.0)),
             "reward_variance": float(report.get("reward_variance", 0.0)),
+            "reward_collapse": 1.0 if reward_collapse else 0.0,
+            "reward_collapse_recent": 1.0 if reward_collapse_recent else 0.0,
+            "reward_collapse_count": reward_collapse_count,
             "agent_exit_ratio": float(report.get("agent_exit_ratio_mean", 0.0)),
             "invalid_action_rate": float(report.get("invalid_action_rate_mean", 0.0)),
             "gate_pass_rate": float(report.get("gate_pass_rate", 0.0)),
+            "valid_rate": float(report.get("valid_rate", 0.0)),
             "cost_component_mean": float(report.get("reward_component_means", {}).get("cost_component", 0.0)),
             "distance_to_pass_mean": float(report.get("distance_to_pass_mean", 0.0)),
             "wf_pass_rate": float(report.get("wf_pass_rate", 0.0)),
@@ -166,9 +224,15 @@ class StageController:
             elif key == "max_no_cycle_fail_rate":
                 if metrics["no_cycle_fail_rate"] > float(threshold):
                     fail(f"no_cycle_fail_rate {metrics['no_cycle_fail_rate']:.2f} > {threshold}")
+            elif key == "min_median_trade":
+                if metrics["median_trade"] < float(threshold):
+                    fail(f"median_trade {metrics['median_trade']:.2f} < {threshold}")
             elif key == "min_reward_variance":
                 if metrics["reward_variance"] < float(threshold):
                     fail(f"reward_variance {metrics['reward_variance']:.6f} < {threshold}")
+            elif key == "max_reward_collapse":
+                if metrics["reward_collapse"] > float(threshold):
+                    fail(f"reward_collapse {metrics['reward_collapse']:.2f} > {threshold}")
             elif key == "min_agent_exit_ratio":
                 if metrics["agent_exit_ratio"] < float(threshold):
                     fail(f"agent_exit_ratio {metrics['agent_exit_ratio']:.2f} < {threshold}")
@@ -184,6 +248,9 @@ class StageController:
             elif key == "min_gate_pass_rate":
                 if metrics["gate_pass_rate"] < float(threshold):
                     fail(f"gate_pass_rate {metrics['gate_pass_rate']:.2f} < {threshold}")
+            elif key == "min_valid_rate":
+                if metrics["valid_rate"] < float(threshold):
+                    fail(f"valid_rate {metrics['valid_rate']:.2f} < {threshold}")
             elif key == "max_distance_to_pass_mean":
                 if metrics["distance_to_pass_mean"] > float(threshold):
                     fail(f"distance_to_pass_mean {metrics['distance_to_pass_mean']:.2f} > {threshold}")

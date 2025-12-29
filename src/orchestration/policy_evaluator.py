@@ -6,6 +6,7 @@ import re
 from typing import Dict, Any, List, Optional, Tuple
 from src.contracts import PolicySpec
 from src.shared.logger import get_logger
+from src.config import config
 
 logger = get_logger("orchestration.policy_evaluator")
 
@@ -25,9 +26,17 @@ class RuleEvaluator:
     # [V14-O] Rule Evaluation Cache
     _rule_cache: Dict[str, Tuple[List[str], float]] = {}
 
-    def evaluate_signals(self, df: pd.DataFrame, policy_spec: PolicySpec) -> Tuple[pd.Series, pd.Series, float]:
+    def evaluate_signals(
+        self,
+        df: pd.DataFrame,
+        policy_spec: PolicySpec,
+        close_prices: Optional[pd.Series] = None,
+        tp_pct: Optional[float] = None,
+        sl_pct: Optional[float] = None,
+        max_hold_bars: Optional[int] = None,
+    ) -> Tuple[pd.Series, pd.Series, float, pd.Series, pd.Series, pd.Series]:
         """
-        Returns (entry_signals, exit_signals, complexity_score).
+        Returns (entry_signals, exit_signals, complexity_score, act_signals, hold_short_signals, hold_long_signals).
         [V17] Prefers LogicTree (AST) over text rules.
         [V18] Catches LogicTreeMatchError and returns explicit failure signals.
         
@@ -40,9 +49,15 @@ class RuleEvaluator:
         # 1. Sync LogicTree (Phase 1 Migration)
         entry_tree_dict = None
         exit_tree_dict = None
+        timing_tree_dict = None
+        hold_short_tree_dict = None
+        hold_long_tree_dict = None
         if policy_spec.logic_trees:
             entry_tree_dict = policy_spec.logic_trees.get("entry")
             exit_tree_dict = policy_spec.logic_trees.get("exit")
+            timing_tree_dict = policy_spec.logic_trees.get("timing")
+            hold_short_tree_dict = policy_spec.logic_trees.get("hold_short")
+            hold_long_tree_dict = policy_spec.logic_trees.get("hold_long")
 
         if not entry_tree_dict:
             entry_rule = policy_spec.decision_rules.get("entry", "True")
@@ -60,22 +75,95 @@ class RuleEvaluator:
                 policy_spec.logic_trees["exit"] = exit_tree_dict
             else:
                 policy_spec._exit_tree_disabled = True
+
+        if not timing_tree_dict:
+            timing_rule = policy_spec.decision_rules.get("timing", "")
+            if timing_rule and timing_rule.strip().lower() not in {"false", ""}:
+                timing_tree_dict = asdict(parse_text_to_logic(timing_rule).root)
+                if policy_spec.logic_trees is None:
+                    policy_spec.logic_trees = {}
+                policy_spec.logic_trees["timing"] = timing_tree_dict
+            else:
+                policy_spec._timing_tree_disabled = True
+
+        if not hold_short_tree_dict:
+            hold_short_rule = policy_spec.decision_rules.get("hold_short", "")
+            if hold_short_rule and hold_short_rule.strip().lower() not in {"false", ""}:
+                hold_short_tree_dict = asdict(parse_text_to_logic(hold_short_rule).root)
+                if policy_spec.logic_trees is None:
+                    policy_spec.logic_trees = {}
+                policy_spec.logic_trees["hold_short"] = hold_short_tree_dict
+            else:
+                policy_spec._hold_short_tree_disabled = True
+
+        if not hold_long_tree_dict:
+            hold_long_rule = policy_spec.decision_rules.get("hold_long", "")
+            if hold_long_rule and hold_long_rule.strip().lower() not in {"false", ""}:
+                hold_long_tree_dict = asdict(parse_text_to_logic(hold_long_rule).root)
+                if policy_spec.logic_trees is None:
+                    policy_spec.logic_trees = {}
+                policy_spec.logic_trees["hold_long"] = hold_long_tree_dict
+            else:
+                policy_spec._hold_long_tree_disabled = True
             
         try:
             # 2. Evaluate using LogicTree
             entry_tree = LogicTree.from_dict(entry_tree_dict) if entry_tree_dict else None
             exit_tree = LogicTree.from_dict(exit_tree_dict) if exit_tree_dict else None
+            timing_tree = LogicTree.from_dict(timing_tree_dict) if timing_tree_dict else None
+            hold_short_tree = LogicTree.from_dict(hold_short_tree_dict) if hold_short_tree_dict else None
+            hold_long_tree = LogicTree.from_dict(hold_long_tree_dict) if hold_long_tree_dict else None
             
             # [V17] Use LogicTree for Signal Generation
             entry_sig = evaluate_logic_tree(entry_tree, df) if entry_tree else pd.Series(False, index=df.index)
             exit_sig = evaluate_logic_tree(exit_tree, df) if exit_tree else pd.Series(False, index=df.index)
+            if timing_tree and getattr(config, "ACT_TIMING_ENABLED", True):
+                act_sig = evaluate_logic_tree(timing_tree, df)
+            else:
+                act_sig = pd.Series(True, index=df.index)
+            hold_short_sig = evaluate_logic_tree(hold_short_tree, df) if hold_short_tree else pd.Series(False, index=df.index)
+            hold_long_sig = evaluate_logic_tree(hold_long_tree, df) if hold_long_tree else pd.Series(False, index=df.index)
+
+            act_all_true = bool(act_sig.all())
+            act_all_false = not bool(act_sig.any())
+            if act_all_true:
+                stride = int(getattr(config, "ACT_TIMING_FALLBACK_STRIDE", 1))
+                stride = max(1, stride)
+                mask = np.zeros(len(df), dtype=bool)
+                mask[::stride] = True
+                act_sig = pd.Series(mask, index=df.index)
+            elif act_all_false:
+                fallback = entry_sig | exit_sig
+                act_sig = fallback if bool(fallback.any()) else pd.Series(False, index=df.index)
+
+            if getattr(config, "ACT_TIMING_ENABLED", True):
+                entry_sig = entry_sig & act_sig
+                exit_sig = exit_sig & act_sig
+
+            if getattr(config, "POLICY_STATE_GATE_ENABLED", True):
+                entry_sig, exit_sig = self._apply_state_gate(
+                    entry_sig,
+                    exit_sig,
+                    hold_short_sig=hold_short_sig,
+                    hold_long_sig=hold_long_sig,
+                    close_prices=close_prices,
+                    tp_pct=tp_pct,
+                    sl_pct=sl_pct,
+                    max_hold_bars=max_hold_bars,
+                )
             
             # 3. Complexity Calculation (Structural)
             complexity = self._calculate_tree_complexity(entry_tree)
             if exit_tree:
                 complexity += self._calculate_tree_complexity(exit_tree)
+            if timing_tree:
+                complexity += self._calculate_tree_complexity(timing_tree)
+            if hold_short_tree:
+                complexity += self._calculate_tree_complexity(hold_short_tree)
+            if hold_long_tree:
+                complexity += self._calculate_tree_complexity(hold_long_tree)
             
-            return entry_sig, exit_sig, complexity
+            return entry_sig, exit_sig, complexity, act_sig, hold_short_sig, hold_long_sig
             
         except LogicTreeMatchError as e:
             # [V18] 매칭 실패: 명시적 실패 반환
@@ -95,7 +183,120 @@ class RuleEvaluator:
             }
             
             # complexity = -1.0은 "FEATURE_MISSING" 실패 마커
-            return all_false, all_false, -1.0
+            return all_false, all_false, -1.0, all_false, all_false, all_false
+
+    def _apply_state_gate(
+        self,
+        entry_sig: pd.Series,
+        exit_sig: pd.Series,
+        hold_short_sig: Optional[pd.Series] = None,
+        hold_long_sig: Optional[pd.Series] = None,
+        close_prices: Optional[pd.Series] = None,
+        tp_pct: Optional[float] = None,
+        sl_pct: Optional[float] = None,
+        max_hold_bars: Optional[int] = None,
+    ) -> Tuple[pd.Series, pd.Series]:
+        if entry_sig.empty:
+            return entry_sig, exit_sig
+
+        entry_mask = np.zeros(len(entry_sig), dtype=bool)
+        exit_mask = np.zeros(len(exit_sig), dtype=bool)
+        state = 0  # 0: FLAT, 1: LONG
+        hold_bars = 0
+        current_min_hold = 0
+        current_max_hold = max_hold_bars
+        entry_price = None
+        price_values = None
+        use_forced_exit = bool(getattr(config, "POLICY_STATE_GATE_FORCED_EXIT", True))
+        if close_prices is not None and use_forced_exit:
+            try:
+                price_values = close_prices.reindex(entry_sig.index).values
+            except Exception:
+                if len(close_prices) == len(entry_sig):
+                    price_values = close_prices.values
+
+        hold_min_values = None
+        hold_max_values = None
+        if hold_short_sig is not None and hold_long_sig is not None:
+            stage_id = int(getattr(config, "CURRICULUM_CURRENT_STAGE", 1))
+            buckets = getattr(config, "HOLD_DURATION_BUCKETS_BY_STAGE", {}).get(stage_id)
+            if not buckets:
+                buckets = getattr(config, "HOLD_DURATION_BUCKETS_BY_STAGE", {}).get(1, {})
+
+            def _pair(key: str, fallback: tuple[int, int]) -> tuple[int, int]:
+                raw = buckets.get(key, fallback)
+                if isinstance(raw, dict):
+                    min_v = int(raw.get("min", fallback[0]))
+                    max_v = int(raw.get("max", fallback[1]))
+                else:
+                    min_v = int(raw[0]) if isinstance(raw, (list, tuple)) else fallback[0]
+                    max_v = int(raw[1]) if isinstance(raw, (list, tuple)) else fallback[1]
+                if max_v < min_v:
+                    max_v = min_v
+                return min_v, max_v
+
+            short_min, short_max = _pair("short", (1, 5))
+            medium_min, medium_max = _pair("medium", (5, 20))
+            long_min, long_max = _pair("long", (20, 60))
+
+            short_mask = hold_short_sig.astype(bool).values
+            long_mask = hold_long_sig.astype(bool).values & ~short_mask
+            hold_min_values = np.where(short_mask, short_min, np.where(long_mask, long_min, medium_min))
+            hold_max_values = np.where(short_mask, short_max, np.where(long_mask, long_max, medium_max))
+
+        entry_vals = entry_sig.values
+        exit_vals = exit_sig.values
+        for i in range(len(entry_vals)):
+            if state == 0:
+                if bool(entry_vals[i]):
+                    entry_mask[i] = True
+                    state = 1
+                    hold_bars = 0
+                    if hold_min_values is not None:
+                        current_min_hold = int(hold_min_values[i])
+                    else:
+                        current_min_hold = 0
+                    if hold_max_values is not None:
+                        current_max_hold = int(hold_max_values[i])
+                    else:
+                        current_max_hold = max_hold_bars
+                    if current_max_hold is not None and current_max_hold < current_min_hold:
+                        current_max_hold = current_min_hold
+                    if price_values is not None:
+                        entry_price = float(price_values[i])
+            else:
+                if bool(exit_vals[i]) and hold_bars >= current_min_hold:
+                    exit_mask[i] = True
+                    state = 0
+                    hold_bars = 0
+                    current_min_hold = 0
+                    current_max_hold = max_hold_bars
+                    entry_price = None
+                    continue
+
+                hold_bars += 1
+                forced_exit = False
+                if use_forced_exit:
+                    if entry_price is not None and price_values is not None:
+                        price = float(price_values[i])
+                        if tp_pct is not None and price >= entry_price * (1.0 + float(tp_pct)):
+                            forced_exit = True
+                        elif sl_pct is not None and price <= entry_price * (1.0 - float(sl_pct)):
+                            forced_exit = True
+                    if current_max_hold is not None and hold_bars >= int(current_max_hold):
+                        forced_exit = True
+
+                if forced_exit:
+                    state = 0
+                    hold_bars = 0
+                    current_min_hold = 0
+                    current_max_hold = max_hold_bars
+                    entry_price = None
+
+        return (
+            pd.Series(entry_mask, index=entry_sig.index),
+            pd.Series(exit_mask, index=exit_sig.index),
+        )
 
     def _calculate_tree_complexity(self, tree: LogicTree) -> float:
         """
